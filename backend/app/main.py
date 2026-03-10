@@ -1,4 +1,5 @@
 import os
+import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,20 +8,42 @@ from fastapi.responses import JSONResponse
 from app.core.config import settings
 from app.core.database import init_db
 from app.core.redis import init_redis, close_redis
+from app.core.logging import setup_logging, get_logger
 from app.api.v1 import auth, users, models, knowledge, workflows, app_market, audit, prompts, agents
+
+logger = get_logger("main")
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # ── 初始化日志系统 ──
+    setup_logging()
+    logger.info("启动 AI-GeneralPlat v2.0 Agent 平台")
+
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     os.makedirs(settings.CHROMA_PERSIST_DIR, exist_ok=True)
+    os.makedirs(settings.LOG_DIR, exist_ok=True)
+    os.makedirs(settings.MEMORY_DB_PATH, exist_ok=True)
+    os.makedirs(settings.CHECKPOINT_DIR, exist_ok=True)
+
     # Import all models to ensure they are registered with Base.metadata before create_all
     import app.models  # noqa: F401
     await init_db()
     await init_redis()
     await _seed_initial_data()
+
+    # ── 清理过期检查点 ──
+    from app.services.agent.checkpoint import CheckpointManager
+    CheckpointManager.cleanup_old_checkpoints(max_age_hours=24)
+
+    logger.info("所有子系统初始化完成")
     yield
+
+    # ── 关闭时清理 ──
+    from app.services.inference import ModelManager
+    await ModelManager.get_instance().cleanup_idle(max_idle_seconds=0)
     await close_redis()
+    logger.info("服务已关闭")
 
 
 async def _seed_initial_data():

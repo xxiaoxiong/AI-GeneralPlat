@@ -527,7 +527,7 @@ class WorkflowEngine:
         """在工作流中调用 Agent（ReAct 模式）"""
         from sqlalchemy import select
         from app.models.agent import Agent
-        from app.services.agent_service import AgentEngine
+        from app.services.agent import AgentEngine
 
         agent_id = config.get("agent_id")
         input_template = config.get("input", "{{input}}")

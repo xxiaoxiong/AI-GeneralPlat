@@ -1,5 +1,8 @@
 """
-Agent ReAct 执行引擎
+Agent ReAct 执行引擎（v1 旧版 - 已由 app.services.agent 包替代）
+
+向后兼容：从新包重新导出 AgentEngine
+新代码请使用: from app.services.agent import AgentEngine
 
 工具实现已按分类拆分到 app/services/tools/ 子包：
   datetime_tools.py  📅 时间日期
@@ -7,11 +10,16 @@ Agent ReAct 执行引擎
   network_tools.py   🌐 网络请求
   database_tools.py  🗄️ 数据库
   text_tools.py      📝 文本处理
-  knowledge_tools.py � 知识检索
-  analysis_tools.py  � 数据分析
+  knowledge_tools.py 🔍 知识检索
+  analysis_tools.py  📊 数据分析
   system_tools.py    🛠️ 系统工具
-  notify_tools.py    � 通知推送
+  notify_tools.py    📧 通知推送
 """
+# 向后兼容导出
+try:
+    from app.services.agent import AgentEngine as AgentEngine  # noqa: F401
+except ImportError:
+    pass  # 回退到下方旧实现
 import json
 import re
 from typing import AsyncGenerator, Dict, Any, List, Optional

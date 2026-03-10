@@ -1,5 +1,5 @@
 """
-Agent 管理与对话 API
+Agent 管理与对话 API（v2 增强版）
 """
 import json
 from typing import List, Optional
@@ -13,7 +13,8 @@ from app.core.database import get_db
 from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.agent import Agent, AgentSession
-from app.services.agent_service import AgentEngine, BUILTIN_TOOLS
+from app.services.agent import AgentEngine
+from app.services.tools import BUILTIN_TOOLS
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -50,20 +51,25 @@ class AgentChatRequest(BaseModel):
 
 class MemoryAddRequest(BaseModel):
     content: str
+    memory_type: str = "fact"  # fact / rule / skill / preference / episode
     agent_id: Optional[int] = None
     importance: float = 1.0
     tags: str = ""
+    is_pinned: bool = False
 
 
-# ── 记忆管理 API ──────────────────────────────────────────────────────────────
+# ── 记忆管理 API（v2 增强版：结构化记忆）──────────────────────────────────────
 
 @router.get("/memories")
 async def list_memories(
     agent_id: Optional[int] = None,
+    memory_type: Optional[str] = None,
     current_user: User = Depends(get_current_user),
 ):
-    from app.services.memory_service import MemoryService
-    items = await MemoryService.list_memories(current_user.id, agent_id=agent_id)
+    from app.services.agent.memory_manager import MemoryManager
+    items = await MemoryManager.list_memories(
+        current_user.id, agent_id=agent_id, memory_type=memory_type
+    )
     return {"items": items, "total": len(items)}
 
 
@@ -72,13 +78,15 @@ async def add_memory(
     body: MemoryAddRequest,
     current_user: User = Depends(get_current_user),
 ):
-    from app.services.memory_service import MemoryService
-    mem_id = await MemoryService.add_memory(
+    from app.services.agent.memory_manager import MemoryManager
+    mem_id = await MemoryManager.add_memory(
         user_id=current_user.id,
         content=body.content,
+        memory_type=body.memory_type,
         agent_id=body.agent_id,
         importance=body.importance,
         tags=body.tags,
+        is_pinned=body.is_pinned,
     )
     return {"id": mem_id, "message": "记忆已保存"}
 
@@ -88,8 +96,8 @@ async def delete_memory(
     memory_id: int,
     current_user: User = Depends(get_current_user),
 ):
-    from app.services.memory_service import MemoryService
-    ok = await MemoryService.delete_memory(memory_id, current_user.id)
+    from app.services.agent.memory_manager import MemoryManager
+    ok = await MemoryManager.delete_memory(memory_id, current_user.id)
     if not ok:
         raise HTTPException(status_code=404, detail="记忆不存在")
     return {"message": "已删除"}
@@ -100,8 +108,8 @@ async def clear_memories(
     agent_id: Optional[int] = None,
     current_user: User = Depends(get_current_user),
 ):
-    from app.services.memory_service import MemoryService
-    count = await MemoryService.clear_memories(current_user.id, agent_id=agent_id)
+    from app.services.agent.memory_manager import MemoryManager
+    count = await MemoryManager.clear_memories(current_user.id, agent_id=agent_id)
     return {"message": f"已清除 {count} 条记忆"}
 
 
@@ -301,18 +309,17 @@ async def agent_chat(
 
     # 跨会话记忆：检索相关历史记忆并注入 agent_config
     if body.use_memory:
-        from app.services.memory_service import MemoryService
-        memories = await MemoryService.search_memories(
+        from app.services.agent.memory_manager import MemoryManager
+        memories = await MemoryManager.search_memories(
             user_id=current_user.id,
             query=body.message,
             agent_id=agent_id,
             top_k=5,
         )
         if memories:
-            mem_context = MemoryService.format_memories_for_prompt(memories)
+            mem_context = MemoryManager.format_memories_for_prompt(memories)
             agent_config = dict(agent_config)
-            existing_prompt = agent_config.get("system_prompt", "")
-            agent_config["system_prompt"] = existing_prompt + "\n\n" + mem_context
+            agent_config["_memory_context"] = mem_context
 
     if not body.stream:
         # 非流式：收集所有步骤后返回
@@ -334,8 +341,8 @@ async def agent_chat(
 
         # 跨会话记忆：从本轮对话中提取并保存记忆
         if body.use_memory:
-            from app.services.memory_service import MemoryService
-            await MemoryService.extract_and_save_memories(
+            from app.services.agent.memory_manager import MemoryManager
+            await MemoryManager.extract_and_save_memories(
                 user_id=current_user.id,
                 messages=[{"role": "user", "content": body.message}],
                 agent_id=agent_id,
@@ -375,8 +382,8 @@ async def agent_chat(
         # 跨会话记忆：从本轮对话中提取并保存记忆
         if body.use_memory:
             try:
-                from app.services.memory_service import MemoryService
-                await MemoryService.extract_and_save_memories(
+                from app.services.agent.memory_manager import MemoryManager
+                await MemoryManager.extract_and_save_memories(
                     user_id=current_user.id,
                     messages=[{"role": "user", "content": body.message}],
                     agent_id=agent_id,
@@ -465,3 +472,37 @@ def _session_to_dict(s: AgentSession) -> dict:
         "created_at": s.created_at.isoformat() if s.created_at else None,
         "updated_at": s.updated_at.isoformat() if s.updated_at else None,
     }
+
+
+# ── 监控与诊断 API ───────────────────────────────────────────────────────────
+
+@router.get("/monitor/performance")
+async def get_performance_stats(
+    current_user: User = Depends(get_current_user),
+):
+    """获取 Agent 引擎性能统计"""
+    from app.services.agent.trace import get_global_monitor
+    monitor = get_global_monitor()
+    return monitor.get_summary()
+
+
+@router.get("/monitor/inference")
+async def get_inference_stats(
+    current_user: User = Depends(get_current_user),
+):
+    """获取推理队列和模型连接池状态"""
+    from app.services.inference import ModelManager, InferenceQueue
+    return {
+        "model_connections": ModelManager.get_instance().get_stats(),
+        "inference_queue": InferenceQueue.get_instance().get_stats(),
+    }
+
+
+@router.post("/monitor/reload")
+async def hot_reload(
+    current_user: User = Depends(get_current_user),
+):
+    """热重载：清空模型连接池和工具缓存"""
+    from app.services.inference import ModelManager
+    await ModelManager.get_instance().reload_config()
+    return {"message": "热重载完成"}

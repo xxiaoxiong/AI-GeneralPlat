@@ -91,8 +91,8 @@
           />
           <div class="input-actions">
             <div class="input-left-actions">
-              <input ref="imageInputRef" type="file" accept="image/*" style="display:none" @change="handleImageUpload" />
-              <el-button size="small" :icon="Picture" @click="imageInputRef?.click()" title="上传图片（多模态）">图片</el-button>
+              <!-- <input ref="imageInputRef" type="file" accept="image/*" style="display:none" @change="handleImageUpload" />
+              <el-button size="small" :icon="Picture" @click="imageInputRef?.click()" title="上传图片（多模态）">图片</el-button> -->
             </div>
             <div class="input-right-actions">
               <span class="hint">Ctrl+Enter 发送</span>
