@@ -119,6 +119,39 @@ Observation: {{"time": "2024-01-15 14:30:25", "timezone": "Asia/Shanghai"}}
 Thought: 已获取到当前时间信息，可以回答用户了。
 Final Answer: 现在是北京时间 2024年1月15日 14:30:25。
 
+## 示例 4：信息不足时追问用户
+用户: 帮我查一下数据库
+Thought: 用户想查数据库，但没有说明要查哪个表、什么条件。我需要先了解具体需求才能构造正确的查询。
+Final Answer: 我可以帮您查询数据库，请提供以下信息：
+1. 您想查询哪个表或哪类数据？
+2. 有什么筛选条件吗？（比如时间范围、状态等）
+3. 您希望看到哪些字段？
+
+## 示例 5：数据库查询（必须先查表结构，禁止编造数据！）
+用户: 帮我查一下数据
+Thought: 用户想查数据库。我不能猜测表名，必须先用 db_schema 查看数据库实际有哪些表。
+Action: db_schema
+Action Input: {{}}
+
+（说明：db_schema 会返回数据库中真实存在的表列表。收到结果后，再用 db_schema 查看具体表的列，最后用 db_query 执行真实 SQL。绝不编造表名、列名或数据。）
+
+# 追问机制（重要）
+当用户提供的信息不足以完成任务时，**必须主动追问**，不要猜测或编造：
+- 数据库查询缺少表名、条件 → 追问具体需求
+- 任务描述模糊不清 → 追问关键细节
+- 多个可能的理解 → 列出选项让用户选择
+追问时直接在 Final Answer 中提出问题，并尽可能给出选项供用户选择。
+
+# 数据库查询铁律（违反则视为严重错误）
+1. **禁止编造任何数据**：你绝不能自行编造表名、列名、查询结果或任何数据库内容
+2. **必须先查结构**：任何数据库查询前，必须先调用 db_schema 获取真实的表列表和列信息
+3. **只用真实数据**：回答中的所有数据必须来自 db_query/db_count/db_aggregate 工具返回的 Observation
+4. **上面示例中的表名（如 users、orders 等）仅为格式演示，不代表数据库中真实存在这些表**
+5. 当用户的问题涉及「查询」「统计」「多少」「有哪些」等数据库相关意图时，必须主动调用数据库工具
+6. 如果不确定用户要查哪个表，先用 db_schema 列出所有表让用户选择
+7. **禁止翻译或修改列名**：Final Answer 中的表格必须使用数据库返回的原始列名（如 name、status），严禁翻译成中文或其他语言
+8. **禁止加工数据值**：不得对查询返回的数据值进行翻译、重写或格式转换，原样呈现即可
+
 # 严格规则（必须遵守）
 1. Action Input 必须是合法 JSON，键名用双引号
 2. 每次只执行一个工具调用
@@ -128,6 +161,11 @@ Final Answer: 现在是北京时间 2024年1月15日 14:30:25。
 6. 不要编造工具返回结果，只使用 Observation 中的真实数据
 7. 如果不确定，在 Final Answer 中明确说明不确定性
 8. 不要在 Final Answer 中输出 Thought/Action 格式的内容
+9. 数据库查询结果请用 Markdown 表格格式展示
+10. 信息不足时必须追问用户，不要猜测
+11. **数据库查询前必须先用 db_schema 查看表结构**，不要猜测表名和列名
+12. 严格使用用户指定的数据库，不要混淆查询对象
+13. Final Answer 必须完整，不要截断，如果内容较长请分段组织
 
 {memory_section}
 
@@ -182,6 +220,7 @@ class PromptBuilder:
         max_iterations: int = 15,
         memory_context: str = "",
         extra_instructions: str = "",
+        db_info: Optional[Dict] = None,
     ) -> str:
         """构建完整的系统提示词"""
 
@@ -191,6 +230,40 @@ class PromptBuilder:
         if memory_context:
             memory_section = f"\n# 用户历史记忆\n{memory_context}\n"
 
+        # 数据库上下文注入：让模型明确知道连接的是哪个数据库
+        db_context = ""
+        if db_info:
+            db_name = db_info.get("database", "未知")
+            db_type = db_info.get("db_type", "")
+            db_alias = db_info.get("name", "")
+            tables = db_info.get("tables", [])
+
+            db_context = (
+                f"\n# 当前数据库连接\n"
+                f"你当前连接的数据库是: **{db_name}**（{db_type}，别名: {db_alias}）\n"
+            )
+
+            # 如果预加载了表列表，直接告诉模型
+            if tables:
+                table_list = ", ".join(f"`{t}`" for t in tables)
+                db_context += (
+                    f"该数据库包含以下表: {table_list}\n\n"
+                    f"重要规则：\n"
+                    f"- 只能查询上面列出的表，不要使用其他表名\n"
+                    f"- 查询具体表的列信息时用 db_schema 工具（传入 table 参数）\n"
+                    f"- SQL 中的表名和列名必须与实际数据库一致\n"
+                    f"- 当用户问到数据相关问题时，主动使用 db_query 工具查询真实数据\n"
+                )
+            else:
+                db_context += (
+                    f"重要规则：\n"
+                    f"- 查询前必须先调用 db_schema 工具查看可用表和列\n"
+                    f"- 不要猜测表名，严格使用 db_schema 返回的真实表名\n"
+                    f"- SQL 中的表名和列名必须与 db_schema 结果一致\n"
+                )
+
+        combined_extra = db_context + (extra_instructions or "")
+
         prompt = REACT_SYSTEM_PROMPT.format(
             user_system_prompt=user_system_prompt or "你是一个智能助手。",
             tools_section=tools_section,
@@ -198,7 +271,7 @@ class PromptBuilder:
             max_retries=settings.AGENT_MAX_TOOL_RETRIES,
             max_same_tool=settings.AGENT_MAX_SAME_TOOL_CALLS,
             memory_section=memory_section,
-            extra_instructions=extra_instructions,
+            extra_instructions=combined_extra,
         )
 
         return prompt
@@ -211,7 +284,26 @@ class PromptBuilder:
         if len(result) > max_len:
             result = result[:max_len] + f"\n...[结果已截断，原始长度 {len(result)} 字符]"
 
-        return f"Observation (来自工具 {tool_name}):\n{result}\n\n请基于以上工具返回的结果继续推理。如果已有足够信息，请直接输出 Final Answer。"
+        # SQL 错误恢复提示：引导模型使用 db_schema
+        hint = ""
+        if tool_name in ("db_query", "db_count", "db_aggregate"):
+            result_lower = result.lower()
+            if any(kw in result_lower for kw in ("不存在", "doesn't exist", "no such table", "unknown column", "错误")):
+                hint = "\n\n⚠️ SQL 执行出错。请先用 db_schema 工具查看可用的表和列，再重新构造正确的 SQL。"
+            else:
+                hint = "\n\n❗铁律：以上是真实数据库返回的数据。你的 Final Answer 必须原样使用上面的列名和数据值，禁止翻译列名（如不得将 name 改为 名称），禁止添加、修改或编造任何数据行。"
+
+        if tool_name == "db_schema":
+            hint = "\n\n❗请严格使用上面列出的表名和列名，不要猜测或编造不存在的表名/列名。"
+
+        # 搜索失败时的降级提示
+        if tool_name == "web_search" and "未找到结果" in result:
+            hint = "\n\n提示：网络搜索未获取到结果，请直接使用你的知识回答，并注明信息来源为模型知识。"
+        elif tool_name == "web_search" and "搜索结果" in result:
+            hint += "\n\n提示：如果搜索结果中包含页面摘要，请基于其内容回答；如果信息不够详细，可用 fetch_webpage 工具深入读取某个链接的全文。"
+
+        suffix = f"{hint}\n\n请继续推理。信息足够则输出 Final Answer。"
+        return f"Observation ({tool_name}):\n{result}{suffix}"
 
     @staticmethod
     def build_force_answer_message(reason: str = "已达到最大步骤数") -> str:

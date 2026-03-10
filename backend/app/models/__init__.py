@@ -5,6 +5,7 @@ from app.models.workflow import Workflow, WorkflowExecution
 from app.models.app_market import AppTemplate, AppInstance
 from app.models.audit import AuditLog
 from app.models.agent import Agent, AgentSession
+from app.models.database_connection import DatabaseConnection
 
 __all__ = [
     "User", "Role", "Permission", "UserRole", "RolePermission",
@@ -14,4 +15,5 @@ __all__ = [
     "AppTemplate", "AppInstance",
     "AuditLog",
     "Agent", "AgentSession",
+    "DatabaseConnection",
 ]

@@ -56,6 +56,7 @@ class ExecutionTrace:
     final_answer: str = ""
     success: bool = True
     error: str = ""
+    partial_final: str = ""
 
     def add_step(self, step_type: str, content: str, **metadata) -> TraceStep:
         step = TraceStep(

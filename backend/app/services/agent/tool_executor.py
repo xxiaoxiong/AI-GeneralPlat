@@ -73,10 +73,11 @@ TOOL_PERMISSIONS: Dict[str, ToolPermission] = {
     "http_request": ToolPermission.NETWORK,
     "send_email_tool": ToolPermission.NETWORK,
     "webhook_notify": ToolPermission.NETWORK,
-    # 写入工具
-    "db_query": ToolPermission.WRITE,
-    "db_count": ToolPermission.WRITE,
-    "db_aggregate": ToolPermission.WRITE,
+    # 数据库工具
+    "db_schema": ToolPermission.READ,
+    "db_query": ToolPermission.READ,
+    "db_count": ToolPermission.READ,
+    "db_aggregate": ToolPermission.READ,
     # 执行工具
     "python_exec": ToolPermission.EXECUTE,
 }
@@ -124,6 +125,10 @@ class EnhancedToolExecutor:
         # 执行历史追踪
         self.call_history: List[ToolCallRecord] = []
         self.call_counts: Dict[str, int] = {}
+
+        # 外部数据库引擎缓存（避免每次调用都创建新引擎）
+        self._ext_engine = None
+        self._ext_engine_conn_id = None
 
         # 从旧工具系统导入 handler
         from app.services.tools import (
@@ -244,6 +249,56 @@ class EnhancedToolExecutor:
 
         return f"工具执行失败（已重试 {max_retries} 次）: {last_error}"
 
+    async def _get_db_session(self):
+        """获取数据库会话：优先使用用户配置的外部数据库连接"""
+        conn_id = self.agent_config.get("database_connection_id")
+        if not conn_id:
+            logger.info("未配置外部数据库连接，使用应用自身数据库")
+            return self.db, False  # 使用应用自身数据库，无需关闭
+
+        logger.info(f"使用外部数据库连接 ID={conn_id}")
+
+        # 复用已缓存的引擎
+        if self._ext_engine and self._ext_engine_conn_id == conn_id:
+            from sqlalchemy.ext.asyncio import AsyncSession as ExtSession, async_sessionmaker
+            factory = async_sessionmaker(self._ext_engine, class_=ExtSession, expire_on_commit=False)
+            ext_session = factory()
+            return ext_session, True
+
+        # 加载用户配置的外部数据库连接
+        from sqlalchemy import select
+        from app.models.database_connection import DatabaseConnection
+        res = await self.db.execute(
+            select(DatabaseConnection).where(DatabaseConnection.id == conn_id)
+        )
+        conn = res.scalar_one_or_none()
+        if not conn:
+            raise ValueError(f"数据库连接 ID={conn_id} 不存在，请在智能体设置中重新配置数据库连接")
+
+        logger.info(f"连接外部数据库: {conn.db_type}://{conn.host}:{conn.port}/{conn.database} (名称: {conn.name})")
+
+        from app.api.v1.databases import _build_engine
+        ext_engine = _build_engine(conn)
+        self._ext_engine = ext_engine
+        self._ext_engine_conn_id = conn_id
+
+        from sqlalchemy.ext.asyncio import AsyncSession as ExtSession, async_sessionmaker
+        factory = async_sessionmaker(ext_engine, class_=ExtSession, expire_on_commit=False)
+        ext_session = factory()
+        # 返回外部会话，需要调用者关闭
+        return ext_session, True
+
+    async def close_external_engine(self):
+        """清理外部数据库引擎（在 Agent 执行结束后调用）"""
+        if self._ext_engine:
+            try:
+                await self._ext_engine.dispose()
+                logger.info("外部数据库引擎已释放")
+            except Exception as e:
+                logger.warning(f"释放外部数据库引擎失败: {e}")
+            self._ext_engine = None
+            self._ext_engine_conn_id = None
+
     async def _execute_impl(self, tool_name: str, tool_input: Dict) -> str:
         """实际执行工具调用"""
         if tool_name in self._sync_handlers:
@@ -256,7 +311,19 @@ class EnhancedToolExecutor:
             return await self._async_handlers[tool_name](tool_input)
 
         if tool_name in self._db_handlers:
-            return await self._db_handlers[tool_name](self.db, tool_input)
+            db_session, need_close = await self._get_db_session()
+            try:
+                result = await self._db_handlers[tool_name](db_session, tool_input)
+                # 在结果前标注实际查询的数据库名称
+                db_info = self.agent_config.get("_db_info")
+                if db_info:
+                    db_label = f"[数据库: {db_info.get('database', '?')}]"
+                else:
+                    db_label = "[数据库: 应用内置库]"
+                return f"{db_label}\n{result}"
+            finally:
+                if need_close:
+                    await db_session.close()
 
         if tool_name in self._agent_handlers:
             return await self._agent_handlers[tool_name](self.db, self.agent_config, tool_input)

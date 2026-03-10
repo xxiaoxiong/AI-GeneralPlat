@@ -103,6 +103,23 @@ def _parse_baidu_html(html: str, max_results: int) -> List[Dict[str, str]]:
     return results
 
 
+async def _fetch_page_text(client: httpx.AsyncClient, url: str, max_len: int = 1500) -> str:
+    """抓取单个网页的正文文本（用于搜索结果内容增强）"""
+    try:
+        resp = await client.get(url, headers=_HEADERS, timeout=10)
+        html = resp.text
+        html = re.sub(r'<(script|style|head|nav|footer|header)[^>]*>.*?</\1>', '', html, flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r'<[^>]+>', ' ', html)
+        text = re.sub(r'[ \t]{2,}', ' ', text)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+        text = text.strip()
+        if len(text) < 50:
+            return ""
+        return text[:max_len]
+    except Exception:
+        return ""
+
+
 def _format_search_results(query: str, results: List[Dict], engine: str) -> str:
     if not results:
         return f"搜索 '{query}' 未找到结果"
@@ -111,18 +128,167 @@ def _format_search_results(query: str, results: List[Dict], engine: str) -> str:
         lines.append(f"{i}. **{r['title']}**")
         if r.get("desc"):
             lines.append(f"   {r['desc']}")
+        if r.get("page_content"):
+            lines.append(f"   📄 页面摘要: {r['page_content']}")
         lines.append(f"   🔗 [{r['url']}]({r['url']})\n")
     return "\n".join(lines)
 
 
+def _parse_duckduckgo_html(html: str, max_results: int) -> List[Dict[str, str]]:
+    """从 DuckDuckGo HTML Lite 解析搜索结果"""
+    results = []
+
+    # DDG HTML Lite 使用 class="result__a" 作为结果链接
+    # 模式 1：提取 result 块
+    blocks = re.findall(
+        r'<div[^>]+class="[^"]*links_main[^"]*"[^>]*>(.*?)</div>\s*</div>',
+        html, re.DOTALL
+    )
+    if not blocks:
+        # 模式 2：匹配 result 级别的 div
+        blocks = re.findall(
+            r'<div[^>]+class="[^"]*result\b[^"]*"[^>]*>(.*?)</div>\s*(?=<div|$)',
+            html, re.DOTALL
+        )
+
+    for block in blocks[:max_results]:
+        # 提取链接和标题
+        link_m = re.search(r'<a[^>]+href="([^"]+)"[^>]*class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>', block, re.DOTALL)
+        if not link_m:
+            link_m = re.search(r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', block, re.DOTALL)
+        if not link_m:
+            link_m = re.search(r'<a[^>]+href="(https?://[^"]+)"[^>]*>(.*?)</a>', block, re.DOTALL)
+
+        if link_m:
+            url = link_m.group(1)
+            title = re.sub(r'<[^>]+>', '', link_m.group(2)).strip()
+            # 提取描述
+            desc = ""
+            desc_m = re.search(r'class="[^"]*result__snippet[^"]*"[^>]*>(.*?)</[a-z]', block, re.DOTALL)
+            if not desc_m:
+                desc_m = re.search(r'class="[^"]*snippet[^"]*"[^>]*>(.*?)</[a-z]', block, re.DOTALL)
+            if desc_m:
+                desc = re.sub(r'<[^>]+>', '', desc_m.group(1)).strip()
+            if url.startswith("http") and title and "duckduckgo" not in url.lower():
+                results.append({"title": title, "url": url, "desc": desc[:200]})
+
+    # 如果块解析失败，尝试全局提取
+    if not results:
+        all_links = re.findall(
+            r'<a[^>]+class="[^"]*result__a[^"]*"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
+            html, re.DOTALL
+        )
+        if not all_links:
+            all_links = re.findall(
+                r'<a[^>]+href="([^"]+)"[^>]*class="[^"]*result__a[^"]*"[^>]*>(.*?)</a>',
+                html, re.DOTALL
+            )
+        for url, title_html in all_links[:max_results]:
+            title = re.sub(r'<[^>]+>', '', title_html).strip()
+            if url.startswith("http") and title:
+                results.append({"title": title, "url": url, "desc": ""})
+
+    return results
+
+
+# 搜索结果自动拓展：拨取前 N 条结果的页面内容
+_AUTO_FETCH_TOP_N = 2
+_AUTO_FETCH_MAX_CHARS = 1200
+
+
+async def _enhance_results_with_content(
+    client: httpx.AsyncClient, results: List[Dict], top_n: int = _AUTO_FETCH_TOP_N
+) -> List[Dict]:
+    """自动拓展搜索结果：并发拨取前 top_n 条结果的页面正文，加入到 page_content 字段"""
+    import asyncio
+    targets = [r for r in results[:top_n] if r.get("url", "").startswith("http")]
+    if not targets:
+        return results
+
+    tasks = [_fetch_page_text(client, r["url"], _AUTO_FETCH_MAX_CHARS) for r in targets]
+    contents = await asyncio.gather(*tasks, return_exceptions=True)
+
+    for r, content in zip(targets, contents):
+        if isinstance(content, str) and content:
+            r["page_content"] = content
+    return results
+
+
 async def execute_web_search(params: dict) -> str:
+    from app.core.config import settings
+
     query       = params.get("query", "")
     max_results = min(int(params.get("max_results", 5)), 10)
     engine      = params.get("engine", "auto").lower()
 
-    async with httpx.AsyncClient(timeout=20, verify=False, follow_redirects=True) as client:
-        # 尝试 Bing
-        if engine in ("auto", "bing"):
+    errors = []  # 记录每个引擎的失败原因
+    timeout = settings.SEARCH_TIMEOUT or 25
+    found_results = None
+    found_engine = ""
+
+    async with httpx.AsyncClient(timeout=timeout, verify=False, follow_redirects=True) as client:
+        # 引擎 0：SearXNG（内网搜索引擎，优先级最高）
+        searxng_url = settings.SEARXNG_URL
+        if not found_results and searxng_url and engine in ("auto", "searxng"):
+            try:
+                resp = await client.get(
+                    f"{searxng_url.rstrip('/')}/search",
+                    params={"q": query, "format": "json", "language": "zh-CN"},
+                    headers=_HEADERS,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    results = []
+                    for item in (data.get("results") or [])[:max_results]:
+                        results.append({
+                            "title": item.get("title", ""),
+                            "url": item.get("url", ""),
+                            "desc": (item.get("content") or "")[:200],
+                        })
+                    if results:
+                        found_results = results
+                        found_engine = "SearXNG"
+                    else:
+                        errors.append("SearXNG: 返回 0 条结果")
+                else:
+                    errors.append(f"SearXNG: HTTP {resp.status_code}")
+            except httpx.ConnectError:
+                errors.append(f"SearXNG: 连接失败（{searxng_url}）")
+            except httpx.TimeoutException:
+                errors.append("SearXNG: 请求超时")
+            except Exception as e:
+                errors.append(f"SearXNG: {type(e).__name__}: {e}")
+
+        # 引擎 1：DuckDuckGo HTML Lite（POST 方式，最低反爬虫）
+        if not found_results and engine in ("auto", "duckduckgo"):
+            try:
+                resp = await client.post(
+                    "https://html.duckduckgo.com/html/",
+                    data={"q": query},
+                    headers={
+                        **_HEADERS,
+                        "Referer": "https://duckduckgo.com/",
+                        "Content-Type": "application/x-www-form-urlencoded",
+                    },
+                )
+                if resp.status_code == 200:
+                    results = _parse_duckduckgo_html(resp.text, max_results)
+                    if results:
+                        found_results = results
+                        found_engine = "DuckDuckGo"
+                    else:
+                        errors.append(f"DuckDuckGo: 解析到 0 条结果（HTML长度={len(resp.text)}）")
+                else:
+                    errors.append(f"DuckDuckGo: HTTP {resp.status_code}")
+            except httpx.ConnectError:
+                errors.append("DuckDuckGo: 连接失败（网络不可达）")
+            except httpx.TimeoutException:
+                errors.append("DuckDuckGo: 请求超时")
+            except Exception as e:
+                errors.append(f"DuckDuckGo: {type(e).__name__}: {e}")
+
+        # 引擎 2：Bing
+        if not found_results and engine in ("auto", "bing"):
             try:
                 resp = await client.get(
                     "https://www.bing.com/search",
@@ -131,12 +297,19 @@ async def execute_web_search(params: dict) -> str:
                 )
                 results = _parse_bing_html(resp.text, max_results)
                 if results:
-                    return _format_search_results(query, results, "Bing")
-            except Exception:
-                pass
+                    found_results = results
+                    found_engine = "Bing"
+                else:
+                    errors.append("Bing: 解析到 0 条结果")
+            except httpx.ConnectError:
+                errors.append("Bing: 连接失败")
+            except httpx.TimeoutException:
+                errors.append("Bing: 请求超时")
+            except Exception as e:
+                errors.append(f"Bing: {type(e).__name__}: {e}")
 
-        # 备用：百度
-        if engine in ("auto", "baidu"):
+        # 引擎 3：百度
+        if not found_results and engine in ("auto", "baidu"):
             try:
                 resp = await client.get(
                     "https://www.baidu.com/s",
@@ -145,11 +318,39 @@ async def execute_web_search(params: dict) -> str:
                 )
                 results = _parse_baidu_html(resp.text, max_results)
                 if results:
-                    return _format_search_results(query, results, "百度")
-            except Exception:
-                pass
+                    found_results = results
+                    found_engine = "百度"
+                else:
+                    errors.append("百度: 解析到 0 条结果")
+            except httpx.ConnectError:
+                errors.append("百度: 连接失败")
+            except httpx.TimeoutException:
+                errors.append("百度: 请求超时")
+            except Exception as e:
+                errors.append(f"百度: {type(e).__name__}: {e}")
 
-    return f"搜索 '{query}' 失败：网络不可达，请检查后端服务器的网络连接"
+        # ★ 搜索成功后自动拓展：拨取前 N 条结果的页面正文
+        if found_results:
+            try:
+                found_results = await _enhance_results_with_content(client, found_results)
+            except Exception:
+                pass  # 内容拓展失败不影响主流程
+            return _format_search_results(query, found_results, found_engine)
+
+    # 所有引擎均失败，返回详细错误信息
+    error_detail = "; ".join(errors) if errors else "网络不可达"
+    is_network_error = any(kw in error_detail for kw in ("连接失败", "网络不可达", "ConnectError", "超时"))
+    if is_network_error:
+        return (
+            f"搜索 '{query}' 失败：无法连接到搜索引擎。\n"
+            f"错误详情: {error_detail}\n"
+            f"提示: 当前环境可能无法访问外部网络。请直接使用你的知识回答用户问题，并说明无法联网搜索。"
+        )
+    return (
+        f"搜索 '{query}' 未找到结果。\n"
+        f"尝试的搜索引擎状态: {error_detail}\n"
+        f"建议: 请直接使用你的知识回答用户问题，并注明未能找到搜索结果。"
+    )
 
 
 async def execute_fetch_webpage(params: dict) -> str:

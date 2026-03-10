@@ -58,6 +58,11 @@
           <template #title>Agent 智能体</template>
         </el-menu-item>
 
+        <el-menu-item index="/databases">
+          <el-icon><Coin /></el-icon>
+          <template #title>数据库管理</template>
+        </el-menu-item>
+
         <!-- 分组：自动化 -->
         <div v-if="!isCollapsed" class="menu-group-label">自动化</div>
         <div v-else class="menu-divider" />

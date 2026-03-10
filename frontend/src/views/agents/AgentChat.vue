@@ -157,8 +157,35 @@
                 </el-collapse>
               </div>
 
+              <!-- 错误信息（即使关闭思考链也显示） -->
+              <div v-if="!showThinking && msg.steps?.some(s => s.type === 'error')" class="error-banner">
+                <span v-for="(step, ei) in msg.steps.filter(s => s.type === 'error')" :key="ei">
+                  ⚠️ {{ step.content }}
+                </span>
+              </div>
+
               <!-- 最终回答 -->
               <div class="final-answer" v-html="renderMarkdown(msg.content)"></div>
+
+              <!-- 追问快捷回复按钮 -->
+              <div v-if="msg.clarify_suggestions && msg.clarify_suggestions.length" class="clarify-suggestions">
+                <div class="clarify-label">快捷回复：</div>
+                <div class="clarify-chips">
+                  <span
+                    v-for="(sug, si) in msg.clarify_suggestions"
+                    :key="si"
+                    class="clarify-chip"
+                    @click="sendExample(sug)"
+                  >{{ sug }}</span>
+                </div>
+              </div>
+
+              <!-- 重新生成按钮 -->
+              <div v-if="idx === messages.length - 1 && !streaming" class="regenerate-bar">
+                <el-button size="small" text @click="regenerateMessage">
+                  🔄 重新生成
+                </el-button>
+              </div>
             </div>
           </div>
 
@@ -218,14 +245,24 @@
         />
         <div class="input-actions">
           <span class="input-hint">Enter 发送 · Shift+Enter 换行</span>
-          <el-button
-            type="primary"
-            :loading="streaming"
-            :disabled="!inputText.trim()"
-            @click="sendMessage"
-          >
-            {{ streaming ? '思考中...' : '发送' }}
-          </el-button>
+          <div class="input-buttons">
+            <el-button
+              v-if="streaming"
+              type="danger"
+              plain
+              @click="stopGeneration"
+            >
+              ⏹ 停止生成
+            </el-button>
+            <el-button
+              v-else
+              type="primary"
+              :disabled="!inputText.trim()"
+              @click="sendMessage"
+            >
+              发送
+            </el-button>
+          </div>
         </div>
       </div>
     </div>
@@ -254,6 +291,7 @@ const streaming = ref(false)
 const streamingStatus = ref('思考中...')
 const showThinking = ref(true)
 const messagesRef = ref<HTMLElement>()
+let abortController: AbortController | null = null
 
 const memoryDialogVisible = ref(false)
 const memories = ref<any[]>([])
@@ -329,6 +367,8 @@ function stepLabel(type: string): string {
     observation: '👁 观察',
     final: '✅ 回答',
     error: '❌ 错误',
+    verify: '🔍 校验',
+    clarify: '❓ 追问',
   }
   return map[type] || type
 }
@@ -407,6 +447,11 @@ async function newSession() {
 }
 
 async function loadSession(s: any) {
+  // 流式输出时禁止切换会话，防止数据串扰
+  if (streaming.value) {
+    ElMessage.warning('请等待当前回答完成后再切换会话')
+    return
+  }
   currentSession.value = s
   messages.value = []
   try {
@@ -421,6 +466,7 @@ async function loadSession(s: any) {
           role: 'assistant',
           content: m.content || '',
           steps: (m.steps || []).filter((s: any) => s.type !== 'done' && s.type !== 'final'),
+          clarify_suggestions: m.clarify_suggestions || [],
         }
       }
       return m
@@ -458,12 +504,17 @@ async function sendMessage() {
   inputText.value = ''
   messages.value.push({ role: 'user', content: text })
 
+  // 记住本次请求的会话ID，用于防止切换会话后数据串扰
+  const sessionIdForThisRequest = currentSession.value.id
+
   // 添加流式占位消息（用 reactive index 更新以触发 Vue 响应式）
   const streamingIdx = messages.value.length
   messages.value.push({ role: 'streaming', steps: [] as any[], content: '', streamingAnswer: '' })
   streaming.value = true
   streamingStatus.value = '思考中...'
   await scrollToBottom()
+
+  abortController = new AbortController()
 
   try {
     const response = await fetch(`/api/v1/agents/${agentId}/chat`, {
@@ -477,6 +528,7 @@ async function sendMessage() {
         message: text,
         stream: true,
       }),
+      signal: abortController.signal,
     })
 
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
@@ -486,6 +538,7 @@ async function sendMessage() {
     let buffer = ''
     let finalContent = ''
     let outerDone = false
+    let clarifySuggestions: string[] = []
 
     while (!outerDone) {
       const { done, value } = await reader.read()
@@ -513,11 +566,17 @@ async function sendMessage() {
           } else if (event.type === 'observation') {
             streamingStatus.value = '👁 获取结果...'
             messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
+          } else if (event.type === 'clarify') {
+            streamingStatus.value = '❓ 追问中...'
+            clarifySuggestions = event.suggestions || []
+            messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
+          } else if (event.type === 'verify') {
+            streamingStatus.value = '🔍 校验中...'
+            messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
           } else if (event.type === 'final_start') {
             streamingStatus.value = '✍️ 生成回答...'
             messages.value[streamingIdx] = { ...cur, streamingAnswer: '' }
           } else if (event.type === 'final_chunk') {
-            // 逐 token 追加，实时渲染
             messages.value[streamingIdx] = { ...cur, streamingAnswer: (cur.streamingAnswer || '') + event.content }
           } else if (event.type === 'final') {
             finalContent = event.content
@@ -531,28 +590,64 @@ async function sendMessage() {
       }
     }
 
-    // 替换流式消息为最终消息
-    const finalSteps = (messages.value[streamingIdx]?.steps || []).filter((s: any) => s.type !== 'final')
-    messages.value[streamingIdx] = {
-      role: 'assistant',
-      content: finalContent,
-      steps: finalSteps,
+    // 替换流式消息为最终消息（检查会话是否已切换）
+    if (currentSession.value?.id === sessionIdForThisRequest) {
+      const finalSteps = (messages.value[streamingIdx]?.steps || []).filter((s: any) => s.type !== 'final')
+      messages.value[streamingIdx] = {
+        role: 'assistant',
+        content: finalContent,
+        steps: finalSteps,
+        clarify_suggestions: clarifySuggestions,
+      }
     }
 
-    // 更新会话列表
+    // 更新会话列表（反映新的消息数）
     await loadSessions()
 
   } catch (e: any) {
-    messages.value[streamingIdx] = {
-      role: 'assistant',
-      content: `执行出错: ${e.message}`,
-      steps: [],
+    if (e.name === 'AbortError') {
+      // 用户主动停止
+      const cur = messages.value[streamingIdx]
+      const partialContent = cur?.streamingAnswer || '…（已停止生成）'
+      messages.value[streamingIdx] = {
+        role: 'assistant',
+        content: partialContent,
+        steps: (cur?.steps || []).filter((s: any) => s.type !== 'final'),
+      }
+    } else {
+      messages.value[streamingIdx] = {
+        role: 'assistant',
+        content: `执行出错: ${e.message}`,
+        steps: [],
+      }
+      ElMessage.error('请求失败: ' + e.message)
     }
-    ElMessage.error('请求失败: ' + e.message)
   } finally {
     streaming.value = false
+    abortController = null
     await scrollToBottom()
   }
+}
+
+function stopGeneration() {
+  if (abortController) {
+    abortController.abort()
+  }
+}
+
+async function regenerateMessage() {
+  if (streaming.value || messages.value.length < 2) return
+  // 找到最后一条 user 消息
+  const lastAssistantIdx = messages.value.length - 1
+  const lastUserIdx = lastAssistantIdx - 1
+  if (messages.value[lastUserIdx]?.role !== 'user') return
+  const lastUserText = messages.value[lastUserIdx].content
+  // 移除最后一组问答
+  messages.value.splice(lastUserIdx, 2)
+  // 重新发送
+  inputText.value = lastUserText
+  await nextTick()
+  sendMessage()
 }
 
 onMounted(async () => {
@@ -561,7 +656,8 @@ onMounted(async () => {
   if (sessions.value.length === 0) {
     await newSession()
   } else {
-    currentSession.value = sessions.value[0]
+    // 自动加载最新会话的消息（修复 F6: 之前只设置了 currentSession 但没调用 loadSession）
+    await loadSession(sessions.value[0])
   }
   await loadMemories()
 })
@@ -820,10 +916,20 @@ onMounted(async () => {
   border-left: 3px solid #10a37f; margin: 10px 0; padding: 6px 14px;
   color: #6b7280; background: #f0fdf9; border-radius: 0 6px 6px 0;
 }
-.final-answer :deep(table) { border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 13px; }
-.final-answer :deep(th), .final-answer :deep(td) { border: 1px solid #e5e5e5; padding: 8px 12px; color: #0d0d0d; }
-.final-answer :deep(th) { background: #f9f9f9; font-weight: 600; }
-.final-answer :deep(tr:nth-child(even)) { background: #fafafa; }
+.final-answer :deep(table) {
+  border-collapse: collapse; width: 100%; margin: 10px 0; font-size: 13px;
+  border: 1px solid #e2e8f0; border-radius: 8px; overflow: hidden;
+}
+.final-answer :deep(th), .final-answer :deep(td) {
+  border: 1px solid #e2e8f0; padding: 10px 14px; color: #0d0d0d;
+  text-align: left;
+}
+.final-answer :deep(th) {
+  background: #f1f5f9; font-weight: 600; color: #334155;
+  border-bottom: 2px solid #cbd5e1;
+}
+.final-answer :deep(tr:nth-child(even)) { background: #f8fafc; }
+.final-answer :deep(tr:hover) { background: #f0fdf9; transition: background 0.15s; }
 .final-answer :deep(a) { color: #10a37f; text-decoration: none; word-break: break-all; }
 .final-answer :deep(a:hover) { text-decoration: underline; }
 .final-answer :deep(img) {
@@ -845,6 +951,38 @@ onMounted(async () => {
 .final-answer :deep(.video-embed iframe) { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border: none; }
 .final-answer :deep(video) { max-width: 100%; border-radius: 8px; margin: 8px 0; display: block; }
 .final-answer :deep(hr) { border: none; border-top: 1px solid #e5e5e5; margin: 14px 0; }
+
+/* 错误横幅（关闭思考链时也可见） */
+.error-banner {
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 8px 12px; margin-bottom: 8px;
+  background: #fff5f5; border: 1px solid #fed7d7; border-radius: 8px;
+  font-size: 13px; color: #c53030;
+}
+
+/* 追问快捷回复 */
+.clarify-suggestions { margin-top: 12px; }
+.clarify-label { font-size: 11px; color: #9ca3af; margin-bottom: 6px; }
+.clarify-chips { display: flex; flex-wrap: wrap; gap: 8px; }
+.clarify-chip {
+  padding: 6px 14px; background: #f0fdf9; border: 1px solid #86efac;
+  border-radius: 16px; font-size: 13px; color: #065f46;
+  cursor: pointer; transition: all 0.15s;
+}
+.clarify-chip:hover {
+  background: #d1fae5; border-color: #10a37f; color: #047857;
+}
+
+/* 重新生成按钮 */
+.regenerate-bar {
+  margin-top: 8px; padding-top: 4px;
+}
+.regenerate-bar :deep(.el-button) {
+  color: #9ca3af !important; font-size: 12px;
+}
+.regenerate-bar :deep(.el-button:hover) {
+  color: #10a37f !important;
+}
 
 /* 流式状态 */
 .streaming-steps { margin-bottom: 8px; }
@@ -899,6 +1037,7 @@ onMounted(async () => {
   margin-top: 8px;
 }
 .input-hint { font-size: 12px; color: #d1d5db; }
+.input-buttons { display: flex; gap: 8px; }
 .input-actions :deep(.el-button--primary) {
   background: #10a37f !important;
   border-color: #10a37f !important;
@@ -912,5 +1051,10 @@ onMounted(async () => {
   background: #e5e5e5 !important;
   border-color: #e5e5e5 !important;
   color: #9ca3af !important;
+}
+.input-actions :deep(.el-button--danger) {
+  border-radius: 8px !important;
+  font-weight: 500;
+  padding: 8px 18px;
 }
 </style>

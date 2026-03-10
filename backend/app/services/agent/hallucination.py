@@ -274,21 +274,28 @@ class SelfVerifier:
         observations: List[Dict],
         iteration_count: int,
     ) -> bool:
-        """判断是否需要自我校验"""
+        """
+        判断是否需要自我校验
+
+        30B 优化：减少不必要的 verify 调用，因为：
+        - verify 本身消耗一次模型调用（慢+耗 token）
+        - 30B 模型的 verify 结果经常比原文更差（截断/丢失信息）
+        - 只在真正需要时才触发
+        """
         if not settings.AGENT_ENABLE_SELF_VERIFY:
             return False
 
-        # 使用了工具且答案较长时需要校验
-        if observations and len(final_answer) > 200:
+        # 必须有工具观察结果才值得校验
+        if not observations:
+            return False
+
+        # 只在多步工具调用 + 答案较长时才校验
+        if iteration_count >= 4 and len(final_answer) > 500:
             return True
 
-        # 多步骤推理需要校验
-        if iteration_count >= 3:
-            return True
-
-        # 答案中包含具体数据时需要校验
-        has_specific_data = bool(re.search(r'\b\d{4,}\b', final_answer))
-        if has_specific_data and observations:
+        # 答案中包含可疑的具体数据（非年份的长数字）且工具调用多次
+        has_specific_data = bool(re.search(r'\b\d{6,}\b', final_answer))
+        if has_specific_data and len(observations) >= 2:
             return True
 
         return False
@@ -299,41 +306,45 @@ class SelfVerifier:
         final_answer: str,
         observations: List[Dict],
     ) -> str:
-        """构建自我校验提示词"""
+        """构建自我校验提示词（30B 优化：简洁版）"""
         obs_summary = ""
         if observations:
             obs_parts = []
-            for obs in observations:
-                tool = obs.get("tool_name", "未知工具")
-                content = obs.get("content", "")[:300]
+            for obs in observations[:3]:  # 最多3条观察，节省 token
+                tool = obs.get("tool_name", "")
+                content = obs.get("content", "")[:200]
                 obs_parts.append(f"[{tool}] {content}")
             obs_summary = "\n".join(obs_parts)
 
         return (
-            f"请检查以下回答的准确性：\n\n"
-            f"**用户问题**: {original_question}\n\n"
-            f"**你的回答**: {final_answer[:500]}\n\n"
-            f"**工具返回数据**:\n{obs_summary}\n\n"
-            f"请检查：\n"
-            f"1. 回答中的数据是否都来自工具返回结果？\n"
-            f"2. 是否有编造的信息？\n"
-            f"3. 回答是否完整回答了用户问题？\n\n"
-            f"如果一切正确，回复 VERIFIED\n"
-            f"如果有问题，回复 ISSUE: [问题描述] 并给出修正后的 Final Answer"
+            f"检查回答准确性：\n"
+            f"问题: {original_question[:200]}\n"
+            f"回答: {final_answer[:400]}\n"
+            f"工具数据:\n{obs_summary}\n\n"
+            f"回答正确则输出 VERIFIED\n"
+            f"有问题则输出 ISSUE: [问题] 然后输出完整的 Final Answer: [修正后的完整回答]"
         )
 
     @staticmethod
     def parse_verify_result(verify_output: str) -> Tuple[bool, str]:
-        """解析校验结果"""
+        """
+        解析校验结果
+
+        30B 优化：增加长度保护，拒绝截断的修正
+        """
         if "VERIFIED" in verify_output.upper():
             return True, ""
-
-        # 提取修正后的答案
-        issue_match = re.search(r'ISSUE\s*[:：]\s*(.*?)(?=Final Answer|$)', verify_output, re.DOTALL | re.IGNORECASE)
-        issue = issue_match.group(1).strip() if issue_match else verify_output[:200]
 
         # 提取修正后的 Final Answer
         fa_match = re.search(r'Final\s*Answer\s*[:：]\s*([\s\S]+?)$', verify_output, re.IGNORECASE)
         corrected = fa_match.group(1).strip() if fa_match else ""
 
-        return False, corrected or issue
+        # 如果修正文本太短（<50字），可能是截断的，不采用
+        if corrected and len(corrected) < 50:
+            return False, ""
+
+        # 提取问题描述
+        issue_match = re.search(r'ISSUE\s*[:：]\s*(.*?)(?=Final Answer|$)', verify_output, re.DOTALL | re.IGNORECASE)
+        issue = issue_match.group(1).strip() if issue_match else ""
+
+        return False, corrected or ""

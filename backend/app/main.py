@@ -9,7 +9,7 @@ from app.core.config import settings
 from app.core.database import init_db
 from app.core.redis import init_redis, close_redis
 from app.core.logging import setup_logging, get_logger
-from app.api.v1 import auth, users, models, knowledge, workflows, app_market, audit, prompts, agents
+from app.api.v1 import auth, users, models, knowledge, workflows, app_market, audit, prompts, agents, databases
 
 logger = get_logger("main")
 
@@ -168,6 +168,7 @@ app.include_router(app_market.router, prefix=API_PREFIX)
 app.include_router(audit.router, prefix=API_PREFIX)
 app.include_router(prompts.router, prefix=API_PREFIX)
 app.include_router(agents.router, prefix=API_PREFIX)
+app.include_router(databases.router, prefix=API_PREFIX)
 
 
 @app.get("/api/health")

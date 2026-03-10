@@ -28,6 +28,9 @@ class Agent(Base):
     # 知识库关联（可选）
     knowledge_base_id = Column(Integer, ForeignKey("knowledge_bases.id"), nullable=True)
 
+    # 数据库连接关联（可选，用于自然语言查询外部数据库）
+    database_connection_id = Column(Integer, ForeignKey("database_connections.id"), nullable=True)
+
     is_active = Column(Boolean, default=True)
     owner_id = Column(Integer, ForeignKey("users.id"), nullable=True)
 

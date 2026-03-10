@@ -37,8 +37,8 @@ class Settings(BaseSettings):
     AGENT_ENABLE_SOURCE_CITATION: bool = True   # 启用来源引用
 
     # ── 推理层配置（30B 模型优化）──────────────────────────────────────────────
-    INFERENCE_MAX_CONTEXT_TOKENS: int = 8192    # 最大上下文窗口 token 数
-    INFERENCE_MAX_OUTPUT_TOKENS: int = 4096     # 最大输出 token 数
+    INFERENCE_MAX_CONTEXT_TOKENS: int = 16384   # 最大上下文窗口 token 数
+    INFERENCE_MAX_OUTPUT_TOKENS: int = 8192     # 最大输出 token 数
     INFERENCE_KV_CACHE_MAX_MB: int = 4096       # KV Cache 最大显存占用 MB
     INFERENCE_CONCURRENT_REQUESTS: int = 2      # 最大并发推理请求
     INFERENCE_REQUEST_QUEUE_SIZE: int = 20      # 请求队列大小
@@ -75,6 +75,10 @@ class Settings(BaseSettings):
     LOG_PERFORMANCE: bool = True                # 记录性能指标
     MONITOR_ENABLE: bool = True                 # 启用性能监控
     MONITOR_SLOW_THRESHOLD_MS: int = 5000       # 慢请求阈值
+
+    # ── 搜索引擎配置（内网环境）────────────────────────────────────────────────
+    SEARXNG_URL: str = ""                        # SearXNG 实例地址，如 http://localhost:8888
+    SEARCH_TIMEOUT: int = 25                     # 搜索超时秒数
 
     # ── 稳定性配置 ────────────────────────────────────────────────────────────
     HOT_RELOAD_TOOLS: bool = True               # 工具热重载

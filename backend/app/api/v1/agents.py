@@ -2,19 +2,23 @@
 Agent 管理与对话 API（v2 增强版）
 """
 import json
+import logging
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from sqlalchemy.orm.attributes import flag_modified
 from pydantic import BaseModel
 
-from app.core.database import get_db
+from app.core.database import get_db, AsyncSessionLocal
 from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.agent import Agent, AgentSession
 from app.services.agent import AgentEngine
 from app.services.tools import BUILTIN_TOOLS
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agents", tags=["agents"])
 
@@ -35,6 +39,7 @@ class AgentCreate(BaseModel):
     temperature: str = "0.7"
     tools: list = []
     knowledge_base_id: Optional[int] = None
+    database_connection_id: Optional[int] = None
 
 class AgentUpdate(AgentCreate):
     pass
@@ -161,6 +166,7 @@ async def create_agent(
         temperature=str(body.temperature),
         tools=body.tools,
         knowledge_base_id=body.knowledge_base_id,
+        database_connection_id=body.database_connection_id,
         owner_id=current_user.id,
     )
     db.add(agent)
@@ -307,6 +313,54 @@ async def agent_chat(
     messages = list(session.messages or [])
     messages.append({"role": "user", "content": body.message})
 
+    # 数据库连接信息注入：让 Agent 知道它连接的是哪个数据库
+    if agent_config.get("database_connection_id"):
+        try:
+            from app.models.database_connection import DatabaseConnection
+            db_conn_res = await db.execute(
+                select(DatabaseConnection).where(
+                    DatabaseConnection.id == agent_config["database_connection_id"]
+                )
+            )
+            db_conn = db_conn_res.scalar_one_or_none()
+            if db_conn:
+                agent_config = dict(agent_config)
+                db_info = {
+                    "name": db_conn.name,
+                    "db_type": db_conn.db_type,
+                    "database": db_conn.database,
+                    "host": db_conn.host,
+                    "tables": [],  # 预加载表列表
+                }
+                # ★ 预加载数据库表列表，避免模型猜测表名
+                try:
+                    import sqlalchemy as sa
+                    db_type = db_conn.db_type
+                    if db_type == "mysql":
+                        sync_url = f"mysql+pymysql://{db_conn.username}:{db_conn.password}@{db_conn.host}:{db_conn.port}/{db_conn.database}"
+                    elif db_type == "postgresql":
+                        sync_url = f"postgresql+psycopg2://{db_conn.username}:{db_conn.password}@{db_conn.host}:{db_conn.port}/{db_conn.database}"
+                    elif db_type == "sqlite":
+                        sync_url = f"sqlite:///{db_conn.database}"
+                    else:
+                        sync_url = None
+
+                    if sync_url:
+                        if db_conn.extra_params:
+                            sync_url += f"?{db_conn.extra_params}"
+                        sync_engine = sa.create_engine(sync_url, pool_pre_ping=True)
+                        insp = sa.inspect(sync_engine)
+                        table_names = insp.get_table_names()
+                        db_info["tables"] = table_names[:50]
+                        sync_engine.dispose()
+                        logger.info(f"预加载数据库 {db_conn.database} 表列表: {table_names[:10]}...")
+                except Exception as e:
+                    logger.warning(f"预加载数据库表列表失败: {e}")
+
+                agent_config["_db_info"] = db_info
+        except Exception as e:
+            logger.warning(f"加载数据库连接信息失败: {e}")
+
     # 跨会话记忆：检索相关历史记忆并注入 agent_config
     if body.use_memory:
         from app.services.agent.memory_manager import MemoryManager
@@ -332,12 +386,10 @@ async def agent_chat(
             if event["type"] == "final":
                 final_content = event["content"]
 
-        # 保存到会话
+        # 保存到会话（使用独立会话，避免引擎污染）
         messages.append({"role": "assistant", "content": final_content, "steps": steps})
-        session.messages = messages
-        if len(messages) == 2:
-            session.title = body.message[:50]
-        await db.commit()
+        new_title = body.message[:50] if (not session.title or session.title == "新对话") else None
+        await _save_session(session.id, messages, new_title)
 
         # 跨会话记忆：从本轮对话中提取并保存记忆
         if body.use_memory:
@@ -359,37 +411,37 @@ async def agent_chat(
             collected_steps.append(event)
             if event["type"] == "final":
                 final_content = event["content"]
-            data = json.dumps(event, ensure_ascii=False)
-            yield f"data: {data}\n\n"
 
             if event["type"] == "done":
+                # ★ 关键修复：使用独立的数据库会话保存，避免引擎工具执行
+                # 对原 db session 的污染导致 commit 失败
+                messages.append({
+                    "role": "assistant",
+                    "content": final_content,
+                    "steps": [s for s in collected_steps if s["type"] != "done"],
+                })
+                new_title = body.message[:50] if (not session.title or session.title == "新对话") else None
+                await _save_session(session.id, messages, new_title)
+
+                # 跨会话记忆
+                if body.use_memory:
+                    try:
+                        from app.services.agent.memory_manager import MemoryManager
+                        await MemoryManager.extract_and_save_memories(
+                            user_id=current_user.id,
+                            messages=[{"role": "user", "content": body.message}],
+                            agent_id=agent_id,
+                        )
+                    except Exception:
+                        pass
+
+                # 最后 yield done 事件
+                data = json.dumps(event, ensure_ascii=False)
+                yield f"data: {data}\n\n"
                 break
 
-        # 保存会话（在流结束后）
-        messages.append({
-            "role": "assistant",
-            "content": final_content,
-            "steps": [s for s in collected_steps if s["type"] != "done"],
-        })
-        session.messages = messages
-        if len(messages) == 2:
-            session.title = body.message[:50]
-        try:
-            await db.commit()
-        except Exception:
-            pass
-
-        # 跨会话记忆：从本轮对话中提取并保存记忆
-        if body.use_memory:
-            try:
-                from app.services.agent.memory_manager import MemoryManager
-                await MemoryManager.extract_and_save_memories(
-                    user_id=current_user.id,
-                    messages=[{"role": "user", "content": body.message}],
-                    agent_id=agent_id,
-                )
-            except Exception:
-                pass
+            data = json.dumps(event, ensure_ascii=False)
+            yield f"data: {data}\n\n"
 
     return StreamingResponse(
         event_stream(),
@@ -436,6 +488,27 @@ async def invoke_agent(
 
 # ── 辅助函数 ──────────────────────────────────────────────────────────────────
 
+async def _save_session(session_id: int, messages: list, new_title: str = None):
+    """使用独立数据库会话保存对话记录，避免引擎执行污染原 session"""
+    try:
+        async with AsyncSessionLocal() as save_db:
+            res = await save_db.execute(
+                select(AgentSession).where(AgentSession.id == session_id)
+            )
+            s = res.scalar_one_or_none()
+            if s:
+                s.messages = messages
+                flag_modified(s, "messages")
+                if new_title:
+                    s.title = new_title
+                await save_db.commit()
+                logger.info(f"会话 {session_id} 已保存，共 {len(messages)} 条消息")
+            else:
+                logger.error(f"会话 {session_id} 不存在，无法保存")
+    except Exception as e:
+        logger.error(f"会话 {session_id} 保存失败: {e}", exc_info=True)
+
+
 async def _get_or_404(db: AsyncSession, agent_id: int) -> Agent:
     res = await db.execute(select(Agent).where(Agent.id == agent_id, Agent.is_active == True))
     agent = res.scalar_one_or_none()
@@ -456,6 +529,7 @@ def _agent_to_dict(a: Agent) -> dict:
         "temperature": a.temperature,
         "tools": a.tools or [],
         "knowledge_base_id": a.knowledge_base_id,
+        "database_connection_id": a.database_connection_id,
         "is_active": a.is_active,
         "owner_id": a.owner_id,
         "created_at": a.created_at.isoformat() if a.created_at else None,

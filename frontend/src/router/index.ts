@@ -80,6 +80,18 @@ const router = createRouter({
           meta: { title: 'Agent 对话' },
         },
         {
+          path: 'databases',
+          name: 'DatabaseList',
+          component: () => import('@/views/databases/DatabaseList.vue'),
+          meta: { title: '数据库管理', icon: 'Coin' },
+        },
+        {
+          path: 'databases/:id/query',
+          name: 'DatabaseQuery',
+          component: () => import('@/views/databases/DatabaseQuery.vue'),
+          meta: { title: '数据库查询' },
+        },
+        {
           path: 'prompts',
           name: 'PromptList',
           component: () => import('@/views/prompts/PromptList.vue'),

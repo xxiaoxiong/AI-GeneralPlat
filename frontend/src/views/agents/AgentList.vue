@@ -28,6 +28,7 @@
           <div class="card-meta">
             <el-tag size="small" type="info">{{ agent.tools?.length || 0 }} 个工具</el-tag>
             <el-tag size="small" type="success" v-if="agent.knowledge_base_id">含知识库</el-tag>
+            <el-tag size="small" type="warning" v-if="agent.database_connection_id">含数据库</el-tag>
             <el-tag size="small">最多 {{ agent.max_iterations }} 轮</el-tag>
           </div>
         </div>
@@ -92,6 +93,17 @@
           </el-select>
         </el-form-item>
 
+        <el-form-item label="关联数据库">
+          <el-select v-model="form.database_connection_id" placeholder="可选，赋予数据库查询能力" clearable style="width:100%">
+            <el-option
+              v-for="dc in dbConnections"
+              :key="dc.id"
+              :label="`${dc.name} (${dc.db_type} - ${dc.database})`"
+              :value="dc.id"
+            />
+          </el-select>
+        </el-form-item>
+
         <el-form-item label="系统提示词">
           <el-input
             v-model="form.system_prompt"
@@ -146,7 +158,7 @@ import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Edit, Delete, ChatDotRound } from '@element-plus/icons-vue'
-import { agentApi, modelApi, knowledgeApi } from '@/api'
+import { agentApi, modelApi, knowledgeApi, databaseApi } from '@/api'
 
 const router = useRouter()
 
@@ -155,6 +167,7 @@ const saving = ref(false)
 const agents = ref<any[]>([])
 const chatModels = ref<any[]>([])
 const knowledgeBases = ref<any[]>([])
+const dbConnections = ref<any[]>([])
 const allTools = ref<any[]>([])
 const dialogVisible = ref(false)
 const editingAgent = ref<any>(null)
@@ -169,6 +182,7 @@ const defaultForm = () => ({
   temperature: '0.7',
   tools: [] as string[],
   knowledge_base_id: null as number | null,
+  database_connection_id: null as number | null,
 })
 const form = ref(defaultForm())
 const tempSlider = computed({
@@ -204,6 +218,7 @@ function openEdit(agent: any) {
     temperature: String(agent.temperature || '0.7'),
     tools: (agent.tools || []).map((t: any) => typeof t === 'string' ? t : t.name),
     knowledge_base_id: agent.knowledge_base_id || null,
+    database_connection_id: agent.database_connection_id || null,
   }
   dialogVisible.value = true
 }
@@ -255,6 +270,14 @@ onMounted(async () => {
     chatModels.value = models.filter((m: any) => m.model_type === 'chat' && m.is_active)
     knowledgeBases.value = kbs.items || []
     allTools.value = tools.items || []
+    
+    // 加载数据库连接（可能失败，如果表还不存在）
+    try {
+      const dbs = await databaseApi.list()
+      dbConnections.value = dbs.items || []
+    } catch {
+      dbConnections.value = []
+    }
   } catch { /* ignore */ }
 })
 </script>
