@@ -313,6 +313,20 @@ async def agent_chat(
     messages = list(session.messages or [])
     messages.append({"role": "user", "content": body.message})
 
+    # Q&A 编排：意图识别 + 问题重写 + 回答契约
+    from app.services.agent.qa_orchestrator import build_qa_plan
+    qa_plan = build_qa_plan(body.message, messages[:-1])
+    agent_config = dict(agent_config)
+    agent_config["_qa_plan"] = {
+        "intent": qa_plan.intent,
+        "complexity": qa_plan.complexity,
+        "rewritten_query": qa_plan.rewritten_query,
+        "answer_contract": qa_plan.answer_contract,
+        "retrieval_k": qa_plan.retrieval_k,
+        "should_clarify": qa_plan.should_clarify,
+        "clarify_question": qa_plan.clarify_question,
+    }
+
     # 数据库连接信息注入：让 Agent 知道它连接的是哪个数据库
     if agent_config.get("database_connection_id"):
         try:
@@ -366,9 +380,9 @@ async def agent_chat(
         from app.services.agent.memory_manager import MemoryManager
         memories = await MemoryManager.search_memories(
             user_id=current_user.id,
-            query=body.message,
+            query=qa_plan.rewritten_query,
             agent_id=agent_id,
-            top_k=5,
+            top_k=qa_plan.retrieval_k,
         )
         if memories:
             mem_context = MemoryManager.format_memories_for_prompt(memories)

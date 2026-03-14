@@ -221,6 +221,7 @@ class PromptBuilder:
         memory_context: str = "",
         extra_instructions: str = "",
         db_info: Optional[Dict] = None,
+        qa_plan: Optional[Dict] = None,
     ) -> str:
         """构建完整的系统提示词"""
 
@@ -262,7 +263,20 @@ class PromptBuilder:
                     f"- SQL 中的表名和列名必须与 db_schema 结果一致\n"
                 )
 
-        combined_extra = db_context + (extra_instructions or "")
+        qa_plan_context = ""
+        if qa_plan:
+            qa_plan_context = (
+                "\n# Q&A 执行策略\n"
+                f"- 用户意图: {qa_plan.get('intent', 'general')}\n"
+                f"- 任务复杂度: {qa_plan.get('complexity', 'medium')}\n"
+                f"- 检索改写: {qa_plan.get('rewritten_query', '')}\n"
+                f"- 记忆检索条数: {qa_plan.get('retrieval_k', 5)}\n"
+                f"- 是否建议先澄清: {qa_plan.get('should_clarify', False)}\n"
+                "- 回答契约:\n"
+                f"{qa_plan.get('answer_contract', '')}\n"
+            )
+
+        combined_extra = db_context + qa_plan_context + (extra_instructions or "")
 
         prompt = REACT_SYSTEM_PROMPT.format(
             user_system_prompt=user_system_prompt or "你是一个智能助手。",

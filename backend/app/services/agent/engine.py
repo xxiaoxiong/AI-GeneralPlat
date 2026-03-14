@@ -220,6 +220,20 @@ class AgentEngine:
 
         # 执行轨迹
         user_input = messages[-1]["content"] if messages else ""
+
+        # Q&A 编排层可要求先澄清，避免模型盲猜
+        qa_plan = agent_config.get("_qa_plan") or {}
+        if qa_plan.get("should_clarify") and qa_plan.get("clarify_question"):
+            clarify_q = str(qa_plan.get("clarify_question"))
+            yield {
+                "type": "clarify",
+                "content": clarify_q,
+                "suggestions": ["补充目标", "补充约束", "补充输入范围"],
+                "iteration": 0,
+            }
+            yield {"type": "done"}
+            return
+
         trace = ExecutionTrace(
             trace_id=trace_id,
             agent_id=agent_config.get("id"),
@@ -241,6 +255,7 @@ class AgentEngine:
             memory_context=memory_context,
             extra_instructions=RICH_MEDIA_RULES,
             db_info=agent_config.get("_db_info"),
+            qa_plan=agent_config.get("_qa_plan"),
         )
 
         # ── 构建对话历史（预清洗 assistant 消息中的 ReAct 步骤）─────────
