@@ -268,6 +268,7 @@ class PromptBuilder:
             qa_plan_context = (
                 "\n# Q&A 执行策略\n"
                 f"- 用户意图: {qa_plan.get('intent', 'general')}\n"
+                f"- 意图置信度: {qa_plan.get('intent_confidence', 0.5)}\n"
                 f"- 任务复杂度: {qa_plan.get('complexity', 'medium')}\n"
                 f"- 检索改写: {qa_plan.get('rewritten_query', '')}\n"
                 f"- 记忆检索条数: {qa_plan.get('retrieval_k', 5)}\n"

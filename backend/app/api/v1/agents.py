@@ -274,7 +274,11 @@ async def delete_session(
     current_user: User = Depends(get_current_user),
 ):
     res = await db.execute(
-        select(AgentSession).where(AgentSession.id == session_id, AgentSession.agent_id == agent_id)
+        select(AgentSession).where(
+            AgentSession.id == session_id,
+            AgentSession.agent_id == agent_id,
+            AgentSession.user_id == current_user.id,
+        )
     )
     session = res.scalar_one_or_none()
     if not session:
@@ -300,9 +304,16 @@ async def agent_chat(
     session = None
     if body.session_id:
         res = await db.execute(
-            select(AgentSession).where(AgentSession.id == body.session_id)
+            select(AgentSession).where(
+                AgentSession.id == body.session_id,
+                AgentSession.agent_id == agent_id,
+                AgentSession.user_id == current_user.id,
+            )
         )
         session = res.scalar_one_or_none()
+
+        if not session:
+            raise HTTPException(status_code=404, detail="会话不存在或无权限访问")
 
     if not session:
         session = AgentSession(agent_id=agent_id, user_id=current_user.id, messages=[])
@@ -319,6 +330,7 @@ async def agent_chat(
     agent_config = dict(agent_config)
     agent_config["_qa_plan"] = {
         "intent": qa_plan.intent,
+        "intent_confidence": qa_plan.intent_confidence,
         "complexity": qa_plan.complexity,
         "rewritten_query": qa_plan.rewritten_query,
         "answer_contract": qa_plan.answer_contract,
