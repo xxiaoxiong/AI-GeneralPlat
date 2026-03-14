@@ -15,6 +15,8 @@ class QAPlan:
     retrieval_k: int
     should_clarify: bool = False
     clarify_question: str = ""
+    clarify_suggestions: List[str] | None = None
+    intent_confidence: float = 0.5
 
 
 def _detect_intent(text: str) -> str:
@@ -28,6 +30,24 @@ def _detect_intent(text: str) -> str:
     if any(k in lower for k in ("写", "生成", "草稿", "文案", "润色")):
         return "generation"
     return "general"
+
+
+def _intent_confidence(intent: str, text: str) -> float:
+    lower = text.lower()
+    keywords = {
+        "database": ("sql", "数据库", "表", "db", "字段", "where", "join"),
+        "summarization": ("总结", "摘要", "归纳", "tl;dr"),
+        "analysis": ("为什么", "原理", "分析", "对比", "优化", "trade-off", "架构"),
+        "generation": ("写", "生成", "草稿", "文案", "润色"),
+    }
+    if intent not in keywords:
+        return 0.45
+    hit = sum(1 for k in keywords[intent] if k in lower)
+    if hit >= 2:
+        return 0.9
+    if hit == 1:
+        return 0.72
+    return 0.55
 
 
 def _detect_complexity(text: str) -> str:
@@ -47,20 +67,43 @@ def _detect_complexity(text: str) -> str:
     return "low"
 
 
-def _needs_clarification(message: str, intent: str) -> tuple[bool, str]:
+def _is_followup_message(message: str, history: List[Dict[str, str]]) -> bool:
+    """识别短追问，避免在已有上下文下过度追问。"""
+    if not history:
+        return False
+    clean = re.sub(r"\s+", "", message)
+    followup_words = ("那", "这个", "这个方案", "继续", "然后", "下一步", "展开", "细说", "具体点", "怎么做")
+    return len(clean) <= 14 and any(w in clean for w in followup_words)
+
+
+def _clarify_suggestions(intent: str) -> List[str]:
+    if intent == "database":
+        return ["我要查订单表", "按最近7天筛选", "返回字段: id/状态/金额"]
+    if intent == "analysis":
+        return ["目标是提升效果", "约束是成本不增加", "请输出方案+风险"]
+    if intent == "generation":
+        return ["受众是技术团队", "语气专业简洁", "长度控制在500字"]
+    return ["补充目标", "补充约束", "补充输入范围"]
+
+
+def _needs_clarification(message: str, intent: str, history: List[Dict[str, str]]) -> tuple[bool, str, List[str]]:
     clean = re.sub(r"\s+", "", message)
     vague_phrases = ("查一下", "看一下", "处理一下", "优化一下", "帮我做", "搞一下")
 
+    # 短追问通常依赖上文，不应机械触发追问
+    if _is_followup_message(message, history):
+        return False, "", []
+
     if len(clean) <= 6:
-        return True, "为了准确完成任务，请补充你的目标、输入数据范围和期望输出格式。"
+        return True, "为了准确完成任务，请补充你的目标、输入数据范围和期望输出格式。", _clarify_suggestions(intent)
 
     if any(v in clean for v in vague_phrases):
         if intent == "database" and not any(k in clean for k in ("表", "字段", "条件", "时间", "订单", "用户")):
-            return True, "你希望查哪个表/主题？筛选条件是什么？需要哪些字段？"
+            return True, "你希望查哪个表/主题？筛选条件是什么？需要哪些字段？", _clarify_suggestions(intent)
         if intent in ("analysis", "general") and len(clean) < 18:
-            return True, "请补充：你最关心的目标、约束条件、以及希望我给出的结果形式（方案/步骤/代码）。"
+            return True, "请补充：你最关心的目标、约束条件、以及希望我给出的结果形式（方案/步骤/代码）。", _clarify_suggestions(intent)
 
-    return False, ""
+    return False, "", []
 
 
 def _rewrite_query(text: str, intent: str) -> str:
@@ -109,8 +152,9 @@ def build_qa_plan(message: str, history: List[Dict[str, str]]) -> QAPlan:
     basis = f"{context_tail}\n{message}".strip()
 
     intent = _detect_intent(basis)
+    confidence = _intent_confidence(intent, basis)
     complexity = _detect_complexity(message)
-    should_clarify, clarify_question = _needs_clarification(message, intent)
+    should_clarify, clarify_question, clarify_suggestions = _needs_clarification(message, intent, history)
 
     rewritten_query = _rewrite_query(message, intent)
     answer_contract = _answer_contract(intent, complexity)
@@ -124,4 +168,6 @@ def build_qa_plan(message: str, history: List[Dict[str, str]]) -> QAPlan:
         retrieval_k=retrieval_k,
         should_clarify=should_clarify,
         clarify_question=clarify_question,
+        clarify_suggestions=clarify_suggestions,
+        intent_confidence=confidence,
     )

@@ -1,13 +1,16 @@
 """
 Agent 管理与对话 API（v2 增强版）
 """
+import asyncio
 import json
 import logging
+import time
 from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from sqlalchemy.engine import URL
 from sqlalchemy.orm.attributes import flag_modified
 from pydantic import BaseModel
 
@@ -21,6 +24,90 @@ from app.services.tools import BUILTIN_TOOLS
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/agents", tags=["agents"])
+
+
+_DB_SCHEMA_CACHE: dict[int, tuple[float, list[str]]] = {}
+_DB_SCHEMA_TTL_SECONDS = 300
+
+
+def _build_memory_query(message: str, history_messages: list[dict]) -> str:
+    """构造更稳健的记忆检索查询：短追问自动拼接上一轮上下文。"""
+    normalized = (message or '').strip()
+    compact = ''.join(normalized.split())
+    if len(compact) >= 16:
+        return normalized
+
+    recent_user = ''
+    recent_assistant = ''
+    for m in reversed(history_messages or []):
+        role = m.get('role')
+        content = str(m.get('content', '')).strip()
+        if not content:
+            continue
+        if role == 'assistant' and not recent_assistant:
+            recent_assistant = content[:120]
+        elif role == 'user' and not recent_user:
+            recent_user = content[:120]
+        if recent_user and recent_assistant:
+            break
+
+    context_bits = [x for x in [recent_user, recent_assistant] if x]
+    if not context_bits:
+        return normalized
+
+    return f"{normalized}\n\n上下文参考：{' | '.join(context_bits)}"
+
+
+def _build_db_sync_url(db_conn) -> str | None:
+    db_type = db_conn.db_type
+    if db_type == 'mysql':
+        driver = 'mysql+pymysql'
+    elif db_type == 'postgresql':
+        driver = 'postgresql+psycopg2'
+    elif db_type == 'sqlite':
+        return f"sqlite:///{db_conn.database}"
+    else:
+        return None
+
+    url = URL.create(
+        drivername=driver,
+        username=db_conn.username or None,
+        password=db_conn.password or None,
+        host=db_conn.host or None,
+        port=db_conn.port or None,
+        database=db_conn.database or None,
+    )
+    return url.render_as_string(hide_password=False)
+
+
+def _load_tables_sync(sync_url: str, extra_params: str = '') -> list[str]:
+    import sqlalchemy as sa
+
+    if extra_params:
+        sync_url = f"{sync_url}?{extra_params}"
+
+    sync_engine = sa.create_engine(sync_url, pool_pre_ping=True)
+    try:
+        insp = sa.inspect(sync_engine)
+        return insp.get_table_names()[:50]
+    finally:
+        sync_engine.dispose()
+
+
+async def _get_cached_table_names(db_conn) -> list[str]:
+    cache_key = int(db_conn.id)
+    cached = _DB_SCHEMA_CACHE.get(cache_key)
+    now = time.time()
+    if cached and (now - cached[0] <= _DB_SCHEMA_TTL_SECONDS):
+        return cached[1]
+
+    sync_url = _build_db_sync_url(db_conn)
+    if not sync_url:
+        return []
+
+    table_names = await asyncio.to_thread(_load_tables_sync, sync_url, db_conn.extra_params or '')
+    _DB_SCHEMA_CACHE[cache_key] = (now, table_names)
+    return table_names
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -274,7 +361,11 @@ async def delete_session(
     current_user: User = Depends(get_current_user),
 ):
     res = await db.execute(
-        select(AgentSession).where(AgentSession.id == session_id, AgentSession.agent_id == agent_id)
+        select(AgentSession).where(
+            AgentSession.id == session_id,
+            AgentSession.agent_id == agent_id,
+            AgentSession.user_id == current_user.id,
+        )
     )
     session = res.scalar_one_or_none()
     if not session:
@@ -300,9 +391,16 @@ async def agent_chat(
     session = None
     if body.session_id:
         res = await db.execute(
-            select(AgentSession).where(AgentSession.id == body.session_id)
+            select(AgentSession).where(
+                AgentSession.id == body.session_id,
+                AgentSession.agent_id == agent_id,
+                AgentSession.user_id == current_user.id,
+            )
         )
         session = res.scalar_one_or_none()
+
+        if not session:
+            raise HTTPException(status_code=404, detail="会话不存在或无权限访问")
 
     if not session:
         session = AgentSession(agent_id=agent_id, user_id=current_user.id, messages=[])
@@ -319,12 +417,14 @@ async def agent_chat(
     agent_config = dict(agent_config)
     agent_config["_qa_plan"] = {
         "intent": qa_plan.intent,
+        "intent_confidence": qa_plan.intent_confidence,
         "complexity": qa_plan.complexity,
         "rewritten_query": qa_plan.rewritten_query,
         "answer_contract": qa_plan.answer_contract,
         "retrieval_k": qa_plan.retrieval_k,
         "should_clarify": qa_plan.should_clarify,
         "clarify_question": qa_plan.clarify_question,
+        "clarify_suggestions": qa_plan.clarify_suggestions or [],
     }
 
     # 数据库连接信息注入：让 Agent 知道它连接的是哪个数据库
@@ -333,7 +433,9 @@ async def agent_chat(
             from app.models.database_connection import DatabaseConnection
             db_conn_res = await db.execute(
                 select(DatabaseConnection).where(
-                    DatabaseConnection.id == agent_config["database_connection_id"]
+                    DatabaseConnection.id == agent_config["database_connection_id"],
+                    DatabaseConnection.owner_id == current_user.id,
+                    DatabaseConnection.is_active == True,
                 )
             )
             db_conn = db_conn_res.scalar_one_or_none()
@@ -346,27 +448,11 @@ async def agent_chat(
                     "host": db_conn.host,
                     "tables": [],  # 预加载表列表
                 }
-                # ★ 预加载数据库表列表，避免模型猜测表名
+                # 预加载数据库表列表（带缓存+异步线程，避免阻塞事件循环）
                 try:
-                    import sqlalchemy as sa
-                    db_type = db_conn.db_type
-                    if db_type == "mysql":
-                        sync_url = f"mysql+pymysql://{db_conn.username}:{db_conn.password}@{db_conn.host}:{db_conn.port}/{db_conn.database}"
-                    elif db_type == "postgresql":
-                        sync_url = f"postgresql+psycopg2://{db_conn.username}:{db_conn.password}@{db_conn.host}:{db_conn.port}/{db_conn.database}"
-                    elif db_type == "sqlite":
-                        sync_url = f"sqlite:///{db_conn.database}"
-                    else:
-                        sync_url = None
-
-                    if sync_url:
-                        if db_conn.extra_params:
-                            sync_url += f"?{db_conn.extra_params}"
-                        sync_engine = sa.create_engine(sync_url, pool_pre_ping=True)
-                        insp = sa.inspect(sync_engine)
-                        table_names = insp.get_table_names()
-                        db_info["tables"] = table_names[:50]
-                        sync_engine.dispose()
+                    table_names = await _get_cached_table_names(db_conn)
+                    db_info["tables"] = table_names
+                    if table_names:
                         logger.info(f"预加载数据库 {db_conn.database} 表列表: {table_names[:10]}...")
                 except Exception as e:
                     logger.warning(f"预加载数据库表列表失败: {e}")
@@ -380,7 +466,7 @@ async def agent_chat(
         from app.services.agent.memory_manager import MemoryManager
         memories = await MemoryManager.search_memories(
             user_id=current_user.id,
-            query=qa_plan.rewritten_query,
+            query=_build_memory_query(qa_plan.rewritten_query, messages[:-1]),
             agent_id=agent_id,
             top_k=qa_plan.retrieval_k,
         )

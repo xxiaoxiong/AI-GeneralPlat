@@ -225,10 +225,11 @@ class AgentEngine:
         qa_plan = agent_config.get("_qa_plan") or {}
         if qa_plan.get("should_clarify") and qa_plan.get("clarify_question"):
             clarify_q = str(qa_plan.get("clarify_question"))
+            suggestions = qa_plan.get("clarify_suggestions") or ["补充目标", "补充约束", "补充输入范围"]
             yield {
                 "type": "clarify",
                 "content": clarify_q,
-                "suggestions": ["补充目标", "补充约束", "补充输入范围"],
+                "suggestions": suggestions,
                 "iteration": 0,
             }
             yield {"type": "done"}
@@ -311,6 +312,7 @@ class AgentEngine:
             ]
 
             # ── 模型推理 ─────────────────────────────────────────────────
+            yield {"type": "status", "phase": "inference", "content": "模型推理中", "iteration": iteration + 1}
             inference_start = time.perf_counter()
             req = ChatRequest(
                 model_config_id=model_config_id,
@@ -466,15 +468,28 @@ class AgentEngine:
                             # 修正太短，保留原文但加提示
                             trace.add_step("verify", f"自我校验修正被跳过（修正文本过短: {len(corrected)}字 vs 原文{len(final_text)}字）")
 
+                # 数据库任务保护：若数据库意图但没有任何数据库工具证据，明确降级提示
+                db_observation_exists = any(
+                    (obs.get("tool_name") or "").startswith("db_")
+                    for obs in observations
+                )
+                if qa_plan.get("intent") == "database" and not db_observation_exists:
+                    final_text = (
+                        "⚠️ 当前回答未获取到数据库工具返回的真实记录，以下仅为方法建议，"
+                        "请先执行 db_schema/db_query 后再给出最终结论。\n\n"
+                        + final_text
+                    )
+                    trace.add_step("verify", "数据库问题缺少工具证据，已降级为建议模式")
+
                 # ── 直接逐字符流式输出（不再二次调用模型）────────────────
                 yield {"type": "final_start", "iteration": iteration + 1}
 
                 # 分块发送（模拟流式效果，每块 20-80 字符）
-                chunk_size = 40
+                chunk_size = 80 if len(final_text) > 800 else 48
                 for i in range(0, len(final_text), chunk_size):
                     chunk = final_text[i:i + chunk_size]
                     yield {"type": "final_chunk", "content": chunk}
-                    await asyncio.sleep(0.01)  # 微延迟保证前端能逐步渲染
+                    await asyncio.sleep(0.003)  # 减少流式延迟，提高体感速度
 
                 trace.final_answer = final_text
                 yield {"type": "final", "content": final_text, "iteration": iteration + 1}
@@ -530,6 +545,7 @@ class AgentEngine:
                     continue
 
                 yield {"type": "action", "tool": tool_name, "input": tool_input, "iteration": iteration + 1}
+                yield {"type": "status", "phase": "tool", "content": f"调用工具 {tool_name}", "iteration": iteration + 1}
 
                 # ── 执行工具（带超时和重试）──────────────────────────────
                 tool_start = time.perf_counter()
@@ -641,12 +657,26 @@ def _detect_clarification(llm_output: str, parsed: ParsedOutput) -> Optional[Dic
             is_question = True
             break
 
+    question_count = text.count("？") + text.count("?")
+
     # 也检测末尾是否是问号结尾的短文本
     if not is_question:
         lines = text.strip().split('\n')
         last_line = lines[-1].strip()
         if (last_line.endswith('？') or last_line.endswith('?')) and len(text) < 500:
             is_question = True
+
+    # 降低误判：若大部分内容是完整结论，仅末尾带一个反问句，不应当作 clarify
+    declarative_signals = ("结论", "建议", "如下", "总结", "原因", "步骤", "方案", "可以", "应该")
+    has_declarative = any(sig in text for sig in declarative_signals)
+    short_last_question = False
+    lines = [ln.strip() for ln in text.strip().split('\n') if ln.strip()]
+    if lines:
+        last_line = lines[-1]
+        short_last_question = (last_line.endswith('？') or last_line.endswith('?')) and len(last_line) <= 28
+
+    if is_question and has_declarative and question_count <= 1 and short_last_question and len(text) > 80:
+        return None
 
     if not is_question:
         return None
