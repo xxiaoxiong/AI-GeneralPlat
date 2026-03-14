@@ -11,6 +11,7 @@
 7. 记忆冲突解决 → 新旧信息矛盾时听谁的
 8. 结构化记忆存储 → 不能只存文本，要存知识/规则/Skill
 """
+import math
 import re
 import json
 import sqlite3
@@ -144,6 +145,88 @@ def _relevance_score(query_tokens: List[str], doc_tokens: List[str]) -> float:
             score += idf * numerator / denominator
 
     return score / max(len(query_tokens), 1)
+
+
+def _recency_score(created_at: str) -> float:
+    """时间衰减分：越新越高（0~1）"""
+    try:
+        dt = datetime.fromisoformat(created_at)
+        age_hours = max((datetime.utcnow() - dt).total_seconds() / 3600, 0)
+        # 48h 半衰期
+        return math.exp(-age_hours / 48)
+    except Exception:
+        return 0.3
+
+
+def _type_boost(memory_type: str) -> float:
+    """不同记忆类型权重：规则/偏好优先"""
+    return {
+        MemoryType.RULE.value: 1.3,
+        MemoryType.PREFERENCE.value: 1.2,
+        MemoryType.SKILL.value: 1.15,
+        MemoryType.FACT.value: 1.0,
+        MemoryType.EPISODE.value: 0.9,
+    }.get(memory_type, 1.0)
+
+
+def _build_query_expansions(query: str) -> List[str]:
+    """轻量查询扩展（中英文混合）"""
+    expansions = [query]
+    synonym_map = {
+        "数据库": ["db", "sql", "表结构", "查询"],
+        "报错": ["错误", "异常", "失败", "error"],
+        "总结": ["归纳", "摘要", "概括"],
+        "代码": ["脚本", "程序", "函数"],
+        "优化": ["改进", "提升", "重构"],
+        "memory": ["记忆", "context", "上下文"],
+    }
+    ql = query.lower()
+    for k, vals in synonym_map.items():
+        if k in ql or k in query:
+            expansions.extend(vals)
+    return list(dict.fromkeys(expansions))
+
+
+def _mmr_select(
+    scored_rows: List[Tuple[float, tuple]],
+    query_tokens: List[str],
+    top_k: int,
+    lambda_mult: float = 0.75,
+) -> List[Tuple[float, tuple]]:
+    """MMR 重排：提升多样性，避免 topK 全是同类记忆"""
+    if len(scored_rows) <= 1:
+        return scored_rows[:top_k]
+
+    selected: List[Tuple[float, tuple]] = []
+    candidates = scored_rows[:]
+
+    while candidates and len(selected) < top_k:
+        best_idx = 0
+        best_val = -1e9
+        for i, (rel_score, row) in enumerate(candidates):
+            content = row[1]
+            doc_tokens = _tokenize(content)
+            # 将查询相似度再次纳入，避免初始分数过于依赖重要性权重
+            query_rel = _relevance_score(query_tokens, doc_tokens)
+            diversity_penalty = 0.0
+            if selected:
+                sims = []
+                for _, s_row in selected:
+                    s_tokens = _tokenize(s_row[1])
+                    inter = len(set(doc_tokens) & set(s_tokens))
+                    union = len(set(doc_tokens) | set(s_tokens)) or 1
+                    sims.append(inter / union)
+                diversity_penalty = max(sims)
+
+            combined_rel = 0.6 * rel_score + 0.4 * query_rel
+            mmr = lambda_mult * combined_rel - (1 - lambda_mult) * diversity_penalty
+            if mmr > best_val:
+                best_val = mmr
+                best_idx = i
+
+        selected.append(candidates.pop(best_idx))
+
+    return selected
 
 
 class MemoryManager:
@@ -293,7 +376,8 @@ class MemoryManager:
         pinned = [r for r in rows if r[5]]  # is_pinned
         unpinned = [r for r in rows if not r[5]]
 
-        query_tokens = _tokenize(query)
+        expanded_query = " ".join(_build_query_expansions(query))
+        query_tokens = _tokenize(expanded_query)
         if not query_tokens:
             results = pinned + unpinned[:top_k - len(pinned)]
             return [
@@ -306,11 +390,18 @@ class MemoryManager:
         scored = []
         for row in unpinned:
             doc_tokens = _tokenize(row[1])
-            score = _relevance_score(query_tokens, doc_tokens) * row[3]  # × importance
+            lexical_score = _relevance_score(query_tokens, doc_tokens)
+            score = (
+                lexical_score
+                * row[3]  # 用户定义重要性
+                * _type_boost(row[2])
+                * (0.7 + 0.3 * _recency_score(row[6]))
+            )
             if score >= min_score:
                 scored.append((score, row))
 
         scored.sort(key=lambda x: x[0], reverse=True)
+        scored = _mmr_select(scored, query_tokens, top_k=max(top_k * 2, 10))
 
         results = []
         # 先加入置顶记忆
