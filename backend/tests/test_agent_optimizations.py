@@ -642,18 +642,17 @@ class TestToolExecutorCaching:
         assert executor._ext_engine is None
         assert executor._ext_engine_conn_id is None
 
-    def test_no_conn_id_uses_app_db(self):
-        """无 database_connection_id 时应使用应用自身数据库"""
+    def test_no_conn_id_raises_error(self):
+        """无 database_connection_id 时应报错，避免误查应用自身数据库"""
         import asyncio
+        import pytest
         from app.services.agent.tool_executor import EnhancedToolExecutor
 
-        mock_db = "mock_app_db"
-        executor = EnhancedToolExecutor(db=mock_db, agent_config={})
+        executor = EnhancedToolExecutor(db="mock_app_db", agent_config={})
 
         async def check():
-            session, need_close = await executor._get_db_session()
-            assert session == mock_db
-            assert need_close is False
+            with pytest.raises(ValueError, match="未配置外部数据库连接"):
+                await executor._get_db_session()
 
         asyncio.get_event_loop().run_until_complete(check())
 
@@ -724,6 +723,53 @@ class TestV25RawDataRules:
         executor = EnhancedToolExecutor(db=None, agent_config={})
         db_info = executor.agent_config.get("_db_info")
         assert db_info is None
+
+
+class TestV26DatabaseConnectionGuard:
+    """v2.6 外部数据库连接强约束测试"""
+
+    def test_no_conn_id_raises_error(self):
+        """未配置 database_connection_id 时，必须阻止落到应用库"""
+        import asyncio
+        import pytest
+        from app.services.agent.tool_executor import EnhancedToolExecutor
+
+        executor = EnhancedToolExecutor(db=object(), agent_config={})
+
+        async def check():
+            with pytest.raises(ValueError, match="未配置外部数据库连接"):
+                await executor._get_db_session()
+
+        asyncio.get_event_loop().run_until_complete(check())
+
+    def test_owner_scope_check_in_query(self):
+        """数据库连接查询应包含 owner_id 和 is_active 约束"""
+        import asyncio
+        from unittest.mock import AsyncMock
+        from app.services.agent.tool_executor import EnhancedToolExecutor
+
+        class MockResult:
+            def scalar_one_or_none(self):
+                return None
+
+        mock_db = AsyncMock()
+        mock_db.execute = AsyncMock(return_value=MockResult())
+
+        executor = EnhancedToolExecutor(db=mock_db, agent_config={"database_connection_id": 123, "owner_id": 9})
+
+        async def check():
+            try:
+                await executor._get_db_session()
+            except ValueError:
+                pass
+
+        asyncio.get_event_loop().run_until_complete(check())
+
+        called_query = mock_db.execute.call_args[0][0]
+        where_sql = str(called_query.whereclause)
+        assert "database_connections.owner_id" in where_sql
+        assert "database_connections.is_active" in where_sql
+
 
 
 if __name__ == "__main__":

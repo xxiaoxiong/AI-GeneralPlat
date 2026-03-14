@@ -129,6 +129,7 @@ class EnhancedToolExecutor:
         # 外部数据库引擎缓存（避免每次调用都创建新引擎）
         self._ext_engine = None
         self._ext_engine_conn_id = None
+        self._active_db_label = "[数据库: 未设置]"
 
         # 从旧工具系统导入 handler
         from app.services.tools import (
@@ -250,11 +251,10 @@ class EnhancedToolExecutor:
         return f"工具执行失败（已重试 {max_retries} 次）: {last_error}"
 
     async def _get_db_session(self):
-        """获取数据库会话：优先使用用户配置的外部数据库连接"""
+        """获取数据库会话：仅允许使用用户配置的外部数据库连接。"""
         conn_id = self.agent_config.get("database_connection_id")
         if not conn_id:
-            logger.info("未配置外部数据库连接，使用应用自身数据库")
-            return self.db, False  # 使用应用自身数据库，无需关闭
+            raise ValueError("未配置外部数据库连接，已阻止访问应用内置数据库。请先在智能体中绑定 database_connection_id")
 
         logger.info(f"使用外部数据库连接 ID={conn_id}")
 
@@ -268,12 +268,20 @@ class EnhancedToolExecutor:
         # 加载用户配置的外部数据库连接
         from sqlalchemy import select
         from app.models.database_connection import DatabaseConnection
-        res = await self.db.execute(
-            select(DatabaseConnection).where(DatabaseConnection.id == conn_id)
+        owner_id = self.agent_config.get("owner_id")
+        query = select(DatabaseConnection).where(
+            DatabaseConnection.id == conn_id,
+            DatabaseConnection.is_active == True,
         )
+        if owner_id is not None:
+            query = query.where(DatabaseConnection.owner_id == owner_id)
+
+        res = await self.db.execute(query)
         conn = res.scalar_one_or_none()
         if not conn:
-            raise ValueError(f"数据库连接 ID={conn_id} 不存在，请在智能体设置中重新配置数据库连接")
+            raise ValueError(
+                f"数据库连接 ID={conn_id} 不存在、未启用或无权限访问，请在智能体设置中重新配置数据库连接"
+            )
 
         logger.info(f"连接外部数据库: {conn.db_type}://{conn.host}:{conn.port}/{conn.database} (名称: {conn.name})")
 
@@ -285,6 +293,7 @@ class EnhancedToolExecutor:
         from sqlalchemy.ext.asyncio import AsyncSession as ExtSession, async_sessionmaker
         factory = async_sessionmaker(ext_engine, class_=ExtSession, expire_on_commit=False)
         ext_session = factory()
+        self._active_db_label = f"[数据库: {conn.name}/{conn.database}]"
         # 返回外部会话，需要调用者关闭
         return ext_session, True
 
@@ -314,13 +323,7 @@ class EnhancedToolExecutor:
             db_session, need_close = await self._get_db_session()
             try:
                 result = await self._db_handlers[tool_name](db_session, tool_input)
-                # 在结果前标注实际查询的数据库名称
-                db_info = self.agent_config.get("_db_info")
-                if db_info:
-                    db_label = f"[数据库: {db_info.get('database', '?')}]"
-                else:
-                    db_label = "[数据库: 应用内置库]"
-                return f"{db_label}\n{result}"
+                return f"{self._active_db_label}\n{result}"
             finally:
                 if need_close:
                     await db_session.close()

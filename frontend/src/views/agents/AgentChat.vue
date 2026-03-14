@@ -641,6 +641,8 @@ async function sendMessage() {
           } else if (event.type === 'verify') {
             streamingStatus.value = '🔍 校验中...'
             messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
+          } else if (event.type === 'status') {
+            streamingStatus.value = event.content || '处理中...'
           } else if (event.type === 'final_start') {
             streamingStatus.value = '✍️ 生成回答...'
             messages.value[streamingIdx] = { ...cur, streamingAnswer: '' }
@@ -674,6 +676,9 @@ async function sendMessage() {
 
     // 替换流式消息为最终消息（检查会话是否已切换）
     if (currentSession.value?.id === sessionIdForThisRequest) {
+      if (!finalContent && messages.value[streamingIdx]?.streamingAnswer) {
+        finalContent = messages.value[streamingIdx].streamingAnswer
+      }
       const finalSteps = (messages.value[streamingIdx]?.steps || []).filter((s: any) => s.type !== 'final')
       messages.value[streamingIdx] = {
         role: 'assistant',

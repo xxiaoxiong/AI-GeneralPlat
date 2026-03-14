@@ -84,15 +84,15 @@ def _needs_clarification(message: str, intent: str, history: List[Dict[str, str]
         return False, ""
 
     if len(clean) <= 6:
-        return True, "为了准确完成任务，请补充你的目标、输入数据范围和期望输出格式。"
+        return True, "为了准确完成任务，请补充你的目标、输入数据范围和期望输出格式。", _clarify_suggestions(intent)
 
     if any(v in clean for v in vague_phrases):
         if intent == "database" and not any(k in clean for k in ("表", "字段", "条件", "时间", "订单", "用户")):
-            return True, "你希望查哪个表/主题？筛选条件是什么？需要哪些字段？"
+            return True, "你希望查哪个表/主题？筛选条件是什么？需要哪些字段？", _clarify_suggestions(intent)
         if intent in ("analysis", "general") and len(clean) < 18:
-            return True, "请补充：你最关心的目标、约束条件、以及希望我给出的结果形式（方案/步骤/代码）。"
+            return True, "请补充：你最关心的目标、约束条件、以及希望我给出的结果形式（方案/步骤/代码）。", _clarify_suggestions(intent)
 
-    return False, ""
+    return False, "", []
 
 
 def _rewrite_query(text: str, intent: str) -> str:
