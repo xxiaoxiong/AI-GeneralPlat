@@ -470,14 +470,6 @@ async function handleMarkdownAreaClick(evt: Event) {
   }
 }
 
-function handleMarkdownImageError(evt: Event) {
-  const target = evt.target as HTMLElement | null
-  const img = target as HTMLImageElement | null
-  if (!img || !img.classList?.contains('md-img')) return
-  img.classList.add('img-broken')
-  img.alt = img.alt || '图片加载失败'
-}
-
 async function loadAgent() {
   try {
     agent.value = await agentApi.get(agentId)
@@ -747,7 +739,6 @@ async function regenerateMessage() {
 
 onMounted(async () => {
   messagesRef.value?.addEventListener('click', handleMarkdownAreaClick)
-  messagesRef.value?.addEventListener('error', handleMarkdownImageError, true)
   await loadAgent()
   await loadSessions()
   if (sessions.value.length === 0) {
@@ -761,7 +752,6 @@ onMounted(async () => {
 
 onUnmounted(() => {
   messagesRef.value?.removeEventListener('click', handleMarkdownAreaClick)
-  messagesRef.value?.removeEventListener('error', handleMarkdownImageError, true)
 })
 </script>
 

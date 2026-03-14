@@ -15,7 +15,6 @@ class QAPlan:
     retrieval_k: int
     should_clarify: bool = False
     clarify_question: str = ""
-    clarify_suggestions: List[str] | None = None
     intent_confidence: float = 0.5
 
 
@@ -76,23 +75,13 @@ def _is_followup_message(message: str, history: List[Dict[str, str]]) -> bool:
     return len(clean) <= 14 and any(w in clean for w in followup_words)
 
 
-def _clarify_suggestions(intent: str) -> List[str]:
-    if intent == "database":
-        return ["我要查订单表", "按最近7天筛选", "返回字段: id/状态/金额"]
-    if intent == "analysis":
-        return ["目标是提升效果", "约束是成本不增加", "请输出方案+风险"]
-    if intent == "generation":
-        return ["受众是技术团队", "语气专业简洁", "长度控制在500字"]
-    return ["补充目标", "补充约束", "补充输入范围"]
-
-
-def _needs_clarification(message: str, intent: str, history: List[Dict[str, str]]) -> tuple[bool, str, List[str]]:
+def _needs_clarification(message: str, intent: str, history: List[Dict[str, str]]) -> tuple[bool, str]:
     clean = re.sub(r"\s+", "", message)
     vague_phrases = ("查一下", "看一下", "处理一下", "优化一下", "帮我做", "搞一下")
 
     # 短追问通常依赖上文，不应机械触发追问
     if _is_followup_message(message, history):
-        return False, "", []
+        return False, ""
 
     if len(clean) <= 6:
         return True, "为了准确完成任务，请补充你的目标、输入数据范围和期望输出格式。", _clarify_suggestions(intent)
@@ -154,7 +143,7 @@ def build_qa_plan(message: str, history: List[Dict[str, str]]) -> QAPlan:
     intent = _detect_intent(basis)
     confidence = _intent_confidence(intent, basis)
     complexity = _detect_complexity(message)
-    should_clarify, clarify_question, clarify_suggestions = _needs_clarification(message, intent, history)
+    should_clarify, clarify_question = _needs_clarification(message, intent, history)
 
     rewritten_query = _rewrite_query(message, intent)
     answer_contract = _answer_contract(intent, complexity)
@@ -168,6 +157,5 @@ def build_qa_plan(message: str, history: List[Dict[str, str]]) -> QAPlan:
         retrieval_k=retrieval_k,
         should_clarify=should_clarify,
         clarify_question=clarify_question,
-        clarify_suggestions=clarify_suggestions,
         intent_confidence=confidence,
     )

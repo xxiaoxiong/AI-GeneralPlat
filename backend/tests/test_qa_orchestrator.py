@@ -31,16 +31,6 @@ def test_build_qa_plan_clarification_triggered_for_vague_request():
     plan = build_qa_plan("帮我优化一下", [])
     assert plan.should_clarify is True
     assert len(plan.clarify_question) > 0
-    assert len(plan.clarify_suggestions or []) >= 1
-
-
-def test_build_qa_plan_database_clarify_has_targeted_suggestions():
-    from app.services.agent.qa_orchestrator import build_qa_plan
-
-    plan = build_qa_plan("帮我查一下数据库", [])
-    assert plan.should_clarify is True
-    joined = " ".join(plan.clarify_suggestions or [])
-    assert "表" in joined or "字段" in joined
 
 
 def test_build_qa_plan_followup_should_not_over_clarify():
