@@ -31,3 +31,22 @@ def test_build_qa_plan_clarification_triggered_for_vague_request():
     plan = build_qa_plan("帮我优化一下", [])
     assert plan.should_clarify is True
     assert len(plan.clarify_question) > 0
+
+
+def test_build_qa_plan_followup_should_not_over_clarify():
+    from app.services.agent.qa_orchestrator import build_qa_plan
+
+    history = [
+        {"role": "user", "content": "请帮我优化数据库查询慢的问题"},
+        {"role": "assistant", "content": "可以，从索引和执行计划两方面优化"},
+    ]
+    plan = build_qa_plan("那下一步呢", history)
+    assert plan.should_clarify is False
+
+
+def test_build_qa_plan_has_intent_confidence():
+    from app.services.agent.qa_orchestrator import build_qa_plan
+
+    plan = build_qa_plan("请分析这个架构 trade-off", [])
+    assert 0.0 <= plan.intent_confidence <= 1.0
+    assert plan.intent_confidence >= 0.72

@@ -44,6 +44,9 @@
           <!-- <el-tag v-for="t in enabledTools" :key="t" size="small" class="tool-tag">{{ t }}</el-tag> -->
         </div>
         <div class="toolbar-right">
+          <el-tooltip v-if="lastTraceSummary" content="最近一次执行诊断">
+            <el-tag size="small" type="info">{{ lastTraceSummary.total_iterations || 0 }}轮 / {{ lastTraceSummary.total_tool_calls || 0 }}工具</el-tag>
+          </el-tooltip>
           <el-tooltip content="查看/管理记忆">
             <el-button size="small" :icon="Memo" @click="memoryDialogVisible = true">记忆</el-button>
           </el-tooltip>
@@ -158,8 +161,8 @@
               </div>
 
               <!-- 错误信息（即使关闭思考链也显示） -->
-              <div v-if="!showThinking && msg.steps?.some(s => s.type === 'error')" class="error-banner">
-                <span v-for="(step, ei) in msg.steps.filter(s => s.type === 'error')" :key="ei">
+              <div v-if="!showThinking && hasErrorSteps(msg.steps)" class="error-banner">
+                <span v-for="(step, ei) in getErrorSteps(msg.steps)" :key="ei">
                   ⚠️ {{ step.content }}
                 </span>
               </div>
@@ -270,7 +273,7 @@
 </template>
 
 <script setup lang="ts">
-import { ref, computed, onMounted, nextTick, watch } from 'vue'
+import { ref, computed, onMounted, onUnmounted, nextTick, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import { Plus, Delete, ArrowLeft, View, Memo } from '@element-plus/icons-vue'
@@ -290,6 +293,7 @@ const inputText = ref('')
 const streaming = ref(false)
 const streamingStatus = ref('思考中...')
 const showThinking = ref(true)
+const lastTraceSummary = ref<any>(null)
 const messagesRef = ref<HTMLElement>()
 let abortController: AbortController | null = null
 
@@ -373,6 +377,15 @@ function stepLabel(type: string): string {
   return map[type] || type
 }
 
+function hasErrorSteps(steps: any[]): boolean {
+  return Array.isArray(steps) && steps.some((step: any) => step?.type === 'error')
+}
+
+function getErrorSteps(steps: any[]): any[] {
+  if (!Array.isArray(steps)) return []
+  return steps.filter((step: any) => step?.type === 'error')
+}
+
 // 配置 marked v12：链接新标签页打开，图片/视频智能渲染，代码块复制按钮
 marked.use({
   breaks: true,
@@ -381,13 +394,20 @@ marked.use({
     code(code: string, lang: string | undefined) {
       const langClass = lang ? ` class="language-${lang}"` : ''
       const escaped = code.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-      return `<div class="code-block-wrapper"><button class="copy-btn" onclick="(function(btn){var code=btn.nextElementSibling.querySelector('code');navigator.clipboard.writeText(code.innerText).then(function(){btn.textContent='已复制';setTimeout(function(){btn.textContent='复制'},1500)}).catch(function(){btn.textContent='失败'});})(this)">复制</button><pre><code${langClass}>${escaped}</code></pre></div>`
+      return `<div class="code-block-wrapper"><button class="copy-btn" type="button">复制</button><pre><code${langClass}>${escaped}</code></pre></div>`
     },
     link(href: string, title: string | null, text: string) {
+      if (!href || !/^https?:\/\//i.test(href)) {
+        return `<span class="md-link-warning">${text}（链接已拦截）</span>`
+      }
       const titleAttr = title ? ` title="${title}"` : ''
       return `<a href="${href}" target="_blank" rel="noopener noreferrer"${titleAttr}>${text}</a>`
     },
     image(href: string, title: string | null, text: string) {
+      const safeHref = href || ''
+      if (!/^https?:\/\//i.test(safeHref)) {
+        return `<span class="md-link-warning">[不安全媒体链接已拦截]</span>`
+      }
       const isVideo    = /\.(mp4|webm|ogg)$/i.test(href)
       const isYoutube  = /youtube\.com\/watch|youtu\.be\//i.test(href)
       const isBilibili = /bilibili\.com\/video/i.test(href)
@@ -402,7 +422,7 @@ marked.use({
         const bvid = href.match(/\/video\/(BV[\w]+)/i)?.[1]
         if (bvid) return `<div class="video-embed"><iframe src="https://player.bilibili.com/player.html?bvid=${bvid}&autoplay=0" allowfullscreen frameborder="0"></iframe></div>`
       }
-      return `<img src="${href}" alt="${text}" title="${title || text}" class="md-img" onerror="this.onerror=null;this.src='';this.classList.add('img-broken');this.alt='图片加载失败: ${text || href}'" onclick="if(!this.classList.contains('img-broken'))window.open('${href}','_blank')" />`
+      return `<img src="${href}" alt="${text}" title="${title || text}" class="md-img" />`
     },
   } as any,
 })
@@ -412,7 +432,8 @@ function renderMarkdown(text: string): string {
   const raw = marked.parse(text) as string
   return DOMPurify.sanitize(raw, {
     ADD_TAGS: ['iframe', 'video'],
-    ADD_ATTR: ['allowfullscreen', 'frameborder', 'controls', 'src', 'onclick', 'target', 'rel'],
+    ADD_ATTR: ['allowfullscreen', 'frameborder', 'controls', 'src', 'target', 'rel'],
+    FORBID_ATTR: ['onclick', 'onerror', 'onload'],
   })
 }
 
@@ -420,6 +441,32 @@ async function scrollToBottom() {
   await nextTick()
   if (messagesRef.value) {
     messagesRef.value.scrollTop = messagesRef.value.scrollHeight
+  }
+}
+
+async function handleMarkdownAreaClick(evt: Event) {
+  const target = evt.target as HTMLElement | null
+  if (!target) return
+
+  const copyBtn = target.closest('.copy-btn') as HTMLButtonElement | null
+  if (copyBtn) {
+    const codeEl = copyBtn.parentElement?.querySelector('code')
+    const content = codeEl?.textContent || ''
+    if (!content) return
+    try {
+      await navigator.clipboard.writeText(content)
+      copyBtn.textContent = '已复制'
+      setTimeout(() => { copyBtn.textContent = '复制' }, 1200)
+    } catch {
+      copyBtn.textContent = '失败'
+      setTimeout(() => { copyBtn.textContent = '复制' }, 1200)
+    }
+    return
+  }
+
+  const img = target.closest('.md-img') as HTMLImageElement | null
+  if (img && img.src) {
+    window.open(img.src, '_blank', 'noopener,noreferrer')
   }
 }
 
@@ -540,18 +587,39 @@ async function sendMessage() {
     let outerDone = false
     let clarifySuggestions: string[] = []
 
+    const parseSSEEvents = (rawBuffer: string) => {
+      const events: any[] = []
+      const blocks = rawBuffer.split('\n\n')
+      const remain = blocks.pop() || ''
+
+      for (const block of blocks) {
+        const lines = block.split('\n').map(l => l.trimEnd())
+        const dataLines = lines
+          .filter(l => l.startsWith('data:'))
+          .map(l => l.replace(/^data:\s?/, ''))
+
+        if (!dataLines.length) continue
+        const payload = dataLines.join('\n')
+        try {
+          events.push(JSON.parse(payload))
+        } catch {
+          // 忽略非 JSON 心跳
+        }
+      }
+
+      return { events, remain }
+    }
+
     while (!outerDone) {
       const { done, value } = await reader.read()
       if (done) break
 
       buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || ''
+      const parsedSSE = parseSSEEvents(buffer)
+      buffer = parsedSSE.remain
 
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue
+      for (const event of parsedSSE.events) {
         try {
-          const event = JSON.parse(line.slice(6))
 
           if (event.type === 'done') { outerDone = true; break }
 
@@ -583,10 +651,24 @@ async function sendMessage() {
             messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
           } else if (event.type === 'error') {
             messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
+          } else if (event.type === 'trace') {
+            lastTraceSummary.value = event.summary || null
           }
 
           await scrollToBottom()
         } catch { /* ignore parse errors */ }
+      }
+    }
+
+    // 处理流结束时残留 buffer（某些代理层不会补齐空行）
+    if (buffer.trim()) {
+      const tailParsed = parseSSEEvents(`${buffer}\n\n`)
+      for (const event of tailParsed.events) {
+        if (event.type === 'final') {
+          finalContent = event.content
+        } else if (event.type === 'trace') {
+          lastTraceSummary.value = event.summary || null
+        }
       }
     }
 
@@ -651,6 +733,7 @@ async function regenerateMessage() {
 }
 
 onMounted(async () => {
+  messagesRef.value?.addEventListener('click', handleMarkdownAreaClick)
   await loadAgent()
   await loadSessions()
   if (sessions.value.length === 0) {
@@ -660,6 +743,10 @@ onMounted(async () => {
     await loadSession(sessions.value[0])
   }
   await loadMemories()
+})
+
+onUnmounted(() => {
+  messagesRef.value?.removeEventListener('click', handleMarkdownAreaClick)
 })
 </script>
 

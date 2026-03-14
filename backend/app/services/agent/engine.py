@@ -470,11 +470,11 @@ class AgentEngine:
                 yield {"type": "final_start", "iteration": iteration + 1}
 
                 # 分块发送（模拟流式效果，每块 20-80 字符）
-                chunk_size = 40
+                chunk_size = 80 if len(final_text) > 800 else 48
                 for i in range(0, len(final_text), chunk_size):
                     chunk = final_text[i:i + chunk_size]
                     yield {"type": "final_chunk", "content": chunk}
-                    await asyncio.sleep(0.01)  # 微延迟保证前端能逐步渲染
+                    await asyncio.sleep(0.003)  # 减少流式延迟，提高体感速度
 
                 trace.final_answer = final_text
                 yield {"type": "final", "content": final_text, "iteration": iteration + 1}
@@ -641,12 +641,26 @@ def _detect_clarification(llm_output: str, parsed: ParsedOutput) -> Optional[Dic
             is_question = True
             break
 
+    question_count = text.count("？") + text.count("?")
+
     # 也检测末尾是否是问号结尾的短文本
     if not is_question:
         lines = text.strip().split('\n')
         last_line = lines[-1].strip()
         if (last_line.endswith('？') or last_line.endswith('?')) and len(text) < 500:
             is_question = True
+
+    # 降低误判：若大部分内容是完整结论，仅末尾带一个反问句，不应当作 clarify
+    declarative_signals = ("结论", "建议", "如下", "总结", "原因", "步骤", "方案", "可以", "应该")
+    has_declarative = any(sig in text for sig in declarative_signals)
+    short_last_question = False
+    lines = [ln.strip() for ln in text.strip().split('\n') if ln.strip()]
+    if lines:
+        last_line = lines[-1]
+        short_last_question = (last_line.endswith('？') or last_line.endswith('?')) and len(last_line) <= 28
+
+    if is_question and has_declarative and question_count <= 1 and short_last_question and len(text) > 80:
+        return None
 
     if not is_question:
         return None
