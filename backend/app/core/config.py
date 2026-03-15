@@ -11,8 +11,8 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     REFRESH_TOKEN_EXPIRE_DAYS: int = 30
 
-    DATABASE_URL: str = "mysql+aiomysql://root:password@localhost:3308/ai_plat"
-    DATABASE_SYNC_URL: str = "mysql+pymysql://root:password@localhost:3308/ai_plat"
+    DATABASE_URL: str = "mysql+aiomysql://root:password@localhost:3307/ai_plat"
+    DATABASE_SYNC_URL: str = "mysql+pymysql://root:password@localhost:3307/ai_plat"
 
     REDIS_URL: str = "redis://localhost:6379/0"
 
