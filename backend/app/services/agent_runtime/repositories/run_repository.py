@@ -275,6 +275,44 @@ class RunRepository:
             f"run {run_id} 状态提交未命中（并发竞争），视为执行权丢失"
         )
 
+    async def record_recovery(
+        self,
+        run_id: str,
+        lease: RunExecutionLease,
+        *,
+        metadata: Dict[str, Any],
+        recovery_error: Optional[str] = None,
+    ) -> bool:
+        """记录恢复决策元数据（P0-04 §6.3：所有恢复决策写入 Run recovery metadata）。
+
+        与状态提交相同的 Fencing 条件（Worker ID / Lease Version / Lease 未过期），
+        但不改变 Run 状态；冲突时抛 ``RunLeaseLost`` / ``IllegalTransition``。
+        """
+        if lease is None:
+            raise RunLeaseLost(f"run {run_id} 恢复元数据写入缺少执行权身份（lease 为 None）")
+        values: Dict[str, Any] = {
+            "recovery_metadata": metadata,
+            "updated_at": datetime.utcnow(),
+        }
+        if recovery_error is not None:
+            values["recovery_error"] = recovery_error
+        res = await self.session.execute(
+            update(AgentRun)
+            .where(
+                AgentRun.id == run_id,
+                AgentRun.worker_id == lease.worker_id,
+                AgentRun.lease_version == lease.lease_version,
+                AgentRun.lease_expires_at.isnot(None),
+                AgentRun.lease_expires_at > _sql_now(self.session),
+            )
+            .values(**values),
+            execution_options={"synchronize_session": False},
+        )
+        if res.rowcount == 1:
+            return True
+        await self._raise_status_conflict(run_id, lease, "(recovery_metadata)", None)
+        return False  # 不可达：_raise_status_conflict 必定抛出
+
     async def cancel_without_lease(
         self,
         run_id: str,

@@ -29,6 +29,12 @@ STATUS_LIMIT_EXCEEDED = "limit_exceeded"
 
 TERMINAL_STATUSES = {STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED, STATUS_LIMIT_EXCEEDED}
 
+# 恢复检查结论（FR-03 / P0-04）：决策唯一来源是 tools/classification.recovery_decision
+RECOVERY_FRESH = "fresh"                        # 首次执行 / 无 Checkpoint：用输入快照执行
+RECOVERY_CONTINUE = "continue"                  # 有 Checkpoint 且无未决中断：从断点续跑
+RECOVERY_WAITING_APPROVAL = "waiting_approval"  # Checkpoint 停在 HITL 中断：回到待审批
+RECOVERY_NEEDS_RECONCILIATION = "needs_reconciliation"  # 未决副作用：禁止自动重放
+
 # 暂停态：可被人工恢复，不会被 Worker 自动领取执行
 PAUSED_STATUSES = {STATUS_WAITING_APPROVAL, STATUS_NEEDS_RECONCILIATION}
 

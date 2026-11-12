@@ -637,7 +637,7 @@ def test_alembic_migration_upgrade_downgrade(tmp_path):
         for col in (
             "request_hash", "input_payload", "agent_config_snapshot", "started_at",
             "worker_id", "lease_expires_at", "heartbeat_at", "attempt",
-            "lease_version", "last_event_seq", "recovery_error",
+            "lease_version", "last_event_seq", "recovery_error", "recovery_metadata",
         ):
             assert col in run_cols, f"agent_runs 缺少列 {col}"
 
@@ -868,8 +868,8 @@ async def test_recovery_unsafe_ledger_blocks_auto_replay():
         run_id = run.id
         lease = _lease_for(run_id, version, worker_id="dead-worker")
         # 崩溃在副作用结果未知的窗口：账本记录为 unknown（写入时执行权有效）。
-        # webhook_notify 无下游幂等能力 -> 禁止自动重放（http_post 等
-        # external_idempotent 工具允许复用同一幂等键重试，见 T-05）
+        # webhook_notify 无下游幂等能力 -> 禁止自动重放（仅工具契约声明下游
+        # 幂等的 external_idempotent 工具允许复用同一幂等键重试，见 T-05）
         ledger = ToolExecutionRepository(s)
         rec, _ = await ledger.begin(
             run_id=run_id, tool_call_id="call_1", tool_name="webhook_notify",
@@ -1196,50 +1196,73 @@ async def test_t05_unknown_result_blocks_replay_without_idempotency(monkeypatch)
 @pytest.mark.asyncio
 async def test_t05_idempotent_retry_reuses_same_key(monkeypatch):
     """T-05（有下游幂等键）：POST 超时结果未知 -> 重试复用同一 Idempotency-Key，
-    下游按幂等键去重，逻辑副作用只产生一次。"""
-    calls = []
-    downstream: dict = {}  # Idempotency-Key -> 下游业务结果
+    下游按幂等键去重，逻辑副作用只产生一次。
 
-    async def behavior(name, args):
-        key = (args.get("headers") or {}).get("Idempotency-Key")
-        assert key, "外部 POST 必须注入 Idempotency-Key"
-        calls.append(key)
-        if key not in downstream:
-            downstream[key] = "HTTP 201 订单已创建"  # 远端已成功
-        if len(calls) == 1:
-            raise TimeoutError("响应超时，未收到远端响应")  # 客户端超时
-        return downstream[key]  # 幂等键命中，返回既有结果
-
-    monkeypatch.setattr(
-        "app.services.agent_runtime.tools.adapter.ToolExecutor",
-        _fake_executor(behavior),
+    P0-04：幂等能力必须由工具契约显式声明（默认 HTTP POST = non_idempotent），
+    本用例声明 http_post 下游支持 Idempotency-Key 去重后才允许幂等键重试。
+    """
+    from app.services.agent_runtime.tools.classification import (
+        CLASS_EXTERNAL_IDEMPOTENT,
+        RETRY_IDEMPOTENT_KEY,
+        SideEffectContract,
+        register_side_effect_contract,
+        unregister_side_effect_contract,
     )
-    monkeypatch.setattr(ToolPolicy, "check_url", lambda self, url: None)  # 跳过 DNS/SSRF 检查
-    run_id, lv = await _claimed_run()
-    payload = {"tool_call_id": "tc-7", "url": "https://api.example.com/orders", "body": {"sku": "A-1"}}
-    adapter = _make_adapter(_make_ctx(run_id, lease_version=lv), {"http_post"})
-    out1 = await adapter._execute("http_post", dict(payload))
-    assert "工具执行错误" in out1
-    assert len(calls) == 1
-    assert len(downstream) == 1  # 远端已产生副作用
 
-    async with AsyncSessionLocal() as s:
-        rec = await ToolExecutionRepository(s).get(run_id, "tc-7")
-    assert rec.status == TOOL_EXEC_UNKNOWN
+    register_side_effect_contract(SideEffectContract(
+        tool_name="http_post",
+        side_effect_class=CLASS_EXTERNAL_IDEMPOTENT,
+        downstream_idempotency_supported=True,
+        idempotency_key_header="Idempotency-Key",
+        retry_policy=RETRY_IDEMPOTENT_KEY,
+        external_operation_lookup="GET /orders/{Idempotency-Key}",
+    ))
+    try:
+        calls = []
+        downstream: dict = {}  # Idempotency-Key -> 下游业务结果
 
-    # 重试（恢复重放）：external_idempotent 允许复用同一幂等键重试
-    adapter2 = _make_adapter(_make_ctx(run_id, lease_version=lv), {"http_post"})
-    out2 = await adapter2._execute("http_post", dict(payload))
-    assert out2 == "HTTP 201 订单已创建"
-    assert calls[0] == calls[1]  # 复用同一 Idempotency-Key
-    assert len(downstream) == 1  # 逻辑副作用只产生一次
-    # 幂等键 = sha256(run_id + tool_call_id) 摘要，跨重试稳定
-    assert calls[0] == hashlib.sha256(f"{run_id}:tc-7".encode()).hexdigest()
+        async def behavior(name, args):
+            key = (args.get("headers") or {}).get("Idempotency-Key")
+            assert key, "契约声明下游幂等后必须注入 Idempotency-Key"
+            calls.append(key)
+            if key not in downstream:
+                downstream[key] = "HTTP 201 订单已创建"  # 远端已成功
+            if len(calls) == 1:
+                raise TimeoutError("响应超时，未收到远端响应")  # 客户端超时
+            return downstream[key]  # 幂等键命中，返回既有结果
 
-    async with AsyncSessionLocal() as s:
-        rec = await ToolExecutionRepository(s).get(run_id, "tc-7")
-    assert rec.status == TOOL_EXEC_SUCCEEDED
-    assert rec.attempt_count == 2
+        monkeypatch.setattr(
+            "app.services.agent_runtime.tools.adapter.ToolExecutor",
+            _fake_executor(behavior),
+        )
+        monkeypatch.setattr(ToolPolicy, "check_url", lambda self, url: None)  # 跳过 DNS/SSRF 检查
+        run_id, lv = await _claimed_run()
+        payload = {"tool_call_id": "tc-7", "url": "https://api.example.com/orders", "body": {"sku": "A-1"}}
+        adapter = _make_adapter(_make_ctx(run_id, lease_version=lv), {"http_post"})
+        out1 = await adapter._execute("http_post", dict(payload))
+        assert "工具执行错误" in out1
+        assert len(calls) == 1
+        assert len(downstream) == 1  # 远端已产生副作用
+
+        async with AsyncSessionLocal() as s:
+            rec = await ToolExecutionRepository(s).get(run_id, "tc-7")
+        assert rec.status == TOOL_EXEC_UNKNOWN
+
+        # 重试（恢复重放）：external_idempotent 允许复用同一幂等键重试
+        adapter2 = _make_adapter(_make_ctx(run_id, lease_version=lv), {"http_post"})
+        out2 = await adapter2._execute("http_post", dict(payload))
+        assert out2 == "HTTP 201 订单已创建"
+        assert calls[0] == calls[1]  # 复用同一 Idempotency-Key
+        assert len(downstream) == 1  # 逻辑副作用只产生一次
+        # 幂等键 = sha256(run_id + tool_call_id) 摘要，跨重试稳定
+        assert calls[0] == hashlib.sha256(f"{run_id}:tc-7".encode()).hexdigest()
+
+        async with AsyncSessionLocal() as s:
+            rec = await ToolExecutionRepository(s).get(run_id, "tc-7")
+        assert rec.status == TOOL_EXEC_SUCCEEDED
+        assert rec.attempt_count == 2
+    finally:
+        unregister_side_effect_contract("http_post")
 
 
 # ════════════════════════════════════════════════════════════════════════════

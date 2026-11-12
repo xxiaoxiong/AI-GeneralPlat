@@ -93,6 +93,7 @@ class AgentRun(Base):
     lease_version = Column(Integer, default=0, nullable=False)  # fencing token
     last_event_seq = Column(BigInteger, default=0, nullable=False)  # 最近事件序号
     recovery_error = Column(Text, nullable=True)       # 恢复失败原因
+    recovery_metadata = Column(JSON, nullable=True)    # 恢复决策元数据（P0-04 §6.3）
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

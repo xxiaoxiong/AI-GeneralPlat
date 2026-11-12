@@ -66,6 +66,7 @@ from .lifecycle import (
     STATUS_WAITING_APPROVAL,
     TERMINAL_STATUSES,
     InvalidTransition,
+    RunExecutionLease,
     RunHandle,
     RunRegistry,
 )
@@ -80,7 +81,12 @@ from .repositories import (
 )
 from .repositories.errors import IllegalTransition, RunLeaseLost
 from .telemetry import telemetry
-from .tools.classification import REPLAY_BLOCK, replay_action
+from .tools.classification import (
+    CHECKPOINT_MISSING,
+    CHECKPOINT_OK,
+    CHECKPOINT_UNREADABLE,
+    recovery_decision,
+)
 from .tools.policy import BudgetExceededError, ToolPolicy, ToolPolicyError
 from .worker import (
     RECOVERY_CONTINUE,
@@ -1189,41 +1195,76 @@ class AgentRuntimeService:
 
     async def _recovery_check(
         self, row: Any
-    ) -> Tuple[str, str, List[Dict[str, Any]]]:
-        """恢复检查（attempt > 1 的重新领取必须先判断可否安全继续）。
+    ) -> Tuple[str, str, List[Dict[str, Any]], Dict[str, Any]]:
+        """恢复决策（attempt > 1 的重新领取必须先判断可否安全继续，P0-04 §6.2 A）。
 
-        返回 (mode, reason, pending_actions)：
-        - fresh：首次执行 / 无 Checkpoint，用输入快照执行；
-        - continue：有 Checkpoint 且无未决中断，从断点续跑；
+        返回 (mode, reason, pending_actions, metadata)：
+        - fresh：无 Checkpoint 且无结果未知的副作用，用输入快照执行；
+        - continue：有 Checkpoint 且无未决中断，从断点续跑（重放复用原
+          tool_call_id / 幂等键）；
         - waiting_approval：Checkpoint 停在 HITL 中断，回到待审批；
-        - needs_reconciliation：存在结果未知的副作用，禁止自动重放（FR-08）。
+        - needs_reconciliation：结果未知的副作用 / Checkpoint 损坏，禁止自动重放。
+
+        决策唯一来源是 ``classification.recovery_decision``（§6.2 A 决策表）：
+        - 无 Checkpoint + 结果未知的 external_idempotent/non_idempotent 副作用
+          → 阻断（禁止重新推理生成新调用 ID）；
+        - Checkpoint 不可读/损坏 → 安全阻断 + recovery_error，绝不 fresh restart。
+
+        所有恢复决策写入日志与 ``agent_runs.recovery_metadata``（阻断原因同时
+        写入 ``recovery_error``），满足 §6.3 可审计要求。
         """
         if (getattr(row, "attempt", 0) or 0) <= 1:
-            return RECOVERY_FRESH, "", []
+            return RECOVERY_FRESH, "", [], {}
 
         async with AsyncSessionLocal() as db:
             entries = await ToolExecutionRepository(db).list_unresolved(row.id)
-        # 与工具层共用同一重放决策：只有"禁止重放"的未决副作用才阻断自动恢复
-        # （read_only 可安全重试；external_idempotent 复用同一幂等键重试）
-        if any(replay_action(e.status, e.tool_name) == REPLAY_BLOCK for e in entries):
-            return (
-                RECOVERY_NEEDS_RECONCILIATION,
-                "存在结果未知的工具副作用（执行账本未决），禁止自动重放，需人工对账",
-                [],
-            )
 
         state = await self.get_thread_state(row.thread_id)
+        checkpoint_error: Optional[str] = None
         if state is None:
-            # 无 Checkpoint：从输入快照重新执行不会重复副作用之外的状态
-            return RECOVERY_FRESH, "", []
-        if state.get("error"):
-            # 无法读取 Checkpoint 就无法判定恢复安全性：向上抛出，等待租约到期重试
-            raise PersistenceError(
-                f"run {row.id} 恢复检查失败：Checkpoint 不可读（{state['error']}）"
+            checkpoint_state = CHECKPOINT_MISSING
+        elif state.get("error"):
+            checkpoint_state = CHECKPOINT_UNREADABLE
+            checkpoint_error = str(state["error"])
+        else:
+            checkpoint_state = CHECKPOINT_OK
+
+        decision = recovery_decision(checkpoint_state, entries)
+        mode, reason = decision.mode, decision.reason
+        actions: List[Dict[str, Any]] = []
+        if mode == RECOVERY_CONTINUE and state.get("has_interrupt"):
+            mode = RECOVERY_WAITING_APPROVAL
+            actions = state.get("pending_actions") or []
+            reason = "Checkpoint 停在 HITL 中断，回到待审批"
+
+        metadata: Dict[str, Any] = {
+            "mode": mode,
+            "reason": reason,
+            "checkpoint_state": checkpoint_state,
+            "checkpoint_error": checkpoint_error,
+            "pending": decision.pending,
+            "decided_at": datetime.utcnow().isoformat() + "Z",
+        }
+        logger.info(
+            "run %s 恢复决策: mode=%s checkpoint=%s pending=%d reason=%s",
+            row.id, mode, checkpoint_state, len(decision.pending), reason or "-",
+        )
+
+        lease = RunExecutionLease(
+            run_id=row.id,
+            worker_id=row.worker_id,
+            lease_version=row.lease_version,
+            lease_expires_at=row.lease_expires_at,
+        )
+        async with AsyncSessionLocal() as db:
+            await RunRepository(db).record_recovery(
+                row.id,
+                lease,
+                metadata=metadata,
+                recovery_error=reason if mode == RECOVERY_NEEDS_RECONCILIATION else None,
             )
-        if state.get("has_interrupt"):
-            return RECOVERY_WAITING_APPROVAL, "", state.get("pending_actions") or []
-        return RECOVERY_CONTINUE, "", []
+            await db.commit()
+        return mode, reason, actions, metadata
 
     async def _record_approval_requests(self, run_id: str, actions: List[Dict[str, Any]]) -> None:
         """审批请求先持久化（FR-06.2）：action_id 幂等，重启重放不产生重复记录。"""

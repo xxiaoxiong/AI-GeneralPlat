@@ -18,7 +18,9 @@ Phase 3（FR-05 / P0-03）Tool Execution Ledger 接入：
   的副作用等级判定（reentry=True，§5.2 C）
 - 账本写入失败/状态迁移被拒必须被 Adapter 感知：抛异常停止 Graph，
   不发布 TOOL_COMPLETED，不降级为普通工具错误（§5.2 D）
-- HTTP POST 注入 Idempotency-Key（run_id + tool_call_id 摘要），重试复用同一键
+- 幂等能力由工具契约显式声明（§6.2 B）：仅声明下游支持幂等去重的工具注入
+  Idempotency-Key（run_id + tool_call_id 摘要），重试复用同一键；未声明的
+  HTTP POST 按 non_idempotent 处理，结果未知即禁止重放
 
 Phase 5（P0-05）统一 ToolResult（§7.2）：
 - executor.execute 结果统一归一化为 ToolResult（str 兜底 succeeded）
@@ -68,10 +70,12 @@ from ..repositories.tool_execution_repository import (
 from ..telemetry import telemetry
 from .classification import (
     CLASS_READ_ONLY,
-    EXTERNAL_IDEMPOTENT_TOOLS,
     REPLAY_BLOCK,
     REPLAY_CACHED,
+    SideEffectContract,
+    get_side_effect_contract,
     replay_action,
+    register_side_effect_contract,
     tool_outcome_class,
 )
 from .policy import BudgetExceededError, ToolPolicy, ToolPolicyError
@@ -153,6 +157,13 @@ class ToolAdapterFactory:
             name = spec["name"]
             if name not in self.policy.allowed_tools:
                 continue
+            # 幂等能力由工具配置声明（§6.2 B）：spec 携带 side_effect_contract 时
+            # 登记契约；未声明的工具按默认 non_idempotent 处理
+            contract_cfg = spec.get("side_effect_contract")
+            if isinstance(contract_cfg, dict):
+                register_side_effect_contract(
+                    SideEffectContract(tool_name=name, **contract_cfg)
+                )
             tools.append(self._make_tool(spec))
         return tools
 
@@ -264,10 +275,13 @@ class ToolAdapterFactory:
                 return await self._replay_cached(name, fresh, started)
             return await self._refuse_replay(name, fresh, started)
 
-        # 5) 外部副作用注入稳定幂等键（重试复用同一键，下游按 Idempotency-Key 去重）
-        if name in EXTERNAL_IDEMPOTENT_TOOLS:
+        # 5) 外部副作用注入稳定幂等键：仅当工具契约**声明**下游支持幂等去重
+        #    （§6.2 B：未声明的 HTTP POST 按 non_idempotent 处理，不注入、不自动重试）；
+        #    重试复用同一键（run_id + tool_call_id 摘要），下游按幂等键去重
+        contract = get_side_effect_contract(name)
+        if contract.downstream_idempotency_supported and contract.idempotency_key_header:
             headers = dict(args.get("headers") or {})
-            headers.setdefault("Idempotency-Key", idempotency_key)
+            headers.setdefault(contract.idempotency_key_header, idempotency_key)
             args["headers"] = headers
 
         # 6) 执行（在非 async 线程池跑 sync handler，不阻塞事件循环）

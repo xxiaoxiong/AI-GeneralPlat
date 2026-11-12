@@ -31,6 +31,10 @@ from .events import (
     redact_sensitive,
 )
 from .lifecycle import (
+    RECOVERY_CONTINUE,
+    RECOVERY_FRESH,
+    RECOVERY_NEEDS_RECONCILIATION,
+    RECOVERY_WAITING_APPROVAL,
     STATUS_NEEDS_RECONCILIATION,
     STATUS_PENDING,
     STATUS_RUNNING,
@@ -52,11 +56,7 @@ if TYPE_CHECKING:  # pragma: no cover - 仅类型标注，避免循环导入
 
 logger = logging.getLogger("agent_runtime")
 
-# 恢复检查结论（FR-03）
-RECOVERY_FRESH = "fresh"                        # 首次执行 / 无 Checkpoint：用输入快照执行
-RECOVERY_CONTINUE = "continue"                  # 有 Checkpoint 且无未决中断：从断点续跑
-RECOVERY_WAITING_APPROVAL = "waiting_approval"  # Checkpoint 停在 HITL 中断：回到待审批
-RECOVERY_NEEDS_RECONCILIATION = "needs_reconciliation"  # 未决副作用：禁止自动重放
+# 恢复检查结论常量已迁至 lifecycle（RECOVERY_*），此处保留导出兼容
 
 
 @dataclass
@@ -229,7 +229,7 @@ class RunWorker:
         if job.resume is not None:
             mode, reason, actions = RECOVERY_FRESH, "", []
         else:
-            mode, reason, actions = await self.service._recovery_check(row)
+            mode, reason, actions, _recovery_meta = await self.service._recovery_check(row)
 
         if mode == RECOVERY_NEEDS_RECONCILIATION:
             await self._pause_run(handle, STATUS_NEEDS_RECONCILIATION, reason=reason)
