@@ -37,15 +37,40 @@ services:
       timeout: 3s
       retries: 3
 
+  # PostgreSQL Checkpointer（Durable Execution）：多 Uvicorn Worker / 多容器
+  # 共享 Graph State 的持久化后端（P0-01）。宿主机映射 5433 供集成测试直连。
+  checkpoint_pg:
+    image: postgres:16-alpine
+    container_name: ai_plat_checkpoint_pg
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ai_cp
+      POSTGRES_PASSWORD: 123456
+      POSTGRES_DB: agent_checkpoints
+    ports:
+      - "5433:5432"
+    volumes:
+      - checkpoint_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ai_cp -d agent_checkpoints"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
   backend:
     build:
-      context: ../backend
-      dockerfile: ../docker/backend.Dockerfile
+      # 构建上下文为仓库根目录，docker/ 目录集中存放部署文件
+      context: ..
+      dockerfile: docker/backend.Dockerfile
+      args:
+        # pip 镜像加速（可改为 https://pypi.org/simple 或本地镜像）
+        PIP_INDEX_URL: https://mirrors.aliyun.com/pypi/simple/
     container_name: ai_plat_backend
     restart: unless-stopped
     ports:
       - "8000:8000"
     environment:
+      APP_ENV: production
       DATABASE_URL: mysql+aiomysql://ai_plat:123456@mysql:3306/ai_plat
       DATABASE_SYNC_URL: mysql+pymysql://ai_plat:123456@mysql:3306/ai_plat
       REDIS_URL: redis://redis:6379/0
@@ -57,8 +82,10 @@ services:
       ADMIN_PASSWORD: Admin@123456
       ADMIN_USERNAME: admin
       CORS_ORIGINS: '["http://localhost:5173","http://localhost:3000","http://localhost:80"]'
-      # Durable Execution：Checkpoint 落盘到 app_data 卷，重启后可恢复（memory 仅限开发）
-      AGENT_CHECKPOINT_DSN: sqlite:///./data/agent_checkpoints.db
+      # Durable Execution：多 Worker 共享 PostgreSQL Checkpointer（禁止 memory）
+      AGENT_RUNTIME_ENABLED: "true"
+      AGENT_CHECKPOINT_DSN: postgresql://ai_cp:123456@checkpoint_pg:5432/agent_checkpoints
+      UVICORN_WORKERS: "2"
     volumes:
       - app_data:/app/data
       - ../log:/app/data/logs
@@ -66,6 +93,8 @@ services:
       mysql:
         condition: service_healthy
       redis:
+        condition: service_healthy
+      checkpoint_pg:
         condition: service_healthy
 
   frontend:
@@ -83,3 +112,4 @@ volumes:
   mysql_data:
   redis_data:
   app_data:
+  checkpoint_pg_data:

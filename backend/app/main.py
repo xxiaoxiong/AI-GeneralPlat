@@ -20,6 +20,15 @@ async def lifespan(app: FastAPI):
     setup_logging()
     logger.info("启动 AI-GeneralPlat v2.0 Agent 平台")
 
+    # ── 启动期配置校验（P0-01）：非法配置直接拒绝启动 ──
+    settings.validate_startup()
+
+    # ── 启动期初始化 Checkpointer 并做健康检查（P0-01）：
+    #    初始化失败抛错即拒绝启动，绝不静默降级 Memory ──
+    if settings.AGENT_RUNTIME_ENABLED:
+        from app.services.agent_runtime.persistence import CheckpointerFactory
+        await CheckpointerFactory.get().get_checkpointer()
+
     os.makedirs(settings.UPLOAD_DIR, exist_ok=True)
     os.makedirs(settings.CHROMA_PERSIST_DIR, exist_ok=True)
     os.makedirs(settings.LOG_DIR, exist_ok=True)
@@ -50,6 +59,8 @@ async def lifespan(app: FastAPI):
     # ── 关闭时清理 ──
     if runtime_worker is not None:
         await runtime_worker.stop()
+    from app.services.agent_runtime.persistence import CheckpointerFactory
+    await CheckpointerFactory.get().aclose()
     from app.services.inference import ModelManager
     await ModelManager.get_instance().cleanup_idle(max_idle_seconds=0)
     await close_redis()

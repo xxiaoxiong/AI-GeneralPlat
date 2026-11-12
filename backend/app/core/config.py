@@ -6,6 +6,7 @@ import json
 class Settings(BaseSettings):
     APP_NAME: str = "AI-GeneralPlat"
     APP_VERSION: str = "2.0.0"
+    APP_ENV: str = "development"            # development | staging | production
     DEBUG: bool = False
     SECRET_KEY: str = "change-me-in-production-min-32-chars-long!!"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
@@ -120,6 +121,26 @@ class Settings(BaseSettings):
     @property
     def cors_origins_list(self) -> List[str]:
         return json.loads(self.CORS_ORIGINS)
+
+    @property
+    def is_production(self) -> bool:
+        return (self.APP_ENV or "").lower() in ("production", "prod")
+
+    def validate_startup(self) -> None:
+        """启动期配置校验（P0-01）：不合法配置直接抛错拒绝启动，而不是运行到故障才发现。
+
+        生产环境禁止 Durable Runtime 使用 Memory Checkpointer——Memory 是进程内
+        单例，多 Worker / 重启后 Graph State 无法恢复。
+        """
+        if self.is_production and self.AGENT_RUNTIME_ENABLED:
+            dsn = (self.AGENT_CHECKPOINT_DSN or "").strip().lower()
+            if dsn in ("", "memory"):
+                raise RuntimeError(
+                    "配置非法，拒绝启动：APP_ENV=production 且 AGENT_RUNTIME_ENABLED=true 时"
+                    "禁止使用 Memory Checkpointer（AGENT_CHECKPOINT_DSN=memory）。"
+                    "请配置持久化后端（postgresql://... 或 sqlite:///...），"
+                    "多 Worker 部署必须使用 PostgreSQL 以共享 Graph State。"
+                )
 
     class Config:
         env_file = ".env"

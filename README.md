@@ -69,17 +69,24 @@ npm run dev
 ## Docker Compose 一键部署
 
 ```bash
-# 启动所有服务（MySQL + Redis + 后端 + 前端）
-docker-compose up -d
+# 启动所有服务（MySQL + Redis + PostgreSQL Checkpointer + 后端 + 前端）
+docker compose -f docker/docker-compose.yml up -d
 
 # 查看日志
-docker-compose logs -f backend
+docker compose -f docker/docker-compose.yml logs -f backend
 
 # 停止
-docker-compose down
+docker compose -f docker/docker-compose.yml down
 ```
 
 访问：http://localhost（前端），http://localhost:8000（后端 API）
+
+部署说明：
+- 后端启动入口（`docker/backend-entrypoint.sh`）先执行一次 `alembic upgrade head`，
+  迁移失败则服务不启动；随后以多 Worker 启动 Uvicorn。
+- Durable Execution 使用共享 PostgreSQL Checkpointer（`checkpoint_pg` 服务，
+  宿主机端口 5433），多 Worker / 重启后可恢复 Graph State；生产环境禁止
+  `AGENT_CHECKPOINT_DSN=memory`（启动即拒绝）。
 
 ---
 
@@ -199,6 +206,10 @@ AI-GeneralPlat/
 │   │   └── views/                # 页面组件
 │   └── vite.config.ts
 ├── docker/
+│   ├── backend-entrypoint.sh     # 迁移 + 多 Worker 启动入口
+│   ├── backend.Dockerfile
+│   ├── frontend.Dockerfile
+│   ├── docker-compose.yml        # MySQL + Redis + checkpoint_pg + 后端 + 前端
 │   └── mysql/init.sql
-└── docker-compose.yml
+└── log/                          # 运行日志（不入库）
 ```

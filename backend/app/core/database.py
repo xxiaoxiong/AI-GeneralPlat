@@ -46,5 +46,9 @@ async def init_db():
         # （journal_mode 持久化于库文件，仅需设置一次）
         async with engine.begin() as conn:
             await conn.exec_driver_sql("PRAGMA journal_mode=WAL")
+    if settings.is_production:
+        # 生产环境 Schema 由 Alembic 迁移管理（启动入口先执行 upgrade head）；
+        # create_all 只会补新表、不会给已有表加字段，不能作为生产升级手段
+        return
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)

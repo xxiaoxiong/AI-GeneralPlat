@@ -183,6 +183,13 @@ def setup_logging():
     file_handler.setFormatter(StructuredFormatter())
     root_logger.addHandler(file_handler)
 
+    # agent_runtime 系列日志（RunWorker 租约 / Checkpointer 健康 / Fencing）：
+    # 与 ai_plat 共享控制台与文件输出，保证执行权与恢复日志可见（P0-01 启动日志）
+    rt_logger = logging.getLogger("agent_runtime")
+    rt_logger.setLevel(getattr(logging, settings.LOG_LEVEL.upper(), logging.INFO))
+    rt_logger.addHandler(console_handler)
+    rt_logger.addHandler(file_handler)
+
     # Agent 轨迹专用文件
     if settings.LOG_AGENT_TRACE:
         trace_handler = logging.FileHandler(
