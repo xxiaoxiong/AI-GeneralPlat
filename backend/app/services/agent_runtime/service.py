@@ -43,6 +43,7 @@ from .events import (
     RUN_COMPLETED,
     RUN_FAILED,
     RUN_STARTED,
+    RUN_SUSPENDED,
     RUN_WAITING_APPROVAL,
     SUBAGENT_COMPLETED,
     SUBAGENT_STARTED,
@@ -59,6 +60,7 @@ from .lifecycle import (
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_LIMIT_EXCEEDED,
+    STATUS_NEEDS_RECONCILIATION,
     STATUS_PENDING,
     STATUS_RUNNING,
     STATUS_WAITING_APPROVAL,
@@ -360,9 +362,8 @@ class AgentRuntimeService:
                 use_memory_context="",
             ),
         )
-        async for ev in run.bus.events():
-            for legacy in adapter.adapt(ev):
-                yield legacy
+        async for legacy in self._bus_stream(run, adapter):
+            yield legacy
 
     async def cancel_run(self, run_id: str, user_id: int) -> Dict[str, Any]:
         run = self.registry.get(run_id)
@@ -563,10 +564,49 @@ class AgentRuntimeService:
     async def _bus_stream(
         self, run: RunHandle, adapter: LegacyEventAdapter
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """本进程执行：直连事件总线的旧契约事件流。"""
-        async for ev in run.bus.events():
+        """本进程执行：直连事件总线的旧契约事件流。
+
+        消费者必然终止（任务书 §12.2：SSE / 本地流禁止悬挂等待）：
+        除流边界事件（终态 / waiting_approval / run_suspended）外，当驱动任务
+        已结束且队列排空仍无终止事件（如持久化失败、异常退出）时，按
+        run.status 合成终止事件并结束本次流。
+        """
+        while True:
+            ev = await run.bus.get(timeout=0.5)
+            if ev is None:
+                task = run.task
+                if task is not None and task.done():
+                    synthetic = self._synthesize_terminal(run)
+                    for legacy in adapter.adapt(synthetic):
+                        yield legacy
+                    return
+                continue
             for legacy in adapter.adapt(ev):
                 yield legacy
+            if ev.type in TERMINAL_EVENTS:
+                return
+
+    @staticmethod
+    def _synthesize_terminal(run: RunHandle) -> RuntimeEvent:
+        """驱动任务结束但无终止事件时的兜底合成事件（按 run.status 还原终态）。"""
+        status = run.status or STATUS_RUNNING
+        if status == STATUS_COMPLETED:
+            return RuntimeEvent(type=RUN_COMPLETED, run_id=run.run_id,
+                                data={"final_text": run.final_text, "summary": run.summary})
+        if status == STATUS_FAILED:
+            return RuntimeEvent(type=RUN_FAILED, run_id=run.run_id,
+                                data={"error": run.error or "执行链路异常结束"})
+        if status == STATUS_LIMIT_EXCEEDED:
+            return RuntimeEvent(type=RUN_FAILED, run_id=run.run_id,
+                                data={"error": run.error or "执行预算超限",
+                                      "status": STATUS_LIMIT_EXCEEDED})
+        if status == STATUS_CANCELLED:
+            return RuntimeEvent(type=RUN_CANCELLED, run_id=run.run_id)
+        if status in (STATUS_WAITING_APPROVAL, STATUS_NEEDS_RECONCILIATION):
+            return RuntimeEvent(type=RUN_WAITING_APPROVAL, run_id=run.run_id,
+                                data={"approval_required": True, "status": status})
+        return RuntimeEvent(type=RUN_SUSPENDED, run_id=run.run_id,
+                            data={"reason": "drive_ended_without_terminal_event"})
 
     async def _replay_db_stream(
         self, run_id: str, run: RunHandle, adapter: LegacyEventAdapter
@@ -775,11 +815,28 @@ class AgentRuntimeService:
         except PersistenceError:
             # 关键状态写入失败：立即停止推进，绝不带病执行副作用（R-12 / 任务书 §0.7）
             logger.critical("run %s 关键状态持久化失败，停止推进", run.run_id, exc_info=True)
+            # 尽力通知本地消费者终止（持久化可能已不可用，仅入内存队列）；
+            # 失败也无碍：消费端还有"驱动结束即合成终止事件"的兜底
+            try:
+                await bus.publish(RuntimeEvent(type=RUN_FAILED, run_id=run.run_id,
+                                               data={"error": "关键状态持久化失败，执行已停止"}))
+            except Exception:
+                pass
             raise
         except asyncio.CancelledError:
             if run.suspend_requested:
                 # 挂起（优雅关闭 / 租约丢失）：不改写状态，保留 running 供其他 Worker 恢复
                 logger.info("run %s 挂起执行（不写入 cancelled）", run.run_id)
+                # 挂起必须通知本地消费者（任务书 §12.2：SSE 不得悬挂）：
+                # run_suspended 是流边界事件，收到即结束本次事件流
+                try:
+                    await bus.publish(RuntimeEvent(
+                        type=RUN_SUSPENDED,
+                        run_id=run.run_id,
+                        data={"reason": run.suspend_reason or "shutdown"},
+                    ))
+                except Exception:
+                    logger.exception("run %s 挂起事件发布失败", run.run_id)
                 raise
             if not run.is_terminal:
                 try:

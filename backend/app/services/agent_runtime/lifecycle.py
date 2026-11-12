@@ -77,6 +77,7 @@ class RunHandle:
     # 挂起请求：优雅关闭 / 租约丢失时置位——取消执行但不写 cancelled，
     # 保留 running 状态供其他 Worker 经 Checkpoint 恢复
     suspend_requested: bool = False
+    suspend_reason: str = ""  # 挂起原因（lease_lost / shutdown），随 run_suspended 事件通知消费者
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
 

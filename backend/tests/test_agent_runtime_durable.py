@@ -37,6 +37,10 @@ from app.services.agent_runtime.lifecycle import (
     RunRegistry,
 )
 from app.services.agent_runtime.repositories import (
+    HEARTBEAT_FINISHED,
+    HEARTBEAT_LOST,
+    HEARTBEAT_OK,
+    HEARTBEAT_PAUSED,
     EventRepository,
     IdempotencyConflict,
     RunRepository,
@@ -227,10 +231,50 @@ async def test_heartbeat_extends_lease_and_fencing():
         await s.commit()
         v1 = await RunRepository(s).claim(run.id, "worker-a", 30)
 
-        assert await RunRepository(s).heartbeat(run.id, "worker-a", v1, 30)
-        # 错误版本 / 错误 worker 一律拒绝
-        assert not await RunRepository(s).heartbeat(run.id, "worker-a", v1 + 5, 30)
-        assert not await RunRepository(s).heartbeat(run.id, "worker-z", v1, 30)
+        assert await RunRepository(s).heartbeat(run.id, "worker-a", v1, 30) == HEARTBEAT_OK
+        # 错误版本 / 错误 worker → 真租约丢失（fencing 失败）
+        assert await RunRepository(s).heartbeat(run.id, "worker-a", v1 + 5, 30) == HEARTBEAT_LOST
+        assert await RunRepository(s).heartbeat(run.id, "worker-z", v1, 30) == HEARTBEAT_LOST
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_three_state_semantics():
+    """heartbeat 必须区分 续租成功 / Run 已终态 / Run 已暂停 / 真租约丢失（任务书 P0-02）。
+
+    后三者若被误判为租约丢失，会取消正在收尾的执行、吞掉终止事件并悬挂
+    所有事件流消费者（曾导致 t09 多轮会话测试永久挂起）。
+    """
+    # 已终态 → HEARTBEAT_FINISHED（不是租约丢失）
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)
+        await s.commit()
+        v1 = await RunRepository(s).claim(run.id, "worker-a", 30)
+        assert await RunRepository(s).update_status(
+            run.id, status=STATUS_COMPLETED, lease_version=v1
+        )
+        await s.commit()
+        assert await RunRepository(s).heartbeat(run.id, "worker-a", v1, 30) == HEARTBEAT_FINISHED
+
+    # 已暂停（needs_reconciliation）→ HEARTBEAT_PAUSED
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)
+        await s.commit()
+        v1 = await RunRepository(s).claim(run.id, "worker-a", 30)
+        assert await RunRepository(s).update_status(
+            run.id, status=STATUS_NEEDS_RECONCILIATION, lease_version=v1
+        )
+        await s.commit()
+        assert await RunRepository(s).heartbeat(run.id, "worker-a", v1, 30) == HEARTBEAT_PAUSED
+
+    # running 但 lease 易主 → HEARTBEAT_LOST
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)
+        await s.commit()
+        await RunRepository(s).claim(run.id, "worker-a", 30)
+        assert await RunRepository(s).heartbeat(run.id, "worker-b", 99, 30) == HEARTBEAT_LOST
 
 
 @pytest.mark.asyncio

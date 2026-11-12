@@ -37,7 +37,14 @@ from .lifecycle import (
     STATUS_WAITING_APPROVAL,
     RunHandle,
 )
-from .repositories import EventRepository, RunRepository
+from .repositories import (
+    EventRepository,
+    HEARTBEAT_FINISHED,
+    HEARTBEAT_LOST,
+    HEARTBEAT_OK,
+    HEARTBEAT_PAUSED,
+    RunRepository,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型标注，避免循环导入
     from .service import AgentRuntimeService
@@ -152,6 +159,7 @@ class RunWorker:
         for handle in self._active.values():
             # 挂起语义：不写 cancelled，让其他 Worker 经 Checkpoint 恢复
             handle.suspend_requested = True
+            handle.suspend_reason = "shutdown"
         for t in tasks:
             t.cancel()
         if tasks:
@@ -297,9 +305,9 @@ class RunWorker:
         handle.task = drive_task
         hb_task = asyncio.create_task(self._heartbeat_loop(handle, lease_version, drive_task))
         try:
-            await asyncio.wait(
-                {drive_task, hb_task}, return_when=asyncio.FIRST_COMPLETED
-            )
+            # 只以驱动任务为完成判据：心跳是辅助任务，它提前结束（Run 已终态/
+            # 已暂停时心跳自然收尾）不代表执行结束，不得取消在途/收尾中的驱动
+            await asyncio.wait({drive_task})
         finally:
             if not drive_task.done():
                 drive_task.cancel()
@@ -318,37 +326,45 @@ class RunWorker:
     async def _heartbeat_loop(
         self, handle: RunHandle, lease_version: Optional[int], drive_task: asyncio.Task
     ) -> None:
-        """续租循环。租约丢失/无法确认时挂起执行：不得再产生新副作用（F-13）。"""
+        """续租循环。仅真租约丢失/无法确认时挂起执行：不得再产生新副作用（F-13）。
+
+        Run 已终态 / 已暂停属于执行链路的正常收尾或等待人工，心跳自然结束，
+        不得误判为租约丢失（否则会取消正在收尾的执行、悬挂事件流消费者）。
+        """
         try:
             while not drive_task.done():
                 await asyncio.sleep(self.heartbeat_interval)
                 if drive_task.done():
                     return
-                if not await self._heartbeat(handle.run_id, lease_version):
+                result = await self._heartbeat(handle.run_id, lease_version)
+                if result in (HEARTBEAT_FINISHED, HEARTBEAT_PAUSED):
+                    return
+                if result == HEARTBEAT_LOST:
                     logger.warning(
-                        "run %s 租约丢失或续租失败（lease_version=%s），挂起执行",
+                        "run %s 租约丢失（lease_version=%s），挂起执行",
                         handle.run_id, lease_version,
                     )
                     handle.suspend_requested = True
+                    handle.suspend_reason = "lease_lost"
                     drive_task.cancel()
                     return
         except asyncio.CancelledError:
             raise
 
-    async def _heartbeat(self, run_id: str, lease_version: Optional[int]) -> bool:
+    async def _heartbeat(self, run_id: str, lease_version: Optional[int]) -> str:
         if lease_version is None:
-            return True
+            return HEARTBEAT_OK
         try:
             async with AsyncSessionLocal() as db:
-                ok = await RunRepository(db).heartbeat(
+                result = await RunRepository(db).heartbeat(
                     run_id, self.worker_id, lease_version, self.lease_seconds
                 )
                 await db.commit()
-            return ok
+            return result
         except Exception:
             # 无法确认租约归属时按丢失处理（宁可恢复，不可重复副作用）
             logger.warning("run %s 心跳失败（按租约丢失处理）", run_id, exc_info=True)
-            return False
+            return HEARTBEAT_LOST
 
     async def _release(self, handle: RunHandle, lease_version: Optional[int]) -> None:
         """释放租约并递增 fencing token（释放失败无碍：租约到期自动过期）。"""

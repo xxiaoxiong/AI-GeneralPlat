@@ -28,6 +28,15 @@ from .errors import IdempotencyConflict
 # claim_next 可领取的状态：pending，或 Lease 过期的 running（进入恢复检查）
 _CLAIMABLE = (STATUS_PENDING, STATUS_RUNNING)
 
+# ── heartbeat() 三态语义（任务书 P0-02） ─────────────────────────────────
+# 心跳失败必须区分"真租约丢失"与"Run 已终态/暂停"：后两者是执行链路的
+# 正常收尾或等待人工，若一律按租约丢失处理，会取消正在收尾的执行、
+# 吞掉终止事件并悬挂所有事件流消费者。
+HEARTBEAT_OK = "ok"              # 续租成功
+HEARTBEAT_FINISHED = "finished"  # Run 已终态：心跳自然结束
+HEARTBEAT_PAUSED = "paused"      # Run 已暂停（waiting_approval / needs_reconciliation）
+HEARTBEAT_LOST = "lost"          # 真租约丢失：必须停止推进（fencing 失败）
+
 
 class RunRepository:
     def __init__(self, session: AsyncSession) -> None:
@@ -264,8 +273,17 @@ class RunRepository:
 
     async def heartbeat(
         self, run_id: str, worker_id: str, lease_version: int, lease_seconds: int
-    ) -> bool:
-        """续租。返回 False 表示已丢失 Lease（fencing 失败），必须停止推进。"""
+    ) -> str:
+        """续租。返回 HEARTBEAT_* 三态语义（任务书 P0-02）：
+
+        - ``HEARTBEAT_OK``：续租成功；
+        - ``HEARTBEAT_FINISHED``：Run 已终态——心跳自然结束，**不是**租约丢失，
+          不得据此取消正在收尾的执行（否则会吞掉终止事件、悬挂消费者）；
+        - ``HEARTBEAT_PAUSED``：Run 已进入暂停态（waiting_approval /
+          needs_reconciliation）——执行自行挂起等待人工，同样不是租约丢失；
+        - ``HEARTBEAT_LOST``：真租约丢失（worker_id / lease_version 易主），
+          必须停止推进（fencing 失败，宁可恢复、不可重复副作用）。
+        """
         now = datetime.utcnow()
         res = await self.session.execute(
             update(AgentRun)
@@ -282,7 +300,19 @@ class RunRepository:
             ),
             execution_options={"synchronize_session": False},
         )
-        return res.rowcount == 1
+        if res.rowcount == 1:
+            return HEARTBEAT_OK
+        row = await self.session.execute(
+            select(AgentRun.status).where(AgentRun.id == run_id)
+        )
+        status = row.scalar_one_or_none()
+        if status is None:
+            return HEARTBEAT_LOST
+        if status in TERMINAL_STATUSES:
+            return HEARTBEAT_FINISHED
+        if status in PAUSED_STATUSES:
+            return HEARTBEAT_PAUSED
+        return HEARTBEAT_LOST
 
     async def release(self, run_id: str, worker_id: str, lease_version: int) -> bool:
         """释放 Lease 并递增 fencing token（使旧 Worker 永久失效）。"""

@@ -18,6 +18,7 @@ LegacyEventAdapter 映射为旧事件流：
   run_completed      -> final(全部可见模型文本拼接) + done
   run_failed         -> error + done
   run_cancelled      -> error(cancelled) + done
+  run_suspended      -> done(status=suspended)（挂起边界：流必须结束，禁止悬挂等待）
 """
 from __future__ import annotations
 
@@ -43,9 +44,14 @@ STATE_CHANGED = "state_changed"
 RUN_COMPLETED = "run_completed"
 RUN_FAILED = "run_failed"
 RUN_CANCELLED = "run_cancelled"
+RUN_SUSPENDED = "run_suspended"
 PLAN_UPDATED = "plan_updated"
 
-TERMINAL_EVENTS = (RUN_COMPLETED, RUN_FAILED, RUN_CANCELLED, RUN_WAITING_APPROVAL)
+# 流边界事件：消费者收到即结束本次事件流（Run 可能稍后由其他 Worker 恢复，
+# 恢复后的执行产生新的事件流）。任务书 §12.2：SSE 消费者必须能终止。
+TERMINAL_EVENTS = (
+    RUN_COMPLETED, RUN_FAILED, RUN_CANCELLED, RUN_WAITING_APPROVAL, RUN_SUSPENDED,
+)
 
 
 @dataclass
@@ -223,6 +229,19 @@ class LegacyEventAdapter:
             self.finished = True
             return out
 
+        if t == RUN_SUSPENDED:
+            # 挂起边界（租约丢失/优雅停机/驱动异常结束）：流必须结束，
+            # 消费者可按 run_id 重新订阅或走恢复流程，禁止无限等待
+            out = self._ensure_final_start()
+            out.append({
+                "type": "done",
+                "status": "suspended",
+                "run_id": self.run_id,
+                "reason": ev.data.get("reason"),
+            })
+            self.finished = True
+            return out
+
         return []
 
     def _ensure_final_start(self) -> List[Dict[str, Any]]:
@@ -321,6 +340,24 @@ class EventBus:
             yield ev
             if ev.type in TERMINAL_EVENTS:
                 break
+
+    async def get(self, timeout: Optional[float] = None) -> Optional[RuntimeEvent]:
+        """取下一个事件；指定 timeout 时超时返回 None。
+
+        供消费端在无事件间隙做"生产侧是否已结束"的判定，避免无限悬挂等待。
+        被取消/超时的 getter 不会丢失队列中的事件（asyncio.Queue 语义保证）。
+        """
+        import asyncio
+
+        if timeout is None:
+            return await self._queue.get()
+        try:
+            return await asyncio.wait_for(self._queue.get(), timeout)
+        except asyncio.TimeoutError:
+            return None
+
+    def empty(self) -> bool:
+        return self._queue.empty()
 
     def close(self) -> None:
         self._closed = True
