@@ -1,0 +1,1732 @@
+"""Phase 2 Durable Execution 测试：数据持久化 / 幂等 / 租约 CAS / 工具账本 / 事件日志。
+
+运行：
+    pytest backend/tests/test_agent_runtime_durable.py -q
+"""
+import asyncio
+import hashlib
+import os
+import sqlite3
+import subprocess
+import sys
+import uuid
+from typing import Any, List
+
+import pytest
+import pytest_asyncio
+from langchain_core.language_models.chat_models import BaseChatModel
+from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.outputs import ChatGeneration, ChatGenerationChunk, ChatResult
+from sqlalchemy import delete, select, update
+from sqlalchemy.exc import IntegrityError
+
+from app.core.database import AsyncSessionLocal, engine, init_db
+from app.models.agent import AgentApproval, AgentRun, AgentRunEvent, AgentSession, AgentToolExecution
+from app.services.agent_runtime.lifecycle import (
+    STATUS_CANCELLED,
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_LIMIT_EXCEEDED,
+    STATUS_NEEDS_RECONCILIATION,
+    STATUS_PENDING,
+    STATUS_RUNNING,
+    STATUS_WAITING_APPROVAL,
+    ALLOWED_TRANSITIONS,
+    InvalidTransition,
+    RunHandle,
+    RunRegistry,
+)
+from app.services.agent_runtime.repositories import (
+    EventRepository,
+    IdempotencyConflict,
+    RunRepository,
+    ToolExecutionRepository,
+)
+from app.services.agent_runtime.repositories.tool_execution_repository import (
+    TOOL_EXEC_EXECUTING,
+    TOOL_EXEC_NEEDS_RECONCILIATION,
+    TOOL_EXEC_PREPARED,
+    TOOL_EXEC_SUCCEEDED,
+    TOOL_EXEC_UNKNOWN,
+)
+from app.services.agent_runtime.context import RunScope, RuntimeContext
+from app.services.agent_runtime.events import (
+    MODEL_DELTA,
+    RUN_COMPLETED,
+    RUN_STARTED,
+    EventBus,
+    LegacyEventAdapter,
+    RuntimeEvent,
+)
+from app.services.agent_runtime.service import (
+    AgentRuntimeService,
+    ApprovalConflict,
+    ApprovalForbidden,
+    ApprovalInvalid,
+)
+from app.services.agent_runtime.tools.adapter import ToolAdapterFactory
+from app.services.agent_runtime.tools.policy import ToolPolicy
+from app.services.agent_runtime.worker import RunJob, RunWorker
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _db():
+    await init_db()
+    # 测试间清空持久化表，保证 claim/扫描类断言不受其他用例残留影响
+    async with AsyncSessionLocal() as s:
+        for model in (AgentRunEvent, AgentToolExecution, AgentApproval, AgentRun):
+            await s.execute(delete(model))
+        await s.commit()
+    yield
+    await engine.dispose()
+
+
+def _uid() -> str:
+    return uuid.uuid4().hex
+
+
+async def _create_run(repo: RunRepository, **kw):
+    run_id = _uid()
+    defaults = dict(
+        run_id=run_id,
+        agent_id=1,
+        session_id=None,
+        user_id=1,
+        thread_id=f"agent-1-session-{run_id[:8]}",
+    )
+    defaults.update(kw)
+    run, created = await repo.create_run(**defaults)
+    return run, created
+
+
+# ── FR-01 Run 持久化与幂等创建 ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_create_run_persists_pending():
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, created = await _create_run(repo, idempotency_key=None)
+        assert created and run.status == STATUS_PENDING
+        await s.commit()
+
+        got = await RunRepository(s).get_run(run.id)
+        assert got is not None and got.status == STATUS_PENDING
+
+
+@pytest.mark.asyncio
+async def test_idempotent_reuse_same_request_hash():
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        r1, c1 = await _create_run(
+            repo, user_id=7, idempotency_key="k1", request_hash="h1"
+        )
+        await s.commit()
+        r2, c2 = await _create_run(
+            repo, user_id=7, idempotency_key="k1", request_hash="h1"
+        )
+        assert c1 and not c2 and r1.id == r2.id
+
+
+@pytest.mark.asyncio
+async def test_idempotent_conflict_different_request_hash():
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        await _create_run(repo, user_id=7, idempotency_key="k2", request_hash="h1")
+        await s.commit()
+        with pytest.raises(IdempotencyConflict):
+            await _create_run(repo, user_id=7, idempotency_key="k2", request_hash="h2")
+
+
+@pytest.mark.asyncio
+async def test_no_idempotency_key_creates_new_runs():
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        r1, _ = await _create_run(repo)
+        r2, _ = await _create_run(repo)
+        assert r1.id != r2.id
+
+
+@pytest.mark.asyncio
+async def test_idempotency_unique_per_user():
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        r1, _ = await _create_run(repo, user_id=1, idempotency_key="shared")
+        r2, _ = await _create_run(repo, user_id=2, idempotency_key="shared")
+        assert r1.id != r2.id  # 不同用户作用域互不影响
+
+
+@pytest.mark.asyncio
+async def test_db_enforces_idempotency_uniqueness():
+    """数据库唯一约束兜底：绕过仓库直接插重复 (user_id, idempotency_key) 必须失败。"""
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo, user_id=3, idempotency_key="dup")
+        run_id = run.id
+        await s.commit()
+        s.add(
+            AgentRun(
+                id=_uid(), agent_id=1, thread_id="t", status="pending",
+                user_id=3, idempotency_key="dup",
+            )
+        )
+        with pytest.raises(IntegrityError):
+            await s.flush()
+        await s.rollback()
+        # 旧记录仍在
+        assert await RunRepository(s).get_run(run_id) is not None
+
+
+# ── FR-02 租约 / fencing token ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_claim_only_one_winner():
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)
+        await s.commit()
+
+        v1 = await RunRepository(s).claim(run.id, "worker-a", 30)
+        v2 = await RunRepository(s).claim(run.id, "worker-b", 30)
+        assert v1 is not None and v2 is None
+
+        row = await RunRepository(s).get_run(run.id)
+        assert row.worker_id == "worker-a" and row.status == STATUS_RUNNING
+        assert row.attempt == 1  # 首次 Claim 计 1 次执行尝试
+
+
+@pytest.mark.asyncio
+async def test_claim_blocked_while_lease_valid_then_recoverable():
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)
+        await s.commit()
+        v1 = await RunRepository(s).claim(run.id, "worker-a", 300)
+        assert v1 == 1
+
+        # Lease 有效期间不可被抢占
+        assert await RunRepository(s).claim(run.id, "worker-b", 300) is None
+
+        # 模拟 Lease 过期（时间戳拨回）
+        row = await RunRepository(s).get_run(run.id)
+        row.lease_expires_at = row.lease_expires_at.replace(year=2000)
+        await s.commit()
+
+        v2 = await RunRepository(s).claim(run.id, "worker-b", 300)
+        assert v2 == 2 and v2 != v1  # fencing token 递增
+        row = await RunRepository(s).get_run(run.id)
+        assert row.worker_id == "worker-b" and row.attempt == 2
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_extends_lease_and_fencing():
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)
+        await s.commit()
+        v1 = await RunRepository(s).claim(run.id, "worker-a", 30)
+
+        assert await RunRepository(s).heartbeat(run.id, "worker-a", v1, 30)
+        # 错误版本 / 错误 worker 一律拒绝
+        assert not await RunRepository(s).heartbeat(run.id, "worker-a", v1 + 5, 30)
+        assert not await RunRepository(s).heartbeat(run.id, "worker-z", v1, 30)
+
+
+@pytest.mark.asyncio
+async def test_release_invalidates_old_worker():
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)
+        await s.commit()
+        v1 = await RunRepository(s).claim(run.id, "worker-a", 30)
+        assert await RunRepository(s).release(run.id, "worker-a", v1)
+
+        # release 后旧 fencing token 不能再提交状态（F-13）
+        ok = await RunRepository(s).update_status(
+            run.id, status=STATUS_COMPLETED, lease_version=v1
+        )
+        assert not ok
+        row = await RunRepository(s).get_run(run.id)
+        assert row.status == STATUS_RUNNING  # 状态未被旧 Worker 篡改
+
+
+@pytest.mark.asyncio
+async def test_update_status_fencing_requires_match():
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)
+        await s.commit()
+        v1 = await RunRepository(s).claim(run.id, "worker-a", 30)
+
+        assert await RunRepository(s).update_status(
+            run.id, status=STATUS_COMPLETED, lease_version=v1, final_text="done",
+            summary={"model_calls": 1}, finished=True,
+        )
+        row = await RunRepository(s).get_run(run.id)
+        assert row.status == STATUS_COMPLETED and row.final_text == "done"
+        assert row.finished_at is not None
+
+
+@pytest.mark.asyncio
+async def test_claim_next_skips_paused_statuses():
+    """waiting_approval / needs_reconciliation 不得被普通 Worker 领取（FR-02.9）。"""
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        waiting, _ = await _create_run(repo)
+        waiting.status = STATUS_WAITING_APPROVAL
+        recon, _ = await _create_run(repo)
+        recon.status = STATUS_NEEDS_RECONCILIATION
+        ready, _ = await _create_run(repo)
+        await s.commit()
+
+        claimed = await RunRepository(s).claim_next("worker-x", 30)
+        assert claimed is not None and claimed.id == ready.id
+        assert await RunRepository(s).claim_next("worker-y", 30) is None
+
+
+@pytest.mark.asyncio
+async def test_claim_next_picks_expired_running_for_recovery():
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)
+        await s.commit()
+        await RunRepository(s).claim(run.id, "dead-worker", 300)
+        row = await RunRepository(s).get_run(run.id)
+        row.lease_expires_at = row.lease_expires_at.replace(year=2000)
+        await s.commit()
+
+        stale = await RunRepository(s).list_stale_running()
+        assert [r.id for r in stale] == [run.id]
+
+        claimed = await RunRepository(s).claim_next("worker-b", 30)
+        assert claimed is not None and claimed.id == run.id
+        assert claimed.worker_id == "worker-b"
+
+
+# ── FR-05 Tool Execution Ledger ────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_ledger_begin_is_idempotent_per_tool_call_id():
+    """稳定身份是 (run_id, tool_call_id)：重复登记返回同一记录。"""
+    async with AsyncSessionLocal() as s:
+        ledger = ToolExecutionRepository(s)
+        run_id = _uid()
+        rec1, c1 = await ledger.begin(
+            run_id=run_id, tool_call_id="call-1", tool_name="http_post",
+            args_hash="h", idempotency_key="idem-1",
+        )
+        rec2, c2 = await ledger.begin(
+            run_id=run_id, tool_call_id="call-1", tool_name="http_post",
+            args_hash="h", idempotency_key="idem-1",
+        )
+        assert c1 and not c2 and rec1.id == rec2.id
+
+        # 相同参数、不同 tool_call_id 是两次独立操作（禁止 args_hash 当调用 ID）
+        rec3, c3 = await ledger.begin(
+            run_id=run_id, tool_call_id="call-2", tool_name="http_post",
+            args_hash="h", idempotency_key="idem-2",
+        )
+        assert c3 and rec3.id != rec1.id
+
+
+@pytest.mark.asyncio
+async def test_ledger_success_flow():
+    async with AsyncSessionLocal() as s:
+        ledger = ToolExecutionRepository(s)
+        run_id = _uid()
+        rec, _ = await ledger.begin(run_id=run_id, tool_call_id="c1", tool_name="t")
+        assert rec.status == TOOL_EXEC_PREPARED
+
+        assert await ledger.mark_executing(rec.id, worker_id="w", lease_version=1)
+        assert await ledger.mark_succeeded(
+            rec.id, result_payload={"ok": True}, external_operation_id="op-9"
+        )
+        row = await ledger.get(run_id, "c1")
+        assert row.status == TOOL_EXEC_SUCCEEDED
+        assert row.attempt_count == 1
+        assert row.result_payload == {"ok": True}
+        assert row.external_operation_id == "op-9"
+        assert row.finished_at is not None
+
+
+@pytest.mark.asyncio
+async def test_ledger_succeeded_is_immutable():
+    async with AsyncSessionLocal() as s:
+        ledger = ToolExecutionRepository(s)
+        run_id = _uid()
+        rec, _ = await ledger.begin(run_id=run_id, tool_call_id="c1", tool_name="t")
+        await ledger.mark_executing(rec.id)
+        await ledger.mark_succeeded(rec.id, result_payload={"ok": True})
+
+        assert not await ledger.mark_failed(rec.id, error="late failure")
+        assert not await ledger.mark_succeeded(rec.id, result_payload={"ok": False})
+        row = await ledger.get(run_id, "c1")
+        assert row.status == TOOL_EXEC_SUCCEEDED
+        assert row.result_payload == {"ok": True}
+
+
+@pytest.mark.asyncio
+async def test_ledger_unknown_blocks_replay():
+    """结果未知的外部调用：不得自动重放，进入 needs_reconciliation（FR-05/原则 E）。"""
+    async with AsyncSessionLocal() as s:
+        ledger = ToolExecutionRepository(s)
+        run_id = _uid()
+        rec, _ = await ledger.begin(run_id=run_id, tool_call_id="c1", tool_name="http_post")
+        await ledger.mark_executing(rec.id)
+        await ledger.mark_unknown(rec.id, error="响应超时，远端结果未知")
+
+        assert await ledger.has_unsafe_entries(run_id)
+        unresolved = await ledger.list_unresolved(run_id)
+        assert [u.status for u in unresolved] == [TOOL_EXEC_UNKNOWN]
+
+        await ledger.mark_needs_reconciliation(rec.id, error="等待人工核对")
+        row = await ledger.get(run_id, "c1")
+        assert row.status == TOOL_EXEC_NEEDS_RECONCILIATION
+        assert await ledger.has_unsafe_entries(run_id)
+
+
+@pytest.mark.asyncio
+async def test_ledger_no_unsafe_after_success():
+    async with AsyncSessionLocal() as s:
+        ledger = ToolExecutionRepository(s)
+        run_id = _uid()
+        rec, _ = await ledger.begin(run_id=run_id, tool_call_id="c1", tool_name="t")
+        await ledger.mark_executing(rec.id)
+        await ledger.mark_succeeded(rec.id)
+        assert not await ledger.has_unsafe_entries(run_id)
+
+
+# ── FR-07 事件日志与序号 ───────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_event_seq_monotonic_per_run():
+    async with AsyncSessionLocal() as s:
+        runs = RunRepository(s)
+        events = EventRepository(s)
+        run, _ = await _create_run(runs)
+        await s.commit()
+
+        seqs = [
+            await events.append(run.id, "model_delta", {"text": f"t{i}"})
+            for i in range(5)
+        ]
+        await s.commit()
+        assert seqs == [1, 2, 3, 4, 5]
+        assert await events.last_seq(run.id) == 5
+
+
+@pytest.mark.asyncio
+async def test_event_unique_constraint_on_sequence():
+    async with AsyncSessionLocal() as s:
+        runs = RunRepository(s)
+        events = EventRepository(s)
+        run, _ = await _create_run(runs)
+        await events.append(run.id, "run_started", {})
+        await s.commit()
+
+        s.add(AgentRunEvent(run_id=run.id, sequence=1, event_type="dup"))
+        with pytest.raises(IntegrityError):
+            await s.flush()
+        await s.rollback()
+
+
+@pytest.mark.asyncio
+async def test_event_replay_after_seq():
+    async with AsyncSessionLocal() as s:
+        runs = RunRepository(s)
+        events = EventRepository(s)
+        run, _ = await _create_run(runs)
+        for i in range(30):
+            await events.append(run.id, "model_delta", {"i": i})
+        await s.commit()
+
+        replay = await EventRepository(s).list_after(run.id, after_seq=12)
+        assert [e.sequence for e in replay] == list(range(13, 31))
+        tail = await EventRepository(s).list_after(run.id, after_seq=29)
+        assert [e.sequence for e in tail] == [30]
+
+
+@pytest.mark.asyncio
+async def test_event_seq_unknown_run_raises():
+    async with AsyncSessionLocal() as s:
+        with pytest.raises(LookupError):
+            await EventRepository(s).append("no-such-run", "run_started", {})
+
+
+@pytest.mark.asyncio
+async def test_event_cleanup_only_terminal_and_expired():
+    async with AsyncSessionLocal() as s:
+        runs = RunRepository(s)
+        events = EventRepository(s)
+        done_run, _ = await _create_run(runs)
+        await runs.claim(done_run.id, "w", 30)
+        await runs.update_status(
+            done_run.id, status=STATUS_COMPLETED, lease_version=1, finished=True
+        )
+        live_run, _ = await _create_run(runs)
+        live_run.status = STATUS_WAITING_APPROVAL
+        await s.commit()
+        # 把终态 run 的 finished_at 拨老
+        done = await runs.get_run(done_run.id)
+        done.finished_at = done.finished_at.replace(year=2000)
+
+        await events.append(done_run.id, "run_completed", {})
+        await events.append(live_run.id, "run_started", {})
+        await s.commit()
+
+        deleted = await EventRepository(s).cleanup(retention_days=30)
+        await s.commit()
+        assert deleted == 1
+        # 运行中的 run 事件保留
+        kept = await events.list_after(live_run.id, 0)
+        assert len(kept) == 1
+
+
+# ── 生命周期状态机 ─────────────────────────────────────────────────────────
+
+
+def test_needs_reconciliation_transitions():
+    assert STATUS_NEEDS_RECONCILIATION in ALLOWED_TRANSITIONS[STATUS_RUNNING]
+    assert ALLOWED_TRANSITIONS[STATUS_NEEDS_RECONCILIATION] == {
+        STATUS_RUNNING, STATUS_CANCELLED, STATUS_FAILED
+    }
+    handle = RunHandle(
+        run_id="r", agent_id=1, session_id=None, user_id=1, thread_id="t"
+    )
+    handle.status = STATUS_NEEDS_RECONCILIATION
+    with pytest.raises(InvalidTransition):
+        handle.transition(STATUS_COMPLETED)  # 不得自动完成
+    handle.transition(STATUS_RUNNING)  # 人工确认后可继续
+
+
+# ── Alembic 迁移（SQLite 完整 upgrade / downgrade 验证） ───────────────────
+
+
+def test_alembic_migration_upgrade_downgrade(tmp_path):
+    db_path = tmp_path / "mig.db"
+    env = os.environ.copy()
+    env["DATABASE_SYNC_URL"] = f"sqlite:///{db_path}"
+    env["DATABASE_URL"] = f"sqlite+aiosqlite:///{db_path}"
+    env.setdefault("SECRET_KEY", "test-secret-key-for-pytest")
+    backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+    def run(*args):
+        r = subprocess.run(
+            [sys.executable, "-m", "alembic", *args],
+            cwd=backend_dir, env=env, capture_output=True, text=True, timeout=180,
+        )
+        assert r.returncode == 0, f"alembic {args} failed:\n{r.stdout}\n{r.stderr}"
+
+    run("upgrade", "head")
+
+    con = sqlite3.connect(db_path)
+    try:
+        tables = {
+            r[0] for r in con.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        assert {"agent_tool_executions", "agent_run_events"} <= tables
+
+        run_cols = {
+            r[1] for r in con.execute("PRAGMA table_info(agent_runs)").fetchall()
+        }
+        for col in (
+            "request_hash", "input_payload", "agent_config_snapshot", "started_at",
+            "worker_id", "lease_expires_at", "heartbeat_at", "attempt",
+            "lease_version", "last_event_seq", "recovery_error",
+        ):
+            assert col in run_cols, f"agent_runs 缺少列 {col}"
+
+        appro_cols = {
+            r[1] for r in con.execute("PRAGMA table_info(agent_approvals)").fetchall()
+        }
+        for col in ("action_id", "tool_call_id", "args_hash", "action_payload", "decision_status"):
+            assert col in appro_cols, f"agent_approvals 缺少列 {col}"
+
+        # 唯一约束存在（SQLite 不保留约束名，按列组合验证）
+        def unique_index_cols(table):
+            cols_sets = []
+            for idx in con.execute(f"PRAGMA index_list({table})").fetchall():
+                if idx[2]:  # unique
+                    icols = [
+                        r[2] for r in con.execute(f"PRAGMA index_info({idx[1]})").fetchall()
+                    ]
+                    cols_sets.append(icols)
+            return cols_sets
+
+        assert ["user_id", "idempotency_key"] in unique_index_cols("agent_runs")
+        assert ["run_id", "sequence"] in unique_index_cols("agent_run_events")
+        assert ["run_id", "tool_call_id"] in unique_index_cols("agent_tool_executions")
+    finally:
+        con.close()
+
+    run("downgrade", "base")
+    run("upgrade", "head")  # 回滚后可再次升级
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Phase 2：Worker（Claim / Lease / Heartbeat / Fencing / 恢复 / 优雅关闭）
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _make_service(
+    *,
+    worker_id="w-test",
+    lease_seconds=30,
+    heartbeat_interval=0.05,
+    poll_interval=0.02,
+    shutdown_grace=0.5,
+):
+    svc = AgentRuntimeService()
+    svc.worker = RunWorker(
+        svc,
+        worker_id=worker_id,
+        lease_seconds=lease_seconds,
+        heartbeat_interval=heartbeat_interval,
+        poll_interval=poll_interval,
+        shutdown_grace=shutdown_grace,
+    )
+    return svc
+
+
+def _stub_drive(record, *, block=False):
+    """替换 _drive：记录调用参数（不触发模型）；block=True 时阻塞直到被取消。"""
+
+    async def fake_drive(
+        self, run, adapter, *, messages, resume,
+        agent_config=None, use_memory_context="", db_info=None, user_id=None,
+    ):
+        record.append({"run_id": run.run_id, "messages": messages, "resume": resume})
+        await run.bus.publish(RuntimeEvent(type=RUN_STARTED, run_id=run.run_id))
+        if block:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                record.append({"run_id": run.run_id, "cancelled": True})
+                raise
+        run.final_text = "ok"
+        run.summary = {"tool_calls": 0, "model_calls": 1}
+        run.transition(STATUS_COMPLETED)
+        await self._commit(
+            run, status=STATUS_COMPLETED, final_text="ok",
+            summary=run.summary, finished=True,
+        )
+        await run.bus.publish(
+            RuntimeEvent(type=RUN_COMPLETED, run_id=run.run_id, data={"final_text": "ok"})
+        )
+
+    return fake_drive
+
+
+async def _wait_status(run_id, statuses, timeout=5.0):
+    """轮询等待 run 达到指定状态，返回最终行（超时返回 None）。"""
+    deadline = asyncio.get_event_loop().time() + timeout
+    while asyncio.get_event_loop().time() < deadline:
+        async with AsyncSessionLocal() as s:
+            row = await RunRepository(s).get_run(run_id)
+        if row is not None and row.status in statuses:
+            return row
+        await asyncio.sleep(0.02)
+    return None
+
+
+# ── T-06 多 Worker 并发领取 ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_t06_two_workers_single_claim_winner():
+    async with AsyncSessionLocal() as s:
+        run, _ = await _create_run(RunRepository(s))
+        await s.commit()
+        run_id = run.id
+
+    wa, wb = _make_service(worker_id="wa"), _make_service(worker_id="wb")
+    rows = await asyncio.gather(
+        wa.worker.claim_run(run_id),
+        wb.worker.claim_run(run_id),
+    )
+    claimed = [r for r in rows if r is not None]
+    assert len(claimed) == 1  # 只有一个 Worker 获得执行权
+    assert claimed[0].lease_version == 1 and claimed[0].attempt == 1
+
+
+@pytest.mark.asyncio
+async def test_t06_two_runs_each_executed_once_across_workers(monkeypatch):
+    record = []
+    monkeypatch.setattr(AgentRuntimeService, "_drive", _stub_drive(record))
+
+    async with AsyncSessionLocal() as s:
+        r1, _ = await _create_run(RunRepository(s))
+        r2, _ = await _create_run(RunRepository(s))
+        await s.commit()
+        ids = {r1.id, r2.id}
+
+    wa, wb = _make_service(worker_id="wa"), _make_service(worker_id="wb")
+    await wa.worker.start()
+    await wb.worker.start()
+    try:
+        for rid in ids:
+            row = await _wait_status(rid, {STATUS_COMPLETED})
+            assert row is not None, f"run {rid} 未被执行"
+    finally:
+        await wa.worker.stop()
+        await wb.worker.stop()
+
+    executed = [r["run_id"] for r in record]
+    assert sorted(executed) == sorted(ids)  # 每个 run 恰好执行一次，无重复/遗漏
+
+
+# ── T-07 租约丢失 / fencing ────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_t07_lease_loss_cancels_drive_without_state_write(monkeypatch):
+    record = []
+    monkeypatch.setattr(AgentRuntimeService, "_drive", _stub_drive(record, block=True))
+    svc = _make_service(worker_id="wa", heartbeat_interval=0.05)
+
+    async with AsyncSessionLocal() as s:
+        run, _ = await _create_run(RunRepository(s))
+        await s.commit()
+        run_id = run.id
+
+    row = await svc.worker.claim_run(run_id)
+    assert row is not None
+    task = asyncio.create_task(svc.worker.run_claimed(row, RunJob(run_id=run_id)))
+    while not record:  # 等待执行真正开始
+        await asyncio.sleep(0.01)
+
+    # 模拟租约易主：另一 Worker 接管（fencing token 递增）
+    async with AsyncSessionLocal() as s:
+        await s.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id)
+            .values(lease_version=AgentRun.lease_version + 1, worker_id="wb")
+        )
+        await s.commit()
+
+    await asyncio.wait_for(task, timeout=5)  # 心跳失败 → 挂起执行并结束
+    assert any(r.get("cancelled") for r in record)  # 执行已被中止
+
+    async with AsyncSessionLocal() as s:
+        got = await RunRepository(s).get_run(run_id)
+    assert got.status == STATUS_RUNNING  # 挂起不得写 cancelled
+    assert got.worker_id == "wb"  # 状态归属未被旧 Worker 篡改
+    # 旧 Worker 的 fencing token 已失效，无法再领取
+    assert await svc.worker.claim_run(run_id) is None
+
+
+# ── 重启恢复：孤儿 Run 接管（attempt>1 恢复检查） ──────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_recovery_orphan_run_reclaimed_and_executed(monkeypatch):
+    record = []
+    monkeypatch.setattr(AgentRuntimeService, "_drive", _stub_drive(record))
+    svc = _make_service(worker_id="w-recover")
+
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(
+            repo,
+            input_payload={
+                "messages": [{"role": "user", "content": "hi"}],
+                "use_memory_context": "",
+                "db_info": None,
+            },
+            agent_config_snapshot={"id": 1, "tools": []},
+        )
+        await repo.claim(run.id, "dead-worker", 30)
+        await s.commit()
+        run_id = run.id
+        row = await repo.get_run(run_id)
+        row.lease_expires_at = row.lease_expires_at.replace(year=2000)  # 租约过期
+        await s.commit()
+
+    await svc.worker.start()
+    try:
+        done = await _wait_status(run_id, {STATUS_COMPLETED})
+    finally:
+        await svc.worker.stop()
+    assert done is not None
+    assert done.attempt == 2  # 重新领取计一次恢复尝试
+    assert record[0]["messages"] == [{"role": "user", "content": "hi"}]  # 输入快照重建
+
+
+@pytest.mark.asyncio
+async def test_recovery_unsafe_ledger_blocks_auto_replay():
+    svc = _make_service(worker_id="w-recover")
+
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)
+        await repo.claim(run.id, "dead-worker", 30)
+        await s.commit()
+        run_id = run.id
+        row = await repo.get_run(run_id)
+        row.lease_expires_at = row.lease_expires_at.replace(year=2000)
+        # 崩溃在副作用结果未知的窗口：账本记录为 unknown。
+        # webhook_notify 无下游幂等能力 -> 禁止自动重放（http_post 等
+        # external_idempotent 工具允许复用同一幂等键重试，见 T-05）
+        ledger = ToolExecutionRepository(s)
+        rec, _ = await ledger.begin(
+            run_id=run_id, tool_call_id="call_1", tool_name="webhook_notify",
+            args_snapshot={"url": "https://hooks.example.com/x"},
+        )
+        await ledger.mark_unknown(rec.id, error="网络超时，远端是否成功未知")
+        await s.commit()
+
+    await svc.worker.start()
+    try:
+        done = await _wait_status(run_id, {STATUS_NEEDS_RECONCILIATION})
+    finally:
+        await svc.worker.stop()
+    assert done is not None
+    assert done.recovery_error and "禁止自动重放" in done.recovery_error
+
+
+@pytest.mark.asyncio
+async def test_recovery_checkpoint_interrupt_returns_to_waiting_approval(monkeypatch):
+    svc = _make_service(worker_id="w-recover")
+
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)
+        await repo.claim(run.id, "dead-worker", 30)
+        await s.commit()
+        run_id = run.id
+        row = await repo.get_run(run_id)
+        row.lease_expires_at = row.lease_expires_at.replace(year=2000)
+        await s.commit()
+
+    async def fake_thread_state(thread_id):
+        return {
+            "next": ["hitl"],
+            "has_interrupt": True,
+            "pending_actions": [
+                {"tool": "delete_file", "args": {"path": "/x"}, "description": ""},
+            ],
+        }
+
+    monkeypatch.setattr(svc, "get_thread_state", fake_thread_state)
+
+    await svc.worker.start()
+    try:
+        done = await _wait_status(run_id, {STATUS_WAITING_APPROVAL})
+    finally:
+        await svc.worker.stop()
+    assert done is not None
+
+    # 恢复审批所需的审批记录已持久化
+    async with AsyncSessionLocal() as s:
+        rows = (await s.execute(
+            select(AgentApproval).where(AgentApproval.run_id == run_id)
+        )).scalars().all()
+    assert len(rows) == 1 and rows[0].tool_name == "delete_file"
+
+
+# ── F-06 幂等重复请求 ──────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_f06_idempotent_duplicate_request_single_execution(monkeypatch):
+    record = []
+    monkeypatch.setattr(AgentRuntimeService, "_drive", _stub_drive(record))
+    svc = _make_service(worker_id="w-idem")
+    cfg = {"id": 1, "tools": [], "model_config_id": None}
+    msgs = [{"role": "user", "content": "hi"}]
+
+    run_id_1, stream1 = await svc.start_run(
+        agent_config=cfg, messages=msgs, user_id=1,
+        session_id=None, idempotency_key="idem-1",
+    )
+    events1 = [e async for e in stream1]
+    assert events1[-1]["type"] == "done" and events1[-1]["status"] == "completed"
+
+    run_id_2, stream2 = await svc.start_run(
+        agent_config=cfg, messages=msgs, user_id=1,
+        session_id=None, idempotency_key="idem-1",
+    )
+    events2 = [e async for e in stream2]
+
+    assert run_id_2 == run_id_1  # 不产生重复 Run
+    assert len(record) == 1      # 不重复执行
+    assert any(e.get("type") == "final" for e in events2)  # 回放补齐终态事件
+    assert events2[-1]["type"] == "done" and events2[-1]["status"] == STATUS_COMPLETED
+
+    async with AsyncSessionLocal() as s:
+        got = await RunRepository(s).get_run(run_id_1)
+    assert got.status == STATUS_COMPLETED and got.final_text == "ok"
+
+
+# ── 优雅关闭：挂起而非取消（保留可恢复状态） ───────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_graceful_shutdown_suspends_and_releases_lease(monkeypatch):
+    record = []
+    monkeypatch.setattr(AgentRuntimeService, "_drive", _stub_drive(record, block=True))
+    svc = _make_service(worker_id="w-shut", shutdown_grace=0.1)
+
+    async with AsyncSessionLocal() as s:
+        run, _ = await _create_run(RunRepository(s))
+        await s.commit()
+        run_id = run.id
+
+    row = await svc.worker.claim_run(run_id)
+    assert row is not None
+    task = asyncio.create_task(svc.worker.run_claimed(row, RunJob(run_id=run_id)))
+    while not record:
+        await asyncio.sleep(0.01)
+
+    await svc.worker.stop()  # 优雅关闭：等待超时后挂起在途执行
+    await asyncio.gather(task, return_exceptions=True)
+    assert any(r.get("cancelled") for r in record)
+
+    async with AsyncSessionLocal() as s:
+        got = await RunRepository(s).get_run(run_id)
+    assert got.status == STATUS_RUNNING     # 挂起不写 cancelled
+    assert got.worker_id is None            # 租约已释放
+
+    # 其他 Worker 可立即接管（不需要等租约过期）
+    other = _make_service(worker_id="w-next")
+    assert await other.worker.claim_run(run_id) is not None
+
+
+@pytest.mark.asyncio
+async def test_drive_suspend_keeps_run_recoverable(monkeypatch):
+    """真实 _drive 的挂起分支：取消时不改写状态（F-02 / F-13 状态保护）。"""
+    monkeypatch.setattr(
+        AgentRuntimeService, "_load_model",
+        lambda self, mid: _coro(({"provider": "mock"}, {"name": "mock"})),
+    )
+    monkeypatch.setattr(
+        "app.services.agent_runtime.service.build_agent",
+        lambda *a, **k: object(),
+    )
+
+    async def fake_consume(self, agent, payload, run_config, ctx, run, bus):
+        await asyncio.Event().wait()  # 一直执行
+
+    monkeypatch.setattr(AgentRuntimeService, "_consume_stream", fake_consume)
+
+    svc = _make_service(worker_id="w-suspend")
+    async with AsyncSessionLocal() as s:
+        run, _ = await _create_run(RunRepository(s))
+        await s.commit()
+        run_id = run.id
+    row = await svc.worker.claim_run(run_id)
+    handle = svc.registry.attach(
+        run_id=run_id, agent_id=1, session_id=None, user_id=1,
+        thread_id=row.thread_id, status=STATUS_RUNNING,
+    )
+    handle.lease_version = row.lease_version
+    handle.suspend_requested = True  # 优雅关闭/租约丢失语义
+
+    task = asyncio.create_task(svc._drive(
+        handle, LegacyEventAdapter(run_id),
+        messages=[{"role": "user", "content": "x"}], resume=None,
+        agent_config={"id": 1, "tools": []}, user_id=1,
+    ))
+    await asyncio.sleep(0.1)  # 进入 _consume_stream 挂起
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    async with AsyncSessionLocal() as s:
+        got = await RunRepository(s).get_run(run_id)
+    assert got.status == STATUS_RUNNING  # 不得写 cancelled，保留可恢复
+    assert got.error is None
+
+
+def _coro(value):
+    async def _inner(*a, **k):
+        return value
+    return _inner()
+
+
+# ── FR-05 工具账本故障注入（T-04 / T-05） ──────────────────────────────────
+
+
+def _make_ctx(run_id: str) -> RuntimeContext:
+    return RuntimeContext(
+        scope=RunScope(user_id=1),
+        run_id=run_id,
+        thread_id=f"thr-{run_id}",
+        agent_id=1,
+    )
+
+
+def _make_adapter(ctx: RuntimeContext, tool_names) -> ToolAdapterFactory:
+    policy = ToolPolicy.from_settings(set(tool_names), enable_hitl=False)
+    return ToolAdapterFactory(ctx, policy, EventBus())
+
+
+def _fake_executor(behavior):
+    """ToolExecutor 替身：真实账本 + 可注入故障的执行体。"""
+
+    class _Fake:
+        def __init__(self, db, agent_config):
+            pass
+
+        async def execute(self, name, args, *, raise_on_error=False):
+            return await behavior(name, args)
+
+    return _Fake
+
+
+@pytest.mark.asyncio
+async def test_t01_multi_step_tool_ledger_stable_ids_and_keys(monkeypatch):
+    """T-01：多步工具 Run 中每个 tool_call 都有稳定 ID、状态和幂等键。"""
+    calls = []
+
+    async def behavior(name, args):
+        calls.append(name)
+        return f"result-of-{name}"
+
+    monkeypatch.setattr(
+        "app.services.agent_runtime.tools.adapter.ToolExecutor",
+        _fake_executor(behavior),
+    )
+    run_id = _uid()
+    adapter = _make_adapter(_make_ctx(run_id), {"calculator", "web_search"})
+    await adapter._execute("calculator", {"tool_call_id": "tc-a", "expression": "1+1"})
+    await adapter._execute("web_search", {"tool_call_id": "tc-b", "query": "langgraph"})
+    assert calls == ["calculator", "web_search"]
+
+    async with AsyncSessionLocal() as s:
+        ledger = ToolExecutionRepository(s)
+        rec_a = await ledger.get(run_id, "tc-a")
+        rec_b = await ledger.get(run_id, "tc-b")
+    assert rec_a.status == TOOL_EXEC_SUCCEEDED and rec_b.status == TOOL_EXEC_SUCCEEDED
+    assert rec_a.tool_call_id != rec_b.tool_call_id  # 稳定且互异的调用 ID
+    assert rec_a.args_hash and rec_b.args_hash  # 输入指纹留存
+    assert rec_a.args_snapshot["expression"] == "1+1"
+    # 幂等键 = sha256(run_id + tool_call_id)，与 args 无关、跨重试稳定
+    assert rec_a.idempotency_key == hashlib.sha256(f"{run_id}:tc-a".encode()).hexdigest()
+    assert rec_b.idempotency_key == hashlib.sha256(f"{run_id}:tc-b".encode()).hexdigest()
+    assert rec_a.idempotency_key != rec_b.idempotency_key
+
+
+@pytest.mark.asyncio
+async def test_t04_tool_success_then_crash_replay_returns_cached_result(monkeypatch):
+    """T-04：工具真实执行并写入 succeeded 账本后、Checkpoint 前崩溃；
+    重建 Runtime 恢复重放同一 tool_call 时读取账本结果，不重复执行工具。"""
+    calls = []
+
+    async def behavior(name, args):
+        calls.append(args)
+        return "42"
+
+    monkeypatch.setattr(
+        "app.services.agent_runtime.tools.adapter.ToolExecutor",
+        _fake_executor(behavior),
+    )
+    run_id = _uid()
+    adapter = _make_adapter(_make_ctx(run_id), {"calculator"})
+    out1 = await adapter._execute("calculator", {"tool_call_id": "tc-1", "expression": "2+2"})
+    assert out1 == "42"
+    assert len(calls) == 1
+
+    async with AsyncSessionLocal() as s:
+        rec = await ToolExecutionRepository(s).get(run_id, "tc-1")
+    assert rec.status == TOOL_EXEC_SUCCEEDED
+    assert rec.result_payload == "42"
+
+    # 模拟崩溃后重建 Runtime（新 ctx/adapter），Graph 重放同一 tool_call
+    adapter2 = _make_adapter(_make_ctx(run_id), {"calculator"})
+    out2 = await adapter2._execute("calculator", {"tool_call_id": "tc-1", "expression": "2+2"})
+    assert out2 == "42"  # 返回持久化结果
+    assert len(calls) == 1  # 工具不重复执行
+
+    async with AsyncSessionLocal() as s:
+        rec = await ToolExecutionRepository(s).get(run_id, "tc-1")
+    assert rec.status == TOOL_EXEC_SUCCEEDED
+    assert rec.attempt_count == 1
+
+
+@pytest.mark.asyncio
+async def test_t05_unknown_result_blocks_replay_without_idempotency(monkeypatch):
+    """T-05（无下游幂等能力）：外部副作用结果未知 -> unknown；
+    自动恢复不得再次执行（不再 POST），进入 needs_reconciliation。"""
+    calls = []
+
+    async def behavior(name, args):
+        calls.append(args)
+        raise TimeoutError("webhook 响应超时，远端是否成功未知")
+
+    monkeypatch.setattr(
+        "app.services.agent_runtime.tools.adapter.ToolExecutor",
+        _fake_executor(behavior),
+    )
+    run_id = _uid()
+    adapter = _make_adapter(_make_ctx(run_id), {"webhook_notify"})
+    out1 = await adapter._execute(
+        "webhook_notify", {"tool_call_id": "tc-9", "url": "https://hooks.example.com/x"}
+    )
+    assert "工具执行错误" in out1
+    assert len(calls) == 1
+
+    async with AsyncSessionLocal() as s:
+        rec = await ToolExecutionRepository(s).get(run_id, "tc-9")
+    assert rec.status == TOOL_EXEC_UNKNOWN
+
+    # 重建 Runtime 重放：禁止再次执行
+    adapter2 = _make_adapter(_make_ctx(run_id), {"webhook_notify"})
+    out2 = await adapter2._execute(
+        "webhook_notify", {"tool_call_id": "tc-9", "url": "https://hooks.example.com/x"}
+    )
+    assert len(calls) == 1  # 未再次执行、未再次 POST
+    assert "阻止自动重放" in out2
+
+    async with AsyncSessionLocal() as s:
+        rec = await ToolExecutionRepository(s).get(run_id, "tc-9")
+    assert rec.status == TOOL_EXEC_NEEDS_RECONCILIATION
+
+
+@pytest.mark.asyncio
+async def test_t05_idempotent_retry_reuses_same_key(monkeypatch):
+    """T-05（有下游幂等键）：POST 超时结果未知 -> 重试复用同一 Idempotency-Key，
+    下游按幂等键去重，逻辑副作用只产生一次。"""
+    calls = []
+    downstream: dict = {}  # Idempotency-Key -> 下游业务结果
+
+    async def behavior(name, args):
+        key = (args.get("headers") or {}).get("Idempotency-Key")
+        assert key, "外部 POST 必须注入 Idempotency-Key"
+        calls.append(key)
+        if key not in downstream:
+            downstream[key] = "HTTP 201 订单已创建"  # 远端已成功
+        if len(calls) == 1:
+            raise TimeoutError("响应超时，未收到远端响应")  # 客户端超时
+        return downstream[key]  # 幂等键命中，返回既有结果
+
+    monkeypatch.setattr(
+        "app.services.agent_runtime.tools.adapter.ToolExecutor",
+        _fake_executor(behavior),
+    )
+    monkeypatch.setattr(ToolPolicy, "check_url", lambda self, url: None)  # 跳过 DNS/SSRF 检查
+    run_id = _uid()
+    payload = {"tool_call_id": "tc-7", "url": "https://api.example.com/orders", "body": {"sku": "A-1"}}
+    adapter = _make_adapter(_make_ctx(run_id), {"http_post"})
+    out1 = await adapter._execute("http_post", dict(payload))
+    assert "工具执行错误" in out1
+    assert len(calls) == 1
+    assert len(downstream) == 1  # 远端已产生副作用
+
+    async with AsyncSessionLocal() as s:
+        rec = await ToolExecutionRepository(s).get(run_id, "tc-7")
+    assert rec.status == TOOL_EXEC_UNKNOWN
+
+    # 重试（恢复重放）：external_idempotent 允许复用同一幂等键重试
+    adapter2 = _make_adapter(_make_ctx(run_id), {"http_post"})
+    out2 = await adapter2._execute("http_post", dict(payload))
+    assert out2 == "HTTP 201 订单已创建"
+    assert calls[0] == calls[1]  # 复用同一 Idempotency-Key
+    assert len(downstream) == 1  # 逻辑副作用只产生一次
+    # 幂等键 = sha256(run_id + tool_call_id) 摘要，跨重试稳定
+    assert calls[0] == hashlib.sha256(f"{run_id}:tc-7".encode()).hexdigest()
+
+    async with AsyncSessionLocal() as s:
+        rec = await ToolExecutionRepository(s).get(run_id, "tc-7")
+    assert rec.status == TOOL_EXEC_SUCCEEDED
+    assert rec.attempt_count == 2
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Phase 4：HITL 审批持久化（T-02 / T-03 / F-11 / FR-04 / FR-06）
+# ════════════════════════════════════════════════════════════════════════════
+
+
+class _FakeChatModel(BaseChatModel):
+    """脚本化模型：按序返回预设消息（工具调用轮 -> 恢复后最终回答轮）。"""
+
+    script: List[Any] = []
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake"
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        msg = self.script.pop(0) if self.script else AIMessage(content="（无更多脚本输出）")
+        return ChatResult(generations=[ChatGeneration(message=msg)])
+
+
+def _hitl_agent_config():
+    return {
+        "id": 1,
+        "model_config_id": 1,
+        "tools": ["webhook_notify"],  # DEFAULT_HITL_TOOLS 内的副作用工具
+        "system_prompt": "测试",
+    }
+
+
+async def _fake_load_model(self, model_config_id):
+    return (
+        {"name": "mock", "base_url": "http://x", "api_key": "k", "extra_config": {}},
+        {"name": "fake", "supports_function_call": True},
+    )
+
+
+async def _fake_load_agent_config(self, agent_id):
+    return _hitl_agent_config()
+
+
+def _setup_hitl(monkeypatch, calls):
+    """T-02/T-03 共用装配：真实 build_agent 图 + FakeChatModel + webhook_notify。
+
+    首轮模型发出 webhook_notify 工具调用（触发 HITL 中断），批准恢复后
+    第二轮给出最终回答。工具执行体为替身（记录调用），真实走工具账本。
+    """
+    import app.services.agent_runtime.factory as factory_mod
+
+    model = _FakeChatModel(script=[
+        AIMessage(content="", tool_calls=[{
+            "name": "webhook_notify",
+            "args": {"webhook_url": "https://hooks.example.com/x", "message": "hi"},
+            "id": "tc-h1",
+        }]),
+        AIMessage(content="已通知"),
+    ])
+    monkeypatch.setattr(factory_mod, "build_chat_model", lambda *a, **k: model)
+
+    async def behavior(name, args):
+        calls.append({"name": name, "args": dict(args)})
+        return "webhook 已送达"
+
+    monkeypatch.setattr(
+        "app.services.agent_runtime.tools.adapter.ToolExecutor",
+        _fake_executor(behavior),
+    )
+    monkeypatch.setattr(AgentRuntimeService, "_load_model", _fake_load_model)
+    monkeypatch.setattr(AgentRuntimeService, "_load_agent_config", _fake_load_agent_config)
+
+
+async def _run_to_waiting_approval(svc):
+    """启动 HITL Run 并消费事件流至 waiting_approval，返回 (run_id, events)。"""
+    run_id, stream = await svc.start_run(
+        agent_config=_hitl_agent_config(),
+        messages=[{"role": "user", "content": "发个通知"}],
+        user_id=1,
+        session_id=None,
+    )
+    events = [e async for e in stream]
+    await svc.worker.stop()  # 执行进程退出（释放租约）
+    return run_id, events
+
+
+@pytest.mark.asyncio
+async def test_t02_hitl_approval_persisted_and_resumable_after_restart(monkeypatch):
+    """T-02：HITL 审批动作持久化；服务重启丢失内存句柄后凭库中记录恢复执行。
+
+    验收（FR-06 / F-10）：审批前工具零执行；agent_approvals 落库（稳定
+    action_id、pending）；重启后 resume 精确恢复；工具恰执行一次且账本
+    确认 succeeded、决策落库为 approved。
+    """
+    calls = []
+    _setup_hitl(monkeypatch, calls)
+
+    svc = _make_service(worker_id="w-hitl-1")
+    run_id, events = await _run_to_waiting_approval(svc)
+
+    assert events[-1]["type"] == "done" and events[-1]["status"] == STATUS_WAITING_APPROVAL
+    assert any(e.get("approval", {}).get("actions") for e in events)  # 审批请求已推送给客户端
+    assert not calls, "审批完成前工具不得执行"
+
+    # 审批请求已持久化（FR-06）：稳定 action_id、pending 决策
+    async with AsyncSessionLocal() as s:
+        rows = (await s.execute(
+            select(AgentApproval).where(AgentApproval.run_id == run_id)
+        )).scalars().all()
+    assert len(rows) == 1
+    row = rows[0]
+    assert row.tool_name == "webhook_notify"
+    assert row.action_id and row.decision_status == "pending"
+
+    # 模拟服务重启：内存句柄全部丢失，仅剩数据库 + Checkpoint
+    RunRegistry.instance()._runs.clear()
+    svc2 = _make_service(worker_id="w-hitl-2")
+
+    resume_events = [e async for e in svc2.resume_run(
+        run_id,
+        [{"type": "approve", "message": "ok", "action_id": row.action_id}],
+        1,
+    )]
+    assert resume_events[-1]["type"] == "done"
+    assert resume_events[-1]["status"] == STATUS_COMPLETED
+
+    # 工具恰执行一次，账本确认副作用结果
+    assert len(calls) == 1 and calls[0]["name"] == "webhook_notify"
+    async with AsyncSessionLocal() as s:
+        rec = await ToolExecutionRepository(s).get(run_id, "tc-h1")
+        got = await RunRepository(s).get_run(run_id)
+        decided = (await s.execute(
+            select(AgentApproval).where(AgentApproval.run_id == run_id)
+        )).scalars().one()
+    assert rec is not None and rec.status == TOOL_EXEC_SUCCEEDED
+    assert got.status == STATUS_COMPLETED
+    assert decided.decision == "approve"
+    assert decided.decision_status == "approved" and decided.decided_by == 1
+
+
+@pytest.mark.asyncio
+async def test_t03_approval_idempotent_and_conflict_semantics(monkeypatch):
+    """T-03（F-11）：重复一致审批幂等；改判 / 非法决策 / 无权审批显式拒绝。
+
+    - 重复一致决策：幂等返回当前状态，不重复恢复、不重复执行副作用
+    - 同一动作改判：ApprovalConflict（API 层映射 HTTP 409），不得静默覆盖
+    - 未知决策类型 / 未知审批动作：ApprovalInvalid（HTTP 400）
+    - 非属主审批：ApprovalForbidden（HTTP 403）
+    """
+    calls = []
+    _setup_hitl(monkeypatch, calls)
+
+    svc = _make_service(worker_id="w-hitl-3")
+    run_id, events = await _run_to_waiting_approval(svc)
+    assert events[-1]["status"] == STATUS_WAITING_APPROVAL
+
+    async with AsyncSessionLocal() as s:
+        row = (await s.execute(
+            select(AgentApproval).where(AgentApproval.run_id == run_id)
+        )).scalars().one()
+    action_id = row.action_id
+    approve = [{"type": "approve", "message": "ok", "action_id": action_id}]
+
+    ev1 = [e async for e in svc.resume_run(run_id, approve, 1)]
+    assert ev1[-1]["type"] == "done" and ev1[-1]["status"] == STATUS_COMPLETED
+    assert len(calls) == 1
+
+    # 1) 重复一致审批：幂等返回当前状态，不重复恢复、不重复执行
+    ev2 = [e async for e in svc.resume_run(run_id, approve, 1)]
+    assert ev2[-1].get("idempotent") is True
+    assert ev2[-1]["status"] == STATUS_COMPLETED
+    assert len(calls) == 1  # 工具不重复执行
+
+    # 2) 同一动作改判：冲突显式拒绝，不得静默覆盖既有决策
+    ev3 = [e async for e in svc.resume_run(
+        run_id, [{"type": "reject", "message": "改判", "action_id": action_id}], 1,
+    )]
+    assert ev3[0]["type"] == "error" and ev3[0].get("code") == ApprovalConflict.code
+
+    # 3) 未知决策类型：显式拒绝
+    ev4 = [e async for e in svc.resume_run(
+        run_id, [{"type": "maybe", "action_id": action_id}], 1,
+    )]
+    assert ev4[0]["type"] == "error" and ev4[0].get("code") == ApprovalInvalid.code
+
+    # 4) 未知审批动作：显式拒绝
+    ev5 = [e async for e in svc.resume_run(
+        run_id, [{"type": "approve", "action_id": "no-such-action"}], 1,
+    )]
+    assert ev5[0]["type"] == "error" and ev5[0].get("code") == ApprovalInvalid.code
+
+    # 5) 非属主用户审批：显式拒绝（check_decisions 为 API 层 403 映射源）
+    with pytest.raises(ApprovalForbidden):
+        await svc.check_decisions(run_id, approve, 99)
+
+    # 6) 全程未发生改判/重复执行：决策保持 approve，工具仍恰一次
+    async with AsyncSessionLocal() as s:
+        row = (await s.execute(
+            select(AgentApproval).where(AgentApproval.run_id == run_id)
+        )).scalars().one()
+    assert row.decision == "approve" and row.decision_status == "approved"
+    assert len(calls) == 1
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Phase 5：事件持久化与 SSE 断线回放（T-08 / FR-07）
+# ════════════════════════════════════════════════════════════════════════════
+
+
+async def _publish_scripted_events(run_id: str, n_deltas: int = 29) -> None:
+    """模拟执行 Worker 发布 n_deltas 个增量 + 终态事件（持久化总线，FR-07）。"""
+    bus = EventBus(persist=True)
+    bus.bind_run(thread_id=f"agent-1-run-{run_id}", agent_id=1)
+    for i in range(n_deltas):
+        await bus.publish(RuntimeEvent(
+            type=MODEL_DELTA,
+            run_id=run_id,
+            data={"text": f"t{i}", "final": False, "index": i},
+        ))
+    await bus.publish(RuntimeEvent(
+        type=RUN_COMPLETED, run_id=run_id, data={"status": "completed"},
+    ))
+
+
+@pytest.mark.asyncio
+async def test_t08_sse_replay_after_disconnect_no_loss():
+    """T-08（FR-07）：SSE 断线后按 after_seq 续传 —— 不丢失、不重复、不乱序。
+
+    发布并持久化 30 个事件；客户端消费到 seq=12 断开；after_seq=12 重连
+    收到 seq=13 到终态。消费端为全新服务实例（内存句柄已清空），验证
+    API 实例与执行 Worker 不同进程也能消费完整事件流。
+    """
+    async with AsyncSessionLocal() as s:
+        run, _ = await _create_run(RunRepository(s))
+        await s.commit()
+    run_id = run.id
+    await _publish_scripted_events(run_id, n_deltas=29)  # 持久化 30 个事件
+
+    async with AsyncSessionLocal() as s:
+        rows = await EventRepository(s).list_after(run_id, 0)
+    assert len(rows) == 30
+    assert [r.sequence for r in rows] == list(range(1, 31))  # 序号单调唯一
+
+    # 模拟 API 实例（与发布端不同进程）：全新服务、无内存句柄
+    RunRegistry.instance()._runs.clear()
+    svc = _make_service(worker_id="w-api")
+
+    first = []
+    async for ev in svc.replay_events(run_id):  # 从头消费（含 seq=0）
+        first.append(ev)
+        if len(first) >= 13:                    # 消费到 seq=12 后断开
+            break
+    assert [e["seq"] for e in first] == list(range(13))
+    assert first[-1]["type"] == "final_chunk"
+
+    resumed = [e async for e in svc.replay_events(run_id, after_seq=12)]
+    assert resumed, "after_seq=12 重连必须续传后续事件"
+    assert [e["seq"] for e in resumed] == list(range(13, 13 + len(resumed)))
+    assert resumed[-1]["type"] == "done" and resumed[-1]["status"] == "completed"
+
+    # 不丢失：两段拼接覆盖全量（final_start + 29 chunk + final + done = 32）
+    # 不重复：两段 seq 无交集；不乱序：全局 seq 连续
+    all_events = first + resumed
+    assert [e["seq"] for e in all_events] == list(range(len(all_events)))
+    assert len(all_events) == 32
+
+    # 最终文本完整性：拼接 chunk 与最终 final 全文一致
+    chunks = [e["content"] for e in all_events if e["type"] == "final_chunk"]
+    assert chunks == [f"t{i}" for i in range(29)]
+    assert all_events[-2]["type"] == "final"
+    assert all_events[-2]["content"] == "".join(chunks)
+
+
+@pytest.mark.asyncio
+async def test_event_overflow_keeps_persisted_and_redacts_payload():
+    """内存队列溢出不丢持久化事件；payload 入库前脱敏（FR-07）。"""
+    async with AsyncSessionLocal() as s:
+        run, _ = await _create_run(RunRepository(s))
+        await s.commit()
+    run_id = run.id
+    bus = EventBus(maxsize=1, persist=True)  # 极小队列强制溢出
+    bus.bind_run(thread_id="t", agent_id=1)
+    for i in range(5):
+        await bus.publish(RuntimeEvent(
+            type=MODEL_DELTA,
+            run_id=run_id,
+            data={"text": f"t{i}", "api_key": "sk-secret", "index": i},
+        ))
+    async with AsyncSessionLocal() as s:
+        rows = await EventRepository(s).list_after(run_id, 0)
+    assert [r.sequence for r in rows] == [1, 2, 3, 4, 5]  # 溢出仅丢通知，DB 全量
+    assert rows[0].payload["api_key"] == "***"            # 入库前已脱敏
+    assert rows[0].payload["text"] == "t0"
+
+
+@pytest.mark.asyncio
+async def test_event_sequence_concurrent_appends_unique():
+    """并发追加下 run 内事件序号原子唯一（sequence 数据库并发安全）。"""
+    async with AsyncSessionLocal() as s:
+        run, _ = await _create_run(RunRepository(s))
+        await s.commit()
+    run_id = run.id
+
+    async def one(i: int) -> int:
+        async with AsyncSessionLocal() as s:
+            seq = await EventRepository(s).append(run_id, "model_delta", {"i": i})
+            await s.commit()
+        return seq
+
+    seqs = await asyncio.gather(*[one(i) for i in range(12)])
+    assert sorted(seqs) == list(range(1, 13))
+
+
+@pytest.mark.asyncio
+async def test_event_retention_cleanup_wired_in_worker():
+    """保留策略接线：Worker 清理终态超期 Run 事件，运行中 Run 一律保留（FR-07）。"""
+    svc = _make_service(worker_id="w-cleanup")
+
+    async with AsyncSessionLocal() as s:
+        runs = RunRepository(s)
+        old_run, _ = await _create_run(runs)   # 终态但超期
+        await runs.claim(old_run.id, "w", 30)
+        await runs.update_status(
+            old_run.id, status=STATUS_COMPLETED, lease_version=1, finished=True
+        )
+        live_run, _ = await _create_run(runs)  # 仍在运行
+        live_run.status = STATUS_WAITING_APPROVAL
+        old_row = await runs.get_run(old_run.id)
+        old_row.finished_at = old_row.finished_at.replace(year=2000)
+        events = EventRepository(s)
+        await events.append(old_run.id, "run_completed", {})
+        await events.append(live_run.id, "run_started", {})
+        await s.commit()
+
+    await svc.worker._cleanup_events()
+
+    async with AsyncSessionLocal() as s:
+        events = EventRepository(s)
+        assert await events.list_after(old_run.id, 0) == []       # 超期终态已清理
+        assert len(await events.list_after(live_run.id, 0)) == 1  # 运行中保留
+
+
+# ── Phase 6：消息去重 / 最终文本竞态 / 模型计数（T-09 / T-10 / T-11） ──
+
+
+def _plain_agent_config(tools: List[str] = None):
+    return {
+        "id": 1,
+        "model_config_id": 1,
+        "tools": list(tools or []),
+        "system_prompt": "测试",
+    }
+
+
+class _ChunkedChatModel(BaseChatModel):
+    """一次模型请求产出多个可见文本 Chunk（模拟流式 token）。
+
+    流式 Chunk 与最终消息共用消息 ID，LangGraph messages 管道按 ID 去重，
+    最终消息不重复下发 —— 多 Chunk 仍是一次模型请求。
+    """
+
+    chunks: List[str] = []
+
+    @property
+    def _llm_type(self) -> str:
+        return "fake-chunked"
+
+    def bind_tools(self, tools, **kwargs):
+        return self
+
+    def _generate(self, messages, stop=None, run_manager=None, **kwargs):
+        for c in self.chunks:
+            if run_manager:
+                run_manager.on_llm_new_token(
+                    c,
+                    chunk=ChatGenerationChunk(message=AIMessageChunk(content=c, id="m1")),
+                )
+        return ChatResult(generations=[ChatGeneration(
+            message=AIMessage(content="".join(self.chunks), id="m1"),
+        )])
+
+
+@pytest.mark.asyncio
+async def test_t09_multi_turn_history_no_duplication_after_restart(monkeypatch):
+    """T-09（FR-08）：多轮会话消息去重——每条用户/助手消息在 Graph state 中
+    只出现一次；服务重启后继续多轮仍正确；Session 每轮恰好写回一条 assistant。
+
+    每轮注入完整会话历史（模拟 /chat 行为），轮与轮之间清空内存注册表模拟
+    进程重启，仅数据库 + Checkpoint 保留；末尾以同一历史重试注入验证
+    重试语义不产生重复。
+    """
+    import app.services.agent_runtime.factory as factory_mod
+    from app.services.agent_runtime.persistence import make_thread_id
+
+    answers = ["回答一", "回答二", "回答三", "回答四"]
+    model = _FakeChatModel(script=[AIMessage(content=a) for a in answers])
+    monkeypatch.setattr(factory_mod, "build_chat_model", lambda *a, **k: model)
+    monkeypatch.setattr(AgentRuntimeService, "_load_model", _fake_load_model)
+    monkeypatch.setattr(AgentRuntimeService, "_load_agent_config", _fake_load_agent_config)
+
+    async with AsyncSessionLocal() as s:
+        sess = AgentSession(agent_id=1, user_id=1, messages=[])
+        s.add(sess)
+        await s.commit()
+        sid = sess.id
+
+    history: List[dict] = []
+    for i in range(3):
+        history.append({"role": "user", "content": f"消息{i + 1}"})
+        # FR-08.1：用户消息在 Run 创建前可靠持久化（模拟 /chat 预存）
+        async with AsyncSessionLocal() as s:
+            from sqlalchemy.orm.attributes import flag_modified
+
+            row = (await s.execute(select(AgentSession).where(AgentSession.id == sid))).scalar_one()
+            row.messages = list(history)
+            flag_modified(row, "messages")
+            await s.commit()
+        # 模拟服务重启：内存句柄/注册表清空，仅剩数据库 + Checkpoint
+        RunRegistry.instance()._runs.clear()
+        svc = _make_service(worker_id=f"w-t9-{i}")
+        run_id, stream = await svc.start_run(
+            agent_config=_plain_agent_config(),
+            messages=list(history),
+            user_id=1,
+            session_id=sid,
+        )
+        events = [e async for e in stream]
+        await svc.worker.stop()
+        assert events[-1]["type"] == "done" and events[-1]["status"] == STATUS_COMPLETED
+        history.append({"role": "assistant", "content": answers[i]})
+
+    # 用同一 Checkpoint 构建等价图，读取 Graph state（消息通道）验证去重
+    from app.services.agent_runtime.persistence import CheckpointerFactory
+
+    cp = await CheckpointerFactory.get().get_checkpointer()
+    provider, model_config = await _fake_load_model(None, 1)
+    graph = factory_mod.build_agent(
+        _make_ctx("t9-state"),
+        ToolPolicy.from_settings(set(), enable_hitl=False),
+        EventBus(),
+        provider,
+        model_config,
+        [],
+        checkpointer=cp,
+    )
+    thread_cfg = {"configurable": {"thread_id": make_thread_id(1, sid, "")}}
+
+    state = await graph.aget_state(thread_cfg)
+    contents = [m.content for m in state.values.get("messages", [])]
+    for expect in ["消息1", "回答一", "消息2", "回答二", "消息3", "回答三"]:
+        assert contents.count(expect) == 1, f"{expect} 在 state 中出现 {contents.count(expect)} 次"
+
+    # Session 写回（FR-08.2）：每轮恰好一条 assistant，顺序与内容正确
+    async with AsyncSessionLocal() as s:
+        res = await s.execute(select(AgentSession).where(AgentSession.id == sid))
+        msgs = res.scalar_one().messages
+    assert [m["role"] for m in msgs] == ["user", "assistant"] * 3
+    assert [m["content"] for m in msgs if m["role"] == "assistant"] == answers[:3]
+
+    # 同一历史重试注入（FR-08 重试语义）：state 不产生重复追加
+    RunRegistry.instance()._runs.clear()
+    svc = _make_service(worker_id="w-t9-retry")
+    run_id, stream = await svc.start_run(
+        agent_config=_plain_agent_config(),
+        messages=list(history),
+        user_id=1,
+        session_id=sid,
+    )
+    events = [e async for e in stream]
+    await svc.worker.stop()
+    assert events[-1]["status"] == STATUS_COMPLETED
+
+    state = await graph.aget_state(thread_cfg)
+    contents = [m.content for m in state.values.get("messages", [])]
+    for expect in ["消息1", "回答一", "消息2", "回答二", "消息3", "回答三", "回答四"]:
+        assert contents.count(expect) == 1, f"重试后 {expect} 出现 {contents.count(expect)} 次"
+
+
+@pytest.mark.asyncio
+async def test_t10_final_text_authoritative_without_consumer(monkeypatch):
+    """T-10（FR-09）：事件消费者延迟/断线下，_drive 完成时 run.final_text 已完整；
+    非流式响应与数据库最终结果一致；LegacyEventAdapter 不承担唯一结果收集职责。
+
+    运行全程不消费事件流（模拟 SSE 消费者断线），完成后才消费并与 DB 对账。
+    """
+    import app.services.agent_runtime.factory as factory_mod
+
+    model = _ChunkedChatModel(chunks=["答案甲-", "答案乙-", "答案丙"])
+    monkeypatch.setattr(factory_mod, "build_chat_model", lambda *a, **k: model)
+    monkeypatch.setattr(AgentRuntimeService, "_load_model", _fake_load_model)
+    monkeypatch.setattr(AgentRuntimeService, "_load_agent_config", _fake_load_agent_config)
+    full = "答案甲-答案乙-答案丙"
+
+    svc = _make_service(worker_id="w-t10-1")
+    run_id, stream = await svc.start_run(
+        agent_config=_plain_agent_config(),
+        messages=[{"role": "user", "content": "hi"}],
+        user_id=1,
+        session_id=None,
+    )
+    # 不消费 stream：消费者延迟/断线；_drive 独立完成执行与结果持久化
+    row = await _wait_status(run_id, {STATUS_COMPLETED})
+    assert row is not None and row.status == STATUS_COMPLETED
+    assert row.final_text == full, "_drive 完成时最终文本必须已完整（不依赖消费者）"
+    assert row.summary["model_calls"] == 1  # 3 个 Chunk = 1 次模型请求
+
+    # 消费者晚到：旧契约 final 全文与 DB 权威结果一致
+    events = [e async for e in stream]
+    finals = [e for e in events if e["type"] == "final"]
+    assert finals and finals[-1]["content"] == row.final_text
+    await svc.worker.stop()
+
+    # 非流式 run_to_completion 与数据库最终结果一致（同一权威收集）
+    svc2 = _make_service(worker_id="w-t10-2")
+    result = await svc2.run_to_completion(
+        agent_config=_plain_agent_config(),
+        messages=[{"role": "user", "content": "hi"}],
+        user_id=1,
+        session_id=None,
+    )
+    row2 = await _wait_status(result["run_id"], {STATUS_COMPLETED})
+    assert result["content"] == row2.final_text == full
+    await svc2.worker.stop()
+
+
+@pytest.mark.asyncio
+async def test_t11_model_call_counting_and_budget_limit(monkeypatch):
+    """T-11（FR-10）：多 Chunk 一次模型请求只计一次；tool_calls 口径准确；
+    预算耗尽 → limit_exceeded（不是 failed）。"""
+    import app.services.agent_runtime.factory as factory_mod
+
+    monkeypatch.setattr(AgentRuntimeService, "_load_model", _fake_load_model)
+    monkeypatch.setattr(AgentRuntimeService, "_load_agent_config", _fake_load_agent_config)
+
+    # (a) 多 Chunk 单请求：请求 1 次、生成 Token 3、model 节点 1 次
+    model = _ChunkedChatModel(chunks=["甲", "乙", "丙"])
+    monkeypatch.setattr(factory_mod, "build_chat_model", lambda *a, **k: model)
+    svc = _make_service(worker_id="w-t11-a")
+    result = await svc.run_to_completion(
+        agent_config=_plain_agent_config(),
+        messages=[{"role": "user", "content": "hi"}],
+        user_id=1,
+        session_id=None,
+    )
+    row = await _wait_status(result["run_id"], {STATUS_COMPLETED})
+    assert result["content"] == "甲乙丙"
+    assert row.summary["model_calls"] == 1, "多 Chunk 不得按 Chunk 计数"
+    assert row.summary["tokens_generated"] == 3
+    assert row.summary["model_node_runs"] == 1 and row.summary["steps"] == 1
+    await svc.worker.stop()
+
+    # (b) 工具轮次：模型请求 2 次、工具调用 1 次（真实 calculator 工具）
+    model2 = _FakeChatModel(script=[
+        AIMessage(content="", tool_calls=[{
+            "name": "calculator", "args": {"expression": "21*2"}, "id": "tc-c1",
+        }]),
+        AIMessage(content="结果42"),
+    ])
+    monkeypatch.setattr(factory_mod, "build_chat_model", lambda *a, **k: model2)
+    svc2 = _make_service(worker_id="w-t11-b")
+    result2 = await svc2.run_to_completion(
+        agent_config=_plain_agent_config(tools=["calculator"]),
+        messages=[{"role": "user", "content": "算 21*2"}],
+        user_id=1,
+        session_id=None,
+    )
+    row2 = await _wait_status(result2["run_id"], {STATUS_COMPLETED})
+    assert row2.summary["model_calls"] == 2
+    assert row2.summary["tool_calls"] == 1
+    assert row2.summary["model_node_runs"] == 2
+    await svc2.worker.stop()
+
+    # (c) 预算耗尽：max_model_calls=1 + 两次请求 -> limit_exceeded
+    from app.core.config import settings as app_settings
+
+    monkeypatch.setattr(app_settings, "AGENT_MAX_MODEL_CALLS", 1)
+    model3 = _FakeChatModel(script=[
+        AIMessage(content="", tool_calls=[{
+            "name": "calculator", "args": {"expression": "1+1"}, "id": "tc-c2",
+        }]),
+        AIMessage(content="2"),
+    ])
+    monkeypatch.setattr(factory_mod, "build_chat_model", lambda *a, **k: model3)
+    svc3 = _make_service(worker_id="w-t11-c")
+    result3 = await svc3.run_to_completion(
+        agent_config=_plain_agent_config(tools=["calculator"]),
+        messages=[{"role": "user", "content": "算 1+1"}],
+        user_id=1,
+        session_id=None,
+    )
+    assert result3["status"] == STATUS_LIMIT_EXCEEDED
+    row3 = await _wait_status(result3["run_id"], {STATUS_LIMIT_EXCEEDED})
+    assert row3 is not None and row3.status == STATUS_LIMIT_EXCEEDED
+    await svc3.worker.stop()

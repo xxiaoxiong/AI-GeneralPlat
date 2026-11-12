@@ -1,4 +1,4 @@
-"""DeepAgents Runtime 核心测试（确定性 FakeChatModel，无网络无 DB）。
+"""DeepAgents Runtime 核心测试（确定性 FakeChatModel，无网络；工具账本走临时 SQLite）。
 
 覆盖（AT 编号=任务书 §8）：
 - 事件映射与旧 SSE 契约（AT-03 流式 / P0-G 事件契约）
@@ -13,12 +13,15 @@
 """
 import asyncio
 import pytest
+import pytest_asyncio
 from typing import Any, List
 
 from langchain_core.language_models.chat_models import BaseChatModel
 from langchain_core.messages import AIMessage, AIMessageChunk, HumanMessage, ToolMessage
 from langchain_core.outputs import ChatGeneration, ChatResult
 from langchain_core.tools import tool
+
+from app.core.database import init_db
 
 from app.services.agent_runtime.context import (
     ExecutionBudget,
@@ -50,6 +53,13 @@ from app.services.agent_runtime.model_adapter import ModelCapabilityError, build
 from app.services.agent_runtime.skills import SkillRegistry
 from app.services.agent_runtime.tools.adapter import build_args_model
 from app.services.agent_runtime.tools.policy import ToolPolicy, ToolPolicyError
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _db_schema():
+    """工具账本（FR-05）需要 agent_tool_executions 表。"""
+    await init_db()
+    yield
 
 
 # ── FakeChatModel：脚本化两轮（工具调用 -> 最终回答）────────────────────────
@@ -278,8 +288,11 @@ class TestToolAdapter:
         assert [t.name for t in tools] == ["calculator"]  # 未授权工具不下发
 
         calc = tools[0]
-        result = await calc.ainvoke({"expression": "1+1"})
-        assert "2" in result
+        # InjectedToolCallId 约定：经 ToolNode 调用时总是携带完整 tool_call
+        result = await calc.ainvoke({"type": "tool_call", "name": "calculator", "args": {"expression": "1+1"}, "id": "call-t1"})
+        # 携带 tool_call 调用时返回 ToolMessage 包装
+        content = result.content if isinstance(result, ToolMessage) else result
+        assert "2" in content
         # 事件：TOOL_STARTED + TOOL_COMPLETED 已入队
         ev1 = await bus._queue.get()
         ev2 = await bus._queue.get()

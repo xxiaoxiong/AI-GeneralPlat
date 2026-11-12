@@ -14,13 +14,14 @@ import asyncio
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 
 from .events import EventBus
 
 STATUS_PENDING = "pending"
 STATUS_RUNNING = "running"
 STATUS_WAITING_APPROVAL = "waiting_approval"
+STATUS_NEEDS_RECONCILIATION = "needs_reconciliation"
 STATUS_COMPLETED = "completed"
 STATUS_FAILED = "failed"
 STATUS_CANCELLED = "cancelled"
@@ -28,13 +29,19 @@ STATUS_LIMIT_EXCEEDED = "limit_exceeded"
 
 TERMINAL_STATUSES = {STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED, STATUS_LIMIT_EXCEEDED}
 
+# 暂停态：可被人工恢复，不会被 Worker 自动领取执行
+PAUSED_STATUSES = {STATUS_WAITING_APPROVAL, STATUS_NEEDS_RECONCILIATION}
+
 ALLOWED_TRANSITIONS: Dict[str, Set[str]] = {
     STATUS_PENDING: {STATUS_RUNNING, STATUS_CANCELLED, STATUS_FAILED},
     STATUS_RUNNING: {
         STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED,
         STATUS_LIMIT_EXCEEDED, STATUS_WAITING_APPROVAL,
+        STATUS_NEEDS_RECONCILIATION,
     },
     STATUS_WAITING_APPROVAL: {STATUS_RUNNING, STATUS_CANCELLED, STATUS_FAILED},
+    # 人工核对后可显式继续/终止；不得自动执行
+    STATUS_NEEDS_RECONCILIATION: {STATUS_RUNNING, STATUS_CANCELLED, STATUS_FAILED},
     STATUS_COMPLETED: set(),
     STATUS_FAILED: set(),
     STATUS_CANCELLED: set(),
@@ -57,10 +64,19 @@ class RunHandle:
     error: Optional[str] = None
     idempotency_key: Optional[str] = None
     final_text: str = ""
+    # FR-09：最终文本权威收集（执行侧 _consume_stream 累积；事件适配器不承担收集）
+    final_text_parts: List[str] = field(default_factory=list)
     summary: Dict[str, Any] = field(default_factory=dict)
     pending_actions: list = field(default_factory=list)
-    bus: EventBus = field(default_factory=EventBus)
+    bus: EventBus = field(default_factory=lambda: EventBus(persist=True))
     task: Optional[asyncio.Task] = None
+    # ── Durable Execution（Phase 2）：租约与执行尝试 ─────────────────────
+    lease_version: Optional[int] = None   # 当前持有租约的 fencing token（未持有时为 None）
+    worker_id: Optional[str] = None       # 当前租约持有者
+    attempt: int = 0                      # 执行尝试次数（与 agent_runs.attempt 同步）
+    # 挂起请求：优雅关闭 / 租约丢失时置位——取消执行但不写 cancelled，
+    # 保留 running 状态供其他 Worker 经 Checkpoint 恢复
+    suspend_requested: bool = False
     created_at: datetime = field(default_factory=datetime.utcnow)
     updated_at: datetime = field(default_factory=datetime.utcnow)
 
@@ -128,6 +144,38 @@ class RunRegistry:
 
     def get(self, run_id: str) -> Optional[RunHandle]:
         return self._runs.get(run_id)
+
+    def attach(
+        self,
+        *,
+        run_id: str,
+        agent_id: int,
+        session_id: Optional[int],
+        user_id: Optional[int],
+        thread_id: str,
+        idempotency_key: Optional[str] = None,
+        status: str = STATUS_PENDING,
+    ) -> RunHandle:
+        """把数据库中的 Run 挂载为进程内句柄（幂等：已存在则复用）。
+
+        与 ``create`` 不同：run_id 由数据库侧生成/提供，Registry 只做本地缓存。
+        """
+        existing = self._runs.get(run_id)
+        if existing is not None:
+            return existing
+        handle = RunHandle(
+            run_id=run_id,
+            agent_id=agent_id,
+            session_id=session_id,
+            user_id=user_id or 0,
+            thread_id=thread_id,
+            idempotency_key=idempotency_key,
+            status=status,
+        )
+        self._runs[run_id] = handle
+        if idempotency_key:
+            self._by_idem[idempotency_key] = run_id
+        return handle
 
     def release(self, run_id: str) -> None:
         """终态 run 移出活跃表（保留记录在 DB）。"""

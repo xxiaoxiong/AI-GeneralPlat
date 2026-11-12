@@ -36,10 +36,20 @@ async def lifespan(app: FastAPI):
     from app.services.agent.checkpoint import CheckpointManager
     CheckpointManager.cleanup_old_checkpoints(max_age_hours=24)
 
+    # ── Durable Execution Worker：领取 pending / Lease 过期的孤儿 Run ──
+    runtime_worker = None
+    if settings.AGENT_RUNTIME_ENABLED:
+        from app.services.agent_runtime.worker import get_run_worker
+
+        runtime_worker = get_run_worker()
+        await runtime_worker.start()
+
     logger.info("所有子系统初始化完成")
     yield
 
     # ── 关闭时清理 ──
+    if runtime_worker is not None:
+        await runtime_worker.stop()
     from app.services.inference import ModelManager
     await ModelManager.get_instance().cleanup_idle(max_idle_seconds=0)
     await close_redis()

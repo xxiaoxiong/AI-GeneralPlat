@@ -163,6 +163,55 @@ class TestChatFlow:
         assert body["status"] == "ok" and body["content"] == "INVOKE_OK"
         assert body.get("run_id"), "invoke 响应应带 run_id"
 
+    def test_invoke_idempotency_key_hits_original_run(self, client, db_setup, monkeypatch):
+        """Idempotency-Key：幂等命中返回原 Run ID 与状态，不重复执行（FR-01 / §8.2）。"""
+        _patch_model(monkeypatch, [AIMessage(content="IDEM_OK")])
+        headers = {**_auth(db_setup["user1_id"]), "Idempotency-Key": "idem-1"}
+        r1 = client.post(
+            f"/api/v1/agents/{db_setup['agent_id']}/invoke",
+            json={"input": "幂等测试"},
+            headers=headers,
+        )
+        assert r1.status_code == 200 and r1.json()["content"] == "IDEM_OK"
+        run_id = r1.json()["run_id"]
+
+        # 同键重试：命中缓存（模型脚本已耗尽，若重复执行必然失败）
+        r2 = client.post(
+            f"/api/v1/agents/{db_setup['agent_id']}/invoke",
+            json={"input": "幂等测试"},
+            headers=headers,
+        )
+        assert r2.status_code == 200
+        body2 = r2.json()
+        assert body2["idempotent_reuse"] is True
+        assert body2["run_id"] == run_id
+        assert body2["content"] == "IDEM_OK"
+
+        # 不同键 → 新 Run
+        _patch_model(monkeypatch, [AIMessage(content="IDEM_OK2")])
+        headers2 = {**_auth(db_setup["user1_id"]), "Idempotency-Key": "idem-2"}
+        r3 = client.post(
+            f"/api/v1/agents/{db_setup['agent_id']}/invoke",
+            json={"input": "幂等测试"},
+            headers=headers2,
+        )
+        assert r3.status_code == 200 and r3.json()["run_id"] != run_id
+
+    def test_chat_idempotency_key_no_duplicate_execution(self, client, db_setup, monkeypatch):
+        """/chat 同键重试：不重复执行、返回原 Run（FR-01 / §8.2）。"""
+        _patch_model(monkeypatch, [AIMessage(content="CHAT_IDEM")])
+        headers = {**_auth(db_setup["user1_id"]), "Idempotency-Key": "idem-chat"}
+        payload = {"message": "幂等对话", "stream": False, "use_memory": False}
+        c1 = client.post(
+            f"/api/v1/agents/{db_setup['agent_id']}/chat", json=payload, headers=headers,
+        )
+        assert c1.status_code == 200 and c1.json()["content"] == "CHAT_IDEM"
+        c2 = client.post(
+            f"/api/v1/agents/{db_setup['agent_id']}/chat", json=payload, headers=headers,
+        )
+        assert c2.status_code == 200
+        assert c2.json()["idempotent_reuse"] is True
+
     def test_session_history_and_delete(self, client, db_setup):
         # 创建会话并对话
         _id = db_setup["agent_id"]
@@ -367,3 +416,62 @@ class TestBudgetAndLifecycle:
         assert done and done[-1]["status"] == "cancelled", done
         info = await svc.get_run(run_id, db_setup["user1_id"])
         assert info["status"] == "cancelled"
+
+
+# ── FR-07：SSE 事件回放 / 断线续传 ─────────────────────────────────────────
+
+
+class TestRunEventsReplay:
+    def test_events_replay_after_seq_and_last_event_id(self, client, db_setup, monkeypatch):
+        """GET /runs/{id}/events：旧契约字段保留 + seq 连续 + after_seq/Last-Event-ID 续传"""
+        _patch_model(monkeypatch, [AIMessage(content="HELLO_EVT")])
+        resp = client.post(
+            f"/api/v1/agents/{db_setup['agent_id']}/invoke",
+            json={"input": "hi"},
+            headers=_auth(db_setup["user1_id"]),
+        )
+        assert resp.status_code == 200
+        run_id = resp.json()["run_id"]
+
+        def fetch(after_seq=None, last_event_id=None):
+            params = {"after_seq": after_seq} if after_seq is not None else {}
+            headers = dict(_auth(db_setup["user1_id"]))
+            if last_event_id is not None:
+                headers["Last-Event-ID"] = str(last_event_id)
+            r = client.get(
+                f"/api/v1/agents/runs/{run_id}/events", params=params, headers=headers,
+            )
+            assert r.status_code == 200
+            assert r.headers["content-type"].startswith("text/event-stream")
+            return r
+
+        # 全量回放：data 为旧契约 JSON（type 等字段保留）+ seq 连续 + 终态 done
+        r = fetch()
+        assert "id: " in r.text  # 标准 SSE id 行
+        events = _iter_sse(r)
+        assert events and events[-1]["type"] == "done"
+        assert [e["seq"] for e in events] == list(range(len(events)))
+        assert all("type" in e for e in events)
+
+        # after_seq 续传：只返回 seq 大于指定值的事件，直至终态
+        resumed = _iter_sse(fetch(after_seq=events[0]["seq"]))
+        assert [e["seq"] for e in resumed] == [e["seq"] for e in events][1:]
+        assert resumed[-1]["type"] == "done"
+
+        # Last-Event-ID（标准 SSE 重连头）与 after_seq 等价
+        by_header = _iter_sse(fetch(last_event_id=events[0]["seq"]))
+        assert [e["seq"] for e in by_header] == [e["seq"] for e in resumed]
+
+    def test_events_replay_forbidden_for_other_user(self, client, db_setup, monkeypatch):
+        _patch_model(monkeypatch, [AIMessage(content="x")])
+        resp = client.post(
+            f"/api/v1/agents/{db_setup['agent_id']}/invoke",
+            json={"input": "hi"},
+            headers=_auth(db_setup["user1_id"]),
+        )
+        run_id = resp.json()["run_id"]
+        r = client.get(
+            f"/api/v1/agents/runs/{run_id}/events",
+            headers=_auth(db_setup["user2_id"]),
+        )
+        assert r.status_code in (403, 404)

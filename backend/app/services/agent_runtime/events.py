@@ -242,14 +242,22 @@ class EventBus:
 
     发布时为事件补齐 §7.2 最小字段：sequence（单调解号）、thread_id、
     agent_id、status（当前 run 状态）、trace_id。
+
+    Phase 5（FR-07）持久化接线：persist=True 的 run 级总线在发布时先把
+    事件写入 agent_run_events（数据库是事实来源，sequence 由
+    agent_runs.last_event_seq 原子自增分配，payload 入库前脱敏），
+    成功后才通过内存队列唤醒本地 SSE 消费者 —— 内存队列只是通知优化，
+    溢出时仅丢通知、绝不丢持久化事件；事件写入失败显式抛出
+    PersistenceError，不得静默当作成功。
     """
 
-    def __init__(self, maxsize: int = 1000):
+    def __init__(self, maxsize: int = 1000, *, persist: bool = False):
         import asyncio
 
         self._queue: "asyncio.Queue[RuntimeEvent]" = asyncio.Queue(maxsize=maxsize)
         self._closed = False
         self._seq = 0
+        self.persist = persist
         self.thread_id = ""
         self.agent_id: Optional[int] = None
         self.status = ""
@@ -261,19 +269,46 @@ class EventBus:
         self.agent_id = agent_id
         self.trace_id = trace_id
 
+    @staticmethod
+    async def _persist(ev: RuntimeEvent) -> int:
+        """持久化事件并返回分配的 run 内序号（失败向上抛出 PersistenceError）。"""
+        from app.core.database import AsyncSessionLocal
+        from .repositories import EventRepository, PersistenceError
+
+        # 脱敏入库：密钥遮蔽一律保留；文本型事件（模型增量/最终结果）不截断，
+        # 否则回放/最终文本重建会静默丢失文本（FR-09.5）
+        max_len = 100_000 if ev.type in (MODEL_DELTA, RUN_COMPLETED) else 400
+        payload = redact_sensitive(ev.data or {}, max_len=max_len)
+        try:
+            async with AsyncSessionLocal() as db:
+                seq = await EventRepository(db).append(
+                    ev.run_id, ev.type, payload,
+                    thread_id=ev.thread_id or "",
+                )
+                await db.commit()
+            return seq
+        except PersistenceError:
+            raise
+        except Exception as e:
+            raise PersistenceError(f"run {ev.run_id} 事件持久化失败: {e}") from e
+
     async def publish(self, ev: RuntimeEvent) -> None:
         if self._closed:
             return
-        self._seq += 1
-        ev.sequence = self._seq
         ev.thread_id = ev.thread_id or self.thread_id
         ev.agent_id = ev.agent_id if ev.agent_id is not None else self.agent_id
         ev.status = ev.status or self.status
         ev.trace_id = ev.trace_id or self.trace_id
+        if self.persist and ev.run_id:
+            # FR-07：先持久化（可靠序号），再通知本地消费者
+            ev.sequence = await self._persist(ev)
+        else:
+            self._seq += 1
+            ev.sequence = self._seq
         try:
             self._queue.put_nowait(ev)
         except Exception:
-            # 队列满时丢弃最旧事件，保证执行不被观测阻塞
+            # 队列满时丢弃最旧事件，保证执行不被观测阻塞（持久化事件仍在 DB）
             try:
                 self._queue.get_nowait()
                 self._queue.put_nowait(ev)

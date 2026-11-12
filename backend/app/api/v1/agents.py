@@ -4,7 +4,7 @@ Agent 管理与对话 API（v2 增强版）
 import json
 import logging
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, Header, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -18,6 +18,12 @@ from app.models.user import User
 from app.models.agent import Agent, AgentSession
 from app.services.agent import AgentEngine
 from app.services.agent_runtime import get_runtime_service
+from app.services.agent_runtime.service import (
+    ApprovalConflict,
+    ApprovalForbidden,
+    ApprovalInvalid,
+)
+from app.services.agent_runtime.repositories import IdempotencyConflict, RunRepository
 from app.services.tools import BUILTIN_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -298,9 +304,27 @@ async def agent_chat(
     body: AgentChatRequest,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     agent = await _get_or_404(db, agent_id, current_user)
     agent_config = _agent_to_dict(agent)
+
+    # 幂等键命中：在会话/消息变更前先查重（FR-01 / §8.2），
+    # 返回原 Run ID 与当前状态，绝不重复执行、不重复追加用户消息
+    if idempotency_key:
+        async with AsyncSessionLocal() as s:
+            existing = await RunRepository(s).get_by_idempotency_key(
+                current_user.id, idempotency_key
+            )
+        if existing is not None:
+            return {
+                "session_id": existing.session_id,
+                "steps": [],
+                "content": existing.final_text or "",
+                "run_id": existing.id,
+                "status": existing.status,
+                "idempotent_reuse": True,
+            }
 
     # 加载或创建会话（仅限当前用户的会话）
     session = None
@@ -319,10 +343,18 @@ async def agent_chat(
         session = AgentSession(agent_id=agent_id, user_id=current_user.id, messages=[])
         db.add(session)
         await db.flush()
+        # 先提交释放写锁：执行期间运行时会写 agent_runs 等表，
+        # 长事务持有写锁会与运行时持久化互相阻塞（SQLite 必需，MySQL/PG 亦更健康）
+        await db.commit()
 
     # 追加用户消息
     messages = list(session.messages or [])
     messages.append({"role": "user", "content": body.message})
+
+    # FR-08.1：用户消息必须在 Run 创建前可靠保存（失败则不启动运行，
+    # 不得等整轮 Agent 完成后才首次持久化）
+    new_title = body.message[:50] if (not session.title or session.title == "新对话") else None
+    await _save_session(session.id, messages, new_title, raise_on_error=True)
 
     # 数据库连接信息注入：让 Agent 知道它连接的是哪个数据库
     if agent_config.get("database_connection_id"):
@@ -391,14 +423,18 @@ async def agent_chat(
         steps = []
         final_content = ""
         if settings.AGENT_RUNTIME_ENABLED:
-            result = await get_runtime_service().run_to_completion(
-                agent_config=agent_config,
-                messages=messages,
-                user_id=current_user.id,
-                session_id=session.id,
-                use_memory_context=agent_config.get("_memory_context", ""),
-                db_info=agent_config.get("_db_info"),
-            )
+            try:
+                result = await get_runtime_service().run_to_completion(
+                    agent_config=agent_config,
+                    messages=messages,
+                    user_id=current_user.id,
+                    session_id=session.id,
+                    idempotency_key=idempotency_key,
+                    use_memory_context=agent_config.get("_memory_context", ""),
+                    db_info=agent_config.get("_db_info"),
+                )
+            except IdempotencyConflict as e:
+                raise HTTPException(status_code=409, detail=str(e))
             steps = result["steps"]
             final_content = result["content"]
             if result["status"] != "completed":
@@ -411,10 +447,10 @@ async def agent_chat(
                 if event["type"] == "final":
                     final_content = event["content"]
 
-        # 保存到会话（使用独立会话，避免引擎污染）
-        messages.append({"role": "assistant", "content": final_content, "steps": steps})
-        new_title = body.message[:50] if (not session.title or session.title == "新对话") else None
-        await _save_session(session.id, messages, new_title)
+        if not settings.AGENT_RUNTIME_ENABLED:
+            # 旧引擎路径：仍由 API 层写回会话；Runtime 路径由服务统一写回（FR-08.2）
+            messages.append({"role": "assistant", "content": final_content, "steps": steps})
+            await _save_session(session.id, messages)
 
         # 跨会话记忆：从本轮对话中提取并保存记忆
         if body.use_memory:
@@ -432,14 +468,18 @@ async def agent_chat(
     run_id = None
     if settings.AGENT_RUNTIME_ENABLED:
         # 先启动运行拿到 run_id，供响应头 X-Run-Id（重连/状态查询用）
-        run_id, runtime_stream = await get_runtime_service().start_run(
-            agent_config=agent_config,
-            messages=messages,
-            user_id=current_user.id,
-            session_id=session.id,
-            use_memory_context=agent_config.get("_memory_context", ""),
-            db_info=agent_config.get("_db_info"),
-        )
+        try:
+            run_id, runtime_stream = await get_runtime_service().start_run(
+                agent_config=agent_config,
+                messages=messages,
+                user_id=current_user.id,
+                session_id=session.id,
+                idempotency_key=idempotency_key,
+                use_memory_context=agent_config.get("_memory_context", ""),
+                db_info=agent_config.get("_db_info"),
+            )
+        except IdempotencyConflict as e:
+            raise HTTPException(status_code=409, detail=str(e))
 
     async def event_stream():
         collected_steps = []
@@ -456,15 +496,16 @@ async def agent_chat(
                 final_content = event["content"]
 
             if event["type"] == "done":
-                # ★ 关键修复：使用独立的数据库会话保存，避免引擎工具执行
-                # 对原 db session 的污染导致 commit 失败
-                messages.append({
-                    "role": "assistant",
-                    "content": final_content,
-                    "steps": [s for s in collected_steps if s["type"] != "done"],
-                })
-                new_title = body.message[:50] if (not session.title or session.title == "新对话") else None
-                await _save_session(session.id, messages, new_title)
+                if not settings.AGENT_RUNTIME_ENABLED:
+                    # 旧引擎路径：仍由 API 层写回会话（独立数据库会话，避免引擎
+                    # 工具执行对原 db session 的污染）；Runtime 路径由服务统一写回
+                    # （FR-08.2，客户端断线也不丢失）
+                    messages.append({
+                        "role": "assistant",
+                        "content": final_content,
+                        "steps": [s for s in collected_steps if s["type"] != "done"],
+                    })
+                    await _save_session(session.id, messages)
 
                 # 跨会话记忆
                 if body.use_memory:
@@ -508,10 +549,28 @@ async def invoke_agent(
     body: dict,
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
+    idempotency_key: Optional[str] = Header(None, alias="Idempotency-Key"),
 ):
     """供工作流引擎调用的同步接口"""
     agent = await _get_or_404(db, agent_id, current_user)
     agent_config = _agent_to_dict(agent)
+
+    # 幂等键命中：返回原 Run ID 与当前状态，不重复执行（FR-01 / §8.2）
+    if idempotency_key:
+        async with AsyncSessionLocal() as s:
+            existing = await RunRepository(s).get_by_idempotency_key(
+                current_user.id, idempotency_key
+            )
+        if existing is not None:
+            return {
+                "status": "ok" if existing.status == "completed" else existing.status,
+                "content": existing.final_text or "",
+                "steps": [],
+                "iterations": 0,
+                "run_id": existing.id,
+                "idempotent_reuse": True,
+            }
+
     user_input = body.get("input", "")
     messages = [{"role": "user", "content": user_input}]
 
@@ -520,13 +579,17 @@ async def invoke_agent(
     run_status = "completed"
     run_id = None
     if settings.AGENT_RUNTIME_ENABLED:
-        result = await get_runtime_service().run_to_completion(
-            agent_config=agent_config,
-            messages=messages,
-            user_id=current_user.id,
-            use_memory_context="",
-            db_info=agent_config.get("_db_info"),
-        )
+        try:
+            result = await get_runtime_service().run_to_completion(
+                agent_config=agent_config,
+                messages=messages,
+                user_id=current_user.id,
+                idempotency_key=idempotency_key,
+                use_memory_context="",
+                db_info=agent_config.get("_db_info"),
+            )
+        except IdempotencyConflict as e:
+            raise HTTPException(status_code=409, detail=str(e))
         steps = result["steps"]
         final_content = result["content"]
         run_status = result["status"]
@@ -553,10 +616,32 @@ async def invoke_agent(
 class ApprovalDecision(BaseModel):
     type: str = "approve"    # approve / reject
     message: str = ""
+    action_id: Optional[str] = None  # 稳定审批动作 ID（FR-06）；缺省按登记顺序对齐
 
 
 class ResumeRequest(BaseModel):
     decisions: List[ApprovalDecision]
+
+
+def _decisions_payload(body: Optional[ResumeRequest]) -> List[dict]:
+    if body is None:
+        return [{"type": "approve", "message": "", "action_id": None}]
+    return [
+        {"type": d.type, "message": d.message, "action_id": d.action_id}
+        for d in body.decisions
+    ]
+
+
+async def _precheck_decisions(run_id: str, decisions: List[dict], user_id: int) -> None:
+    """审批前置校验：冲突/非法/无权显式映射 HTTP 409/400/403（FR-04）。"""
+    try:
+        await get_runtime_service().check_decisions(run_id, decisions, user_id)
+    except ApprovalForbidden as e:
+        raise HTTPException(status_code=403, detail=str(e))
+    except ApprovalInvalid as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except ApprovalConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
 
 
 @router.get("/runs/{run_id}")
@@ -569,6 +654,39 @@ async def get_run_status(
     if not info:
         raise HTTPException(status_code=404, detail="运行不存在")
     return info
+
+
+@router.get("/runs/{run_id}/events")
+async def stream_run_events(
+    run_id: str,
+    after_seq: Optional[int] = Query(None),
+    last_event_id: Optional[str] = Header(None),
+    current_user: User = Depends(get_current_user),
+):
+    """SSE 事件流回放/订阅（FR-07）：断线后从指定序号继续，不丢失不重复。
+
+    - ``after_seq``：返回 seq 大于该值的事件直到终态；缺省从头回放（含 seq=0）
+    - ``Last-Event-ID``：标准 SSE 重连头，优先于 after_seq
+    - 旧契约 ``data: {json}`` 不变（type/content 等字段保留），附带 seq 与
+      标准 SSE ``id:`` 行；事件事实来源为 agent_run_events，API 与执行
+      Worker 不同进程也可消费
+    """
+    info = await get_runtime_service().get_run(run_id, current_user.id)
+    if not info:
+        raise HTTPException(status_code=404, detail="运行不存在")
+    if last_event_id and last_event_id.strip().isdigit():
+        after_seq = int(last_event_id.strip())
+
+    async def event_stream():
+        async for event in get_runtime_service().replay_events(run_id, after_seq):
+            seq = event.get("seq", 0)
+            yield f"id: {seq}\ndata: {json.dumps(event, ensure_ascii=False, default=str)}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Run-Id": run_id},
+    )
 
 
 @router.post("/runs/{run_id}/cancel")
@@ -590,7 +708,8 @@ async def resume_run(
     current_user: User = Depends(get_current_user),
 ):
     """HITL 审批后恢复运行：返回 SSE 流（与 /chat 相同事件契约）"""
-    decisions = [{"type": d.type, "message": d.message} for d in body.decisions]
+    decisions = _decisions_payload(body)
+    await _precheck_decisions(run_id, decisions, current_user.id)
 
     async def event_stream():
         async for event in get_runtime_service().resume_run(run_id, decisions, current_user.id):
@@ -611,10 +730,8 @@ async def approve_run(
     current_user: User = Depends(get_current_user),
 ):
     """便捷审批：默认全部批准"""
-    decisions = (
-        [{"type": d.type, "message": d.message} for d in body.decisions]
-        if body else [{"type": "approve", "message": ""}]
-    )
+    decisions = _decisions_payload(body)
+    await _precheck_decisions(run_id, decisions, current_user.id)
 
     async def event_stream():
         async for event in get_runtime_service().resume_run(run_id, decisions, current_user.id):
@@ -630,8 +747,18 @@ async def approve_run(
 
 # ── 辅助函数 ──────────────────────────────────────────────────────────────────
 
-async def _save_session(session_id: int, messages: list, new_title: str = None):
-    """使用独立数据库会话保存对话记录，避免引擎执行污染原 session"""
+async def _save_session(
+    session_id: int,
+    messages: list,
+    new_title: str = None,
+    *,
+    raise_on_error: bool = False,
+):
+    """使用独立数据库会话保存对话记录，避免引擎执行污染原 session。
+
+    raise_on_error=True 时失败向上抛出（FR-08.1：用户消息在 Run 创建前的
+    可靠保存，失败不得带病启动运行）。
+    """
     try:
         async with AsyncSessionLocal() as save_db:
             res = await save_db.execute(
@@ -647,8 +774,14 @@ async def _save_session(session_id: int, messages: list, new_title: str = None):
                 logger.info(f"会话 {session_id} 已保存，共 {len(messages)} 条消息")
             else:
                 logger.error(f"会话 {session_id} 不存在，无法保存")
+                if raise_on_error:
+                    raise HTTPException(status_code=500, detail="会话不存在，无法保存消息")
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"会话 {session_id} 保存失败: {e}", exc_info=True)
+        if raise_on_error:
+            raise HTTPException(status_code=500, detail="会话历史保存失败，未启动运行")
 
 
 async def _get_or_404(db: AsyncSession, agent_id: int, current_user: User = None) -> Agent:

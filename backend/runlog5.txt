@@ -1,0 +1,15 @@
+﻿........................................................................ [ 68%]
+..........
+ITER=1 DONE
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+105 passed, 46 warnings in 10.73s
+ITER=2 DONE
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+105 passed, 46 warnings in 10.23s
+ITER=3 DONE
+........................................................................ [ 68%]
+.........................
+ITER=4 DONE
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+105 passed, 46 warnings in 10.26s
+ITER=5 DONE

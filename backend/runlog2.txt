@@ -1,0 +1,105 @@
+﻿python : C:\Program Files\Python311\Lib\site-packages\pytest_asyncio\plugin.py:300: PytestDeprecationWarning: The confi
+guration option "asyncio_default_fixture_loop_scope" is unset.
+所在位置 行:15 字符: 2373
++ ... M = 'dumb'; python -m pytest tests/test_agent_runtime.py tests/test_a ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Program File...cope" is unset.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+The event loop scope for asynchronous fixtures will default to the "fixture" caching scope. Future versions of pytest-a
+syncio will default the loop scope for asynchronous fixtures to "function" scope. Set the default fixture loop scope ex
+plicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "modu
+le", "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.2.0, pluggy-1.7.0 -- C:\Program Files\Python311\python.exe
+cachedir: .pytest_cache
+rootdir: D:\MyPersonalFile\MyStudyFile\AI\MyCode\AI-GeneralPlat\backend
+plugins: anyio-4.16.0, langsmith-0.14.17, asyncio-1.4.1.post1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 105 items
+
+tests/test_agent_runtime.py::TestLegacyEventAdapter::test_model_delta_streams_final PASSED [  0%]
+tests/test_agent_runtime.py::TestLegacyEventAdapter::test_tool_events_shape PASSED [  1%]
+tests/test_agent_runtime.py::TestLegacyEventAdapter::test_redact_sensitive PASSED [  2%]
+tests/test_agent_runtime.py::TestLegacyEventAdapter::test_waiting_approval_terminates_with_done PASSED [  3%]
+tests/test_agent_runtime.py::TestLegacyEventAdapter::test_sse_events_have_sequence PASSED [  4%]
+tests/test_agent_runtime.py::TestLegacyEventAdapter::test_event_min_fields_per_contract PASSED [  5%]
+tests/test_agent_runtime.py::TestToolPolicy::test_ssrf_blocks_loopback PASSED [  6%]
+tests/test_agent_runtime.py::TestToolPolicy::test_ssrf_allowlist PASSED  [  7%]
+tests/test_agent_runtime.py::TestToolPolicy::test_path_traversal_blocked PASSED [  8%]
+tests/test_agent_runtime.py::TestToolPolicy::test_sql_readonly PASSED    [  9%]
+tests/test_agent_runtime.py::TestToolPolicy::test_sandbox_disabled_blocks_exec PASSED [ 10%]
+tests/test_agent_runtime.py::TestToolPolicy::test_unauthorized_tool PASSED [ 11%]
+tests/test_agent_runtime.py::TestToolPolicy::test_hitl_required PASSED   [ 12%]
+tests/test_agent_runtime.py::TestToolAdapter::test_args_model_required PASSED [ 13%]
+tests/test_agent_runtime.py::TestToolAdapter::test_adapter_emits_events_and_policy_rejects PASSED [ 14%]
+tests/test_agent_runtime.py::TestModelAdapter::test_no_function_call_rejected PASSED [ 15%]
+tests/test_agent_runtime.py::TestLifecycle::test_state_machine PASSED    [ 16%]
+tests/test_agent_runtime.py::TestLifecycle::test_idempotency PASSED      [ 17%]
+tests/test_agent_runtime.py::TestE2E::test_multi_step_tool_calling PASSED [ 18%]
+tests/test_agent_runtime.py::TestE2E::test_tool_failure_is_explicit PASSED [ 19%]
+tests/test_agent_runtime.py::TestE2E::test_tool_failure_reported_to_model PASSED [ 20%]
+tests/test_agent_runtime.py::TestE2E::test_hitl_interrupt_and_resume PASSED [ 20%]
+tests/test_agent_runtime.py::TestE2E::test_concurrent_sessions_isolated PASSED [ 21%]
+tests/test_agent_runtime.py::TestHarness::test_skill_registry_disable PASSED [ 22%]
+tests/test_agent_runtime.py::TestHarness::test_subagents_narrowed_tools PASSED [ 23%]
+tests/test_agent_runtime.py::TestHarness::test_subagent_delegation_and_result_collection PASSED [ 24%]
+tests/test_agent_runtime.py::TestHarness::test_skill_files_injected_into_run_state PASSED [ 25%]
+tests/test_agent_runtime.py::TestHarness::test_interrupt_config PASSED   [ 26%]
+tests/test_agent_runtime.py::TestTelemetry::test_run_and_tool_records PASSED [ 27%]
+tests/test_agent_runtime.py::TestTelemetry::test_exporter_error_does_not_break PASSED [ 28%]
+tests/test_agent_runtime.py::TestTelemetry::test_tool_adapter_emits_tool_telemetry PASSED [ 29%]
+tests/test_agent_runtime.py::TestTelemetry::test_context_log_fields_include_model_id PASSED [ 30%]
+tests/test_agent_runtime.py::TestBudget::test_budget_exhausted_reason PASSED [ 31%]
+tests/test_agent_runtime.py::TestBudget::test_tool_call_limit_raises PASSED [ 32%]
+tests/test_agent_runtime.py::TestBudget::test_model_call_limit_raises PASSED [ 33%]
+tests/test_agent_runtime.py::TestBudget::test_recursion_limit_raises PASSED [ 34%]
+tests/test_agent_runtime_persistence.py::TestCheckpointRestart::test_restart_recovery_and_continuity PASSED [ 35%]
+tests/test_agent_runtime_persistence.py::TestMultiInstance::test_two_instances_share_thread_state PASSED [ 36%]
+tests/test_agent_runtime_persistence.py::TestMultiInstance::test_checkpointer_factory_sqlite_fresh_db PASSED [ 37%]
+tests/test_agent_runtime_persistence.py::TestIdempotentSideEffect::test_tool_executes_exactly_once_across_resumes PASSED [ 38%]
+tests/test_agent_runtime_persistence.py::TestIdempotentSideEffect::test_reject_prevents_execution PASSED [ 39%]
+tests/test_agent_runtime_persistence.py::TestLargeContext::test_large_file_lands_in_workspace_backend PASSED [ 40%]
+tests/test_agent_runtime_persistence.py::TestLargeContext::test_big_tool_output_offloaded_not_inlined PASSED [ 40%]
+tests/test_agent_runtime_persistence.py::TestResourceLeak::test_cancel_leaves_no_tasks_and_closes_sqlite PASSED [ 41%]
+tests/test_agent_runtime_durable.py::test_create_run_persists_pending PASSED [ 42%]
+tests/test_agent_runtime_durable.py::test_idempotent_reuse_same_request_hash PASSED [ 43%]
+tests/test_agent_runtime_durable.py::test_idempotent_conflict_different_request_hash PASSED [ 44%]
+tests/test_agent_runtime_durable.py::test_no_idempotency_key_creates_new_runs PASSED [ 45%]
+tests/test_agent_runtime_durable.py::test_idempotency_unique_per_user PASSED [ 46%]
+tests/test_agent_runtime_durable.py::test_db_enforces_idempotency_uniqueness PASSED [ 47%]
+tests/test_agent_runtime_durable.py::test_claim_only_one_winner PASSED   [ 48%]
+tests/test_agent_runtime_durable.py::test_claim_blocked_while_lease_valid_then_recoverable PASSED [ 49%]
+tests/test_agent_runtime_durable.py::test_heartbeat_extends_lease_and_fencing PASSED [ 50%]
+tests/test_agent_runtime_durable.py::test_release_invalidates_old_worker PASSED [ 51%]
+tests/test_agent_runtime_durable.py::test_update_status_fencing_requires_match PASSED [ 52%]
+tests/test_agent_runtime_durable.py::test_claim_next_skips_paused_statuses PASSED [ 53%]
+tests/test_agent_runtime_durable.py::test_claim_next_picks_expired_running_for_recovery PASSED [ 54%]
+tests/test_agent_runtime_durable.py::test_ledger_begin_is_idempotent_per_tool_call_id PASSED [ 55%]
+tests/test_agent_runtime_durable.py::test_ledger_success_flow PASSED     [ 56%]
+tests/test_agent_runtime_durable.py::test_ledger_succeeded_is_immutable PASSED [ 57%]
+tests/test_agent_runtime_durable.py::test_ledger_unknown_blocks_replay PASSED [ 58%]
+tests/test_agent_runtime_durable.py::test_ledger_no_unsafe_after_success PASSED [ 59%]
+tests/test_agent_runtime_durable.py::test_event_seq_monotonic_per_run PASSED [ 60%]
+tests/test_agent_runtime_durable.py::test_event_unique_constraint_on_sequence PASSED [ 60%]
+tests/test_agent_runtime_durable.py::test_event_replay_after_seq PASSED  [ 61%]
+tests/test_agent_runtime_durable.py::test_event_seq_unknown_run_raises PASSED [ 62%]
+tests/test_agent_runtime_durable.py::test_event_cleanup_only_terminal_and_expired PASSED [ 63%]
+tests/test_agent_runtime_durable.py::test_needs_reconciliation_transitions PASSED [ 64%]
+tests/test_agent_runtime_durable.py::test_alembic_migration_upgrade_downgrade PASSED [ 65%]
+tests/test_agent_runtime_durable.py::test_t06_two_workers_single_claim_winner PASSED [ 66%]
+tests/test_agent_runtime_durable.py::test_t06_two_runs_each_executed_once_across_workers PASSED [ 67%]
+tests/test_agent_runtime_durable.py::test_t07_lease_loss_cancels_drive_without_state_write PASSED [ 68%]
+tests/test_agent_runtime_durable.py::test_recovery_orphan_run_reclaimed_and_executed PASSED [ 69%]
+tests/test_agent_runtime_durable.py::test_recovery_unsafe_ledger_blocks_auto_replay PASSED [ 70%]
+tests/test_agent_runtime_durable.py::test_recovery_checkpoint_interrupt_returns_to_waiting_approval PASSED [ 71%]
+tests/test_agent_runtime_durable.py::test_f06_idempotent_duplicate_request_single_execution PASSED [ 72%]
+tests/test_agent_runtime_durable.py::test_graceful_shutdown_suspends_and_releases_lease PASSED [ 73%]
+tests/test_agent_runtime_durable.py::test_drive_suspend_keeps_run_recoverable PASSED [ 74%]
+tests/test_agent_runtime_durable.py::test_t01_multi_step_tool_ledger_stable_ids_and_keys PASSED [ 75%]
+tests/test_agent_runtime_durable.py::test_t04_tool_success_then_crash_replay_returns_cached_result PASSED [ 76%]
+tests/test_agent_runtime_durable.py::test_t05_unknown_result_blocks_replay_without_idempotency PASSED [ 77%]
+tests/test_agent_runtime_durable.py::test_t05_idempotent_retry_reuses_same_key PASSED [ 78%]
+tests/test_agent_runtime_durable.py::test_t02_hitl_approval_persisted_and_resumable_after_restart PASSED [ 79%]

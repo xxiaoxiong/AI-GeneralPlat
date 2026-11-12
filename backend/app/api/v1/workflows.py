@@ -145,6 +145,9 @@ async def execute_workflow(
     )
     db.add(execution)
     await db.flush()
+    # 先提交释放写锁：执行期间 Agent 节点会写 agent_runs 等表，
+    # 长事务持有写锁会与运行时持久化互相阻塞（SQLite 必需，MySQL/PG 亦更健康）
+    await db.commit()
 
     start_time = time.time()
     try:

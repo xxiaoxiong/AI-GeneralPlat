@@ -13,7 +13,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = 'a1b2c3d4e5f6'
-down_revision: Union[str, None] = '9ce3d801b702'
+down_revision: Union[str, None] = 'e5f6a7b8c9d0'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
@@ -43,16 +43,18 @@ def upgrade() -> None:
     op.create_index(op.f('ix_database_connections_id'), 'database_connections', ['id'], unique=False)
 
     # 给 agents 表添加 database_connection_id 列
-    op.add_column('agents', sa.Column('database_connection_id', sa.Integer(), nullable=True))
-    op.create_foreign_key(
-        'fk_agents_database_connection_id',
-        'agents', 'database_connections',
-        ['database_connection_id'], ['id'],
-    )
+    # batch 模式：MySQL 上等价于普通 ALTER；SQLite 上走表重建（ALTER 约束不被支持）
+    with op.batch_alter_table('agents') as batch_op:
+        batch_op.add_column(sa.Column('database_connection_id', sa.Integer(), nullable=True))
+        batch_op.create_foreign_key(
+            'fk_agents_database_connection_id', 'database_connections',
+            ['database_connection_id'], ['id'],
+        )
 
 
 def downgrade() -> None:
-    op.drop_constraint('fk_agents_database_connection_id', 'agents', type_='foreignkey')
-    op.drop_column('agents', 'database_connection_id')
+    with op.batch_alter_table('agents') as batch_op:
+        batch_op.drop_constraint('fk_agents_database_connection_id', type_='foreignkey')
+        batch_op.drop_column('database_connection_id')
     op.drop_index(op.f('ix_database_connections_id'), table_name='database_connections')
     op.drop_table('database_connections')

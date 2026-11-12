@@ -1,0 +1,77 @@
+﻿python : C:\Program Files\Python311\Lib\site-packages\pytest_asyncio\plugin.py:300: PytestDeprecationWarning: The confi
+guration option "asyncio_default_fixture_loop_scope" is unset.
+所在位置 行:15 字符: 2373
++ ... M = 'dumb'; python -m pytest tests/test_agent_runtime_durable.py -v * ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Program File...cope" is unset.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+The event loop scope for asynchronous fixtures will default to the "fixture" caching scope. Future versions of pytest-a
+syncio will default the loop scope for asynchronous fixtures to "function" scope. Set the default fixture loop scope ex
+plicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "modu
+le", "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+============================= test session starts =============================
+platform win32 -- Python 3.11.9, pytest-9.2.0, pluggy-1.7.0 -- C:\Program Files\Python311\python.exe
+cachedir: .pytest_cache
+rootdir: D:\MyPersonalFile\MyStudyFile\AI\MyCode\AI-GeneralPlat\backend
+plugins: anyio-4.16.0, langsmith-0.14.17, asyncio-1.4.1.post1
+asyncio: mode=Mode.STRICT, debug=False, asyncio_default_fixture_loop_scope=None, asyncio_default_test_loop_scope=function
+collecting ... collected 47 items
+
+tests/test_agent_runtime_durable.py::test_create_run_persists_pending PASSED [  2%]
+tests/test_agent_runtime_durable.py::test_idempotent_reuse_same_request_hash PASSED [  4%]
+tests/test_agent_runtime_durable.py::test_idempotent_conflict_different_request_hash PASSED [  6%]
+tests/test_agent_runtime_durable.py::test_no_idempotency_key_creates_new_runs PASSED [  8%]
+tests/test_agent_runtime_durable.py::test_idempotency_unique_per_user PASSED [ 10%]
+tests/test_agent_runtime_durable.py::test_db_enforces_idempotency_uniqueness PASSED [ 12%]
+tests/test_agent_runtime_durable.py::test_claim_only_one_winner PASSED   [ 14%]
+tests/test_agent_runtime_durable.py::test_claim_blocked_while_lease_valid_then_recoverable PASSED [ 17%]
+tests/test_agent_runtime_durable.py::test_heartbeat_extends_lease_and_fencing PASSED [ 19%]
+tests/test_agent_runtime_durable.py::test_release_invalidates_old_worker PASSED [ 21%]
+tests/test_agent_runtime_durable.py::test_update_status_fencing_requires_match PASSED [ 23%]
+tests/test_agent_runtime_durable.py::test_claim_next_skips_paused_statuses PASSED [ 25%]
+tests/test_agent_runtime_durable.py::test_claim_next_picks_expired_running_for_recovery PASSED [ 27%]
+tests/test_agent_runtime_durable.py::test_ledger_begin_is_idempotent_per_tool_call_id PASSED [ 29%]
+tests/test_agent_runtime_durable.py::test_ledger_success_flow PASSED     [ 31%]
+tests/test_agent_runtime_durable.py::test_ledger_succeeded_is_immutable PASSED [ 34%]
+tests/test_agent_runtime_durable.py::test_ledger_unknown_blocks_replay PASSED [ 36%]
+tests/test_agent_runtime_durable.py::test_ledger_no_unsafe_after_success PASSED [ 38%]
+tests/test_agent_runtime_durable.py::test_event_seq_monotonic_per_run PASSED [ 40%]
+tests/test_agent_runtime_durable.py::test_event_unique_constraint_on_sequence PASSED [ 42%]
+tests/test_agent_runtime_durable.py::test_event_replay_after_seq PASSED  [ 44%]
+tests/test_agent_runtime_durable.py::test_event_seq_unknown_run_raises PASSED [ 46%]
+tests/test_agent_runtime_durable.py::test_event_cleanup_only_terminal_and_expired PASSED [ 48%]
+tests/test_agent_runtime_durable.py::test_needs_reconciliation_transitions PASSED [ 51%]
+tests/test_agent_runtime_durable.py::test_alembic_migration_upgrade_downgrade PASSED [ 53%]
+tests/test_agent_runtime_durable.py::test_t06_two_workers_single_claim_winner PASSED [ 55%]
+tests/test_agent_runtime_durable.py::test_t06_two_runs_each_executed_once_across_workers PASSED [ 57%]
+tests/test_agent_runtime_durable.py::test_t07_lease_loss_cancels_drive_without_state_write PASSED [ 59%]
+tests/test_agent_runtime_durable.py::test_recovery_orphan_run_reclaimed_and_executed PASSED [ 61%]
+tests/test_agent_runtime_durable.py::test_recovery_unsafe_ledger_blocks_auto_replay PASSED [ 63%]
+tests/test_agent_runtime_durable.py::test_recovery_checkpoint_interrupt_returns_to_waiting_approval PASSED [ 65%]
+tests/test_agent_runtime_durable.py::test_f06_idempotent_duplicate_request_single_execution PASSED [ 68%]
+tests/test_agent_runtime_durable.py::test_graceful_shutdown_suspends_and_releases_lease PASSED [ 70%]
+tests/test_agent_runtime_durable.py::test_drive_suspend_keeps_run_recoverable PASSED [ 72%]
+tests/test_agent_runtime_durable.py::test_t01_multi_step_tool_ledger_stable_ids_and_keys PASSED [ 74%]
+tests/test_agent_runtime_durable.py::test_t04_tool_success_then_crash_replay_returns_cached_result PASSED [ 76%]
+tests/test_agent_runtime_durable.py::test_t05_unknown_result_blocks_replay_without_idempotency PASSED [ 78%]
+tests/test_agent_runtime_durable.py::test_t05_idempotent_retry_reuses_same_key PASSED [ 80%]
+tests/test_agent_runtime_durable.py::test_t02_hitl_approval_persisted_and_resumable_after_restart PASSED [ 82%]
+tests/test_agent_runtime_durable.py::test_t03_approval_idempotent_and_conflict_semantics PASSED [ 85%]
+tests/test_agent_runtime_durable.py::test_t08_sse_replay_after_disconnect_no_loss PASSED [ 87%]
+tests/test_agent_runtime_durable.py::test_event_overflow_keeps_persisted_and_redacts_payload PASSED [ 89%]
+tests/test_agent_runtime_durable.py::test_event_sequence_concurrent_appends_unique PASSED [ 91%]
+tests/test_agent_runtime_durable.py::test_event_retention_cleanup_wired_in_worker PASSED [ 93%]
+tests/test_agent_runtime_durable.py::test_t09_multi_turn_history_no_duplication_after_restart PASSED [ 95%]
+tests/test_agent_runtime_durable.py::test_t10_final_text_authoritative_without_consumer PASSED [ 97%]
+tests/test_agent_runtime_durable.py::test_t11_model_call_counting_and_budget_limit PASSED [100%]
+
+============================== warnings summary ===============================
+app\core\config.py:6
+  D:\MyPersonalFile\MyStudyFile\AI\MyCode\AI-GeneralPlat\backend\app\core\config.py:6: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/
+    class Settings(BaseSettings):
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+======================== 47 passed, 1 warning in 5.61s ========================

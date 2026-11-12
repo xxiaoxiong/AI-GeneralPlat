@@ -1,0 +1,11 @@
+﻿python : ERROR: usage: python -m pytest [options] [file_or_dir] [file_or_dir] [...]
+所在位置 行:15 字符: 2373
++ ... M = 'dumb'; python -m pytest tests/test_agent_runtime.py tests/test_a ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (ERROR: usage: p...e_or_dir] [...]:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+python -m pytest: error: unrecognized arguments: --faulthandler-timeout=60
+  inifile: None
+  rootdir: D:\MyPersonalFile\MyStudyFile\AI\MyCode\AI-GeneralPlat\backend
+

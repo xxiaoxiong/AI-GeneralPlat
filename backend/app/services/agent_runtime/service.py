@@ -2,16 +2,17 @@
 AgentRuntimeService：平台唯一 Agent 执行入口（DeepAgents + LangGraph）。
 
 职责：
-- 创建/驱动 Run（AsyncIO task + 事件总线）
+- 创建/驱动 Run（DB pending -> Worker CAS Claim -> 执行 + 事件总线）
 - 模型/工具/预算/安全策略组装（factory / tools / model_adapter）
 - Checkpoint 持久化与 thread 管理（persistence）
 - HITL 中断→审批→恢复（interrupt / Command(resume)）
 - 取消、超时、预算超限的确定性状态
-- Run/Approval 记录落库（agent_runs / agent_approvals）
+- Run/Approval 记录落库（agent_runs / agent_approvals），关键状态写入失败向上抛出
 """
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import uuid
@@ -27,7 +28,13 @@ from langgraph.types import Command
 from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 
-from .context import ExecutionBudget, RuntimeContext, RunScope, messages_to_langchain
+from .context import (
+    ExecutionBudget,
+    ModelUsageCallback,
+    RuntimeContext,
+    RunScope,
+    messages_to_langchain,
+)
 from .events import (
     APPROVAL_REQUIRED,
     MODEL_DELTA,
@@ -40,6 +47,7 @@ from .events import (
     SUBAGENT_COMPLETED,
     SUBAGENT_STARTED,
     TOOL_COMPLETED,
+    TERMINAL_EVENTS,
     EventBus,
     LegacyEventAdapter,
     RuntimeEvent,
@@ -51,17 +59,118 @@ from .lifecycle import (
     STATUS_COMPLETED,
     STATUS_FAILED,
     STATUS_LIMIT_EXCEEDED,
+    STATUS_PENDING,
     STATUS_RUNNING,
     STATUS_WAITING_APPROVAL,
+    TERMINAL_STATUSES,
     RunHandle,
     RunRegistry,
 )
 from .model_adapter import ModelCapabilityError
 from .persistence import CheckpointerFactory, make_run_config, make_thread_id
+from .repositories import (
+    EventRepository,
+    IdempotencyConflict,
+    PersistenceError,
+    RunRepository,
+    ToolExecutionRepository,
+)
 from .telemetry import telemetry
-from .tools.policy import ToolPolicy, ToolPolicyError
+from .tools.classification import REPLAY_BLOCK, replay_action
+from .tools.policy import BudgetExceededError, ToolPolicy, ToolPolicyError
+from .worker import (
+    RECOVERY_CONTINUE,
+    RECOVERY_FRESH,
+    RECOVERY_NEEDS_RECONCILIATION,
+    RECOVERY_WAITING_APPROVAL,
+    RunJob,
+    RunWorker,
+)
 
 logger = logging.getLogger("agent_runtime")
+
+
+# ── 审批决策异常（FR-04：冲突/非法决策显式拒绝，API 层可映射 HTTP 4xx） ──
+
+
+class ApprovalInvalid(Exception):
+    """审批决策非法（未知决策类型 / 未知审批动作 / 运行不存在）。"""
+    code = "invalid"
+
+
+class ApprovalConflict(Exception):
+    """审批决策与既有决策冲突：同一动作不允许改判（F-11）。"""
+    code = "conflict"
+
+
+class ApprovalForbidden(Exception):
+    """无权审批该运行。"""
+    code = "forbidden"
+
+
+def _field(obj: Any, key: str, default: Any = None) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _extract_text(content: Any) -> str:
+    """FR-09.5：模型内容文本提取规则——str 原样返回；结构化/多模态 block 列表
+    按 text 块拼接（含纯字符串块），不静默丢弃可保留的文本。"""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and block.get("type", "text") == "text":
+                parts.append(str(block.get("text") or ""))
+        return "".join(parts)
+    return ""
+
+
+def _action_from_req(req: Dict[str, Any], interrupt_id: str, idx: int) -> Dict[str, Any]:
+    """从 HITL interrupt 的 action_request 构造稳定审批动作（FR-06）。
+
+    action_id 优先取 tool_call_id；否则由 interrupt_id + 序号 + 工具 + 参数
+    摘要确定 —— 重启后从 Checkpoint 重提取时保持同一 ID，天然幂等。
+    """
+    raw_args = dict(req.get("args") or {})
+    tool = str(req.get("name") or req.get("action") or req.get("tool") or "unknown")
+    args_hash = hashlib.sha256(
+        json.dumps(raw_args, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    action_id = str(req.get("tool_call_id") or hashlib.sha256(
+        f"{interrupt_id}|{idx}|{tool}|{args_hash}".encode("utf-8")
+    ).hexdigest()[:40])
+    return {
+        "action_id": action_id,
+        "tool_call_id": req.get("tool_call_id"),
+        "tool": tool,
+        "args": redact_sensitive(raw_args),
+        "args_hash": args_hash,
+        "description": req.get("description", ""),
+    }
+
+
+def _synthetic_terminal_event(run_row: Any) -> RuntimeEvent:
+    """无事件日志的旧运行：按状态合成等价终态事件（FR-07 回放兼容）。"""
+    if run_row.status == STATUS_WAITING_APPROVAL:
+        return RuntimeEvent(type=RUN_WAITING_APPROVAL, run_id=run_row.id, data={})
+    if run_row.status == STATUS_COMPLETED:
+        return RuntimeEvent(
+            type=RUN_COMPLETED,
+            run_id=run_row.id,
+            data={"final_text": run_row.final_text or ""},
+        )
+    if run_row.status == STATUS_CANCELLED:
+        return RuntimeEvent(type=RUN_CANCELLED, run_id=run_row.id, data={})
+    return RuntimeEvent(
+        type=RUN_FAILED,
+        run_id=run_row.id,
+        data={"error": run_row.error or "运行失败", "status": run_row.status},
+    )
 
 
 class AgentRuntimeService:
@@ -69,6 +178,7 @@ class AgentRuntimeService:
 
     def __init__(self) -> None:
         self.registry = RunRegistry.instance()
+        self.worker: Optional[RunWorker] = RunWorker(self)
 
     # ── 公共 API ──────────────────────────────────────────────────────────
 
@@ -84,7 +194,7 @@ class AgentRuntimeService:
         db_info: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, AsyncGenerator[Dict[str, Any], None]]:
         """启动运行并返回 (run_id, 事件流)：run_id 可先行写入响应头（X-Run-Id）。"""
-        run, adapter = await self._start(
+        run, _adapter, stream = await self._start(
             agent_config=agent_config,
             messages=messages,
             user_id=user_id,
@@ -93,13 +203,7 @@ class AgentRuntimeService:
             use_memory_context=use_memory_context,
             db_info=db_info,
         )
-
-        async def _gen() -> AsyncGenerator[Dict[str, Any], None]:
-            async for ev in run.bus.events():
-                for legacy in adapter.adapt(ev):
-                    yield legacy
-
-        return run.run_id, _gen()
+        return run.run_id, stream
 
     async def stream_run(
         self,
@@ -132,26 +236,34 @@ class AgentRuntimeService:
         messages: List[Dict[str, Any]],
         user_id: int,
         session_id: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
         use_memory_context: str = "",
         db_info: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """非流式执行：返回 {status, content, steps, run_id}。"""
-        run, adapter = await self._start(
+        run, _adapter, stream = await self._start(
             agent_config=agent_config,
             messages=messages,
             user_id=user_id,
             session_id=session_id,
+            idempotency_key=idempotency_key,
             use_memory_context=use_memory_context,
             db_info=db_info,
         )
         steps: List[Dict[str, Any]] = []
-        async for ev in run.bus.events():
-            steps.extend(adapter.adapt(ev))
-        content = "".join(adapter.final_text_parts)
+        content = ""
+        status = run.status
+        async for legacy in stream:
+            if legacy.get("type") == "final":
+                content = legacy.get("content") or ""
+            if legacy.get("type") == "done":
+                status = legacy.get("status") or status
+                continue
+            steps.append(legacy)
         return {
-            "status": run.status,
+            "status": status,
             "content": content,
-            "steps": [s for s in steps if s.get("type") != "done"],
+            "steps": steps,
             "run_id": run.run_id,
         }
 
@@ -161,22 +273,92 @@ class AgentRuntimeService:
         decisions: List[Dict[str, Any]],
         deciding_user_id: int,
     ) -> AsyncGenerator[Dict[str, Any], None]:
-        """HITL 恢复：decisions=[{"type":"approve"|"reject","message":...}, ...]。"""
+        """HITL 恢复：decisions=[{"type":"approve"|"reject","message":...,"action_id":...}, ...]。
+
+        幂等语义（F-11 / T-03）：重复提交一致决策返回当前状态、不重复恢复；
+        冲突决策（ApprovalConflict）与非法决策（ApprovalInvalid）显式拒绝。
+        服务重启后无内存句柄也可恢复：以 agent_runs / Checkpoint 为准。
+        """
         run = self.registry.get(run_id)
-        if run is None or run.status != STATUS_WAITING_APPROVAL:
-            yield {"type": "error", "content": "运行不存在或不在待审批状态"}
+        if run is None:
+            async with AsyncSessionLocal() as db:
+                row = await RunRepository(db).get_run(run_id)
+            if row is None:
+                yield {"type": "error", "content": "运行不存在或不在待审批状态"}
+                yield {"type": "done", "status": "failed"}
+                return
+            run = self.registry.attach(
+                run_id=row.id,
+                agent_id=row.agent_id,
+                session_id=row.session_id,
+                user_id=row.user_id,
+                thread_id=row.thread_id,
+                idempotency_key=row.idempotency_key,
+                status=row.status,
+            )
+        if run.user_id not in (None, deciding_user_id):
+            yield {"type": "error", "content": "无权审批该运行", "code": "forbidden"}
+            yield {"type": "done", "status": "failed"}
+            return
+
+        # 决策校验：非法/冲突显式拒绝；重复一致提交幂等
+        try:
+            verdict = await self._check_decisions(run_id, decisions)
+        except (ApprovalInvalid, ApprovalConflict) as e:
+            yield {"type": "error", "content": str(e), "code": e.code}
+            yield {"type": "done", "status": "failed"}
+            return
+
+        if run.status != STATUS_WAITING_APPROVAL:
+            if verdict == "idempotent":
+                # F-11 / T-03：重复审批幂等返回当前状态，不重复恢复、不重复执行
+                yield {"type": "done", "status": run.status, "idempotent": True, "run_id": run_id}
+            else:
+                yield {"type": "error", "content": "运行不存在或不在待审批状态"}
+                yield {"type": "done", "status": "failed"}
+            return
+
+        # 审批决策必须先持久化成功（关键写入失败向上抛出，不得带病执行副作用）
+        await self._record_approval_decision(run_id, decisions, deciding_user_id)
+
+        # 图内恢复用决策：按审批登记顺序对齐 action_requests（与 Checkpoint 一致）
+        from sqlalchemy import select
+        from app.models.agent import AgentApproval
+
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(
+                select(AgentApproval).where(AgentApproval.run_id == run_id).order_by(AgentApproval.id)
+            )).scalars().all()
+        graph_decisions = [
+            {"type": r.decision, "message": r.message or ""}
+            for r in rows if r.decision is not None
+        ]
+
+        # 原子领取（waiting_approval -> running + 租约 + fencing token）
+        assert self.worker is not None
+        row = await self.worker.claim_run(run_id, paused=True)
+        if row is None:
+            yield {"type": "error", "content": "运行状态已变更或已被其他执行者接管"}
             yield {"type": "done", "status": "failed"}
             return
 
         adapter = LegacyEventAdapter(run_id)
-        await self._record_approval_decision(run_id, decisions, deciding_user_id)
+        run.lease_version = row.lease_version
+        run.worker_id = self.worker.worker_id
+        run.attempt = row.attempt or run.attempt
         run.transition(STATUS_RUNNING)
-        await self._persist_run(run)
 
-        run.bus = EventBus()
+        run.bus = EventBus(persist=True)
         run.bus.bind_run(thread_id=run.thread_id, agent_id=run.agent_id, trace_id=run.run_id)
-        run.task = asyncio.create_task(
-            self._drive(run, adapter, messages=None, resume={"decisions": decisions})
+        self.worker.supervise(
+            run,
+            adapter,
+            RunJob(
+                run_id=run_id,
+                user_id=run.user_id,
+                resume={"decisions": graph_decisions},
+                use_memory_context="",
+            ),
         )
         async for ev in run.bus.events():
             for legacy in adapter.adapt(ev):
@@ -185,17 +367,38 @@ class AgentRuntimeService:
     async def cancel_run(self, run_id: str, user_id: int) -> Dict[str, Any]:
         run = self.registry.get(run_id)
         if run is None:
-            return {"ok": False, "error": "运行不存在"}
+            # 无内存句柄：按数据库状态取消（pending 可直接取消）
+            async with AsyncSessionLocal() as db:
+                row = await RunRepository(db).get_run(run_id)
+            if row is None or row.user_id not in (None, user_id):
+                return {"ok": False, "error": "运行不存在"}
+            if row.status in TERMINAL_STATUSES:
+                return {"ok": True, "status": row.status}
+            if row.status == STATUS_PENDING:
+                handle = self.registry.attach(
+                    run_id=row.id,
+                    agent_id=row.agent_id,
+                    session_id=row.session_id,
+                    user_id=row.user_id,
+                    thread_id=row.thread_id,
+                    idempotency_key=row.idempotency_key,
+                    status=row.status,
+                )
+                handle.transition(STATUS_CANCELLED)
+                await self._commit(handle, status=STATUS_CANCELLED, finished=True)
+                return {"ok": True, "status": STATUS_CANCELLED}
+            return {"ok": False, "error": "运行执行中由其他 Worker 持有，无法直接取消"}
         if run.user_id != user_id:
             return {"ok": False, "error": "无权取消该运行"}
         if run.is_terminal:
             return {"ok": True, "status": run.status}
         if run.task and not run.task.done():
+            # _drive 的 CancelledError 分支负责落库 cancelled（fencing 校验）
             run.task.cancel()
             return {"ok": True, "status": "cancelling"}
-        # 等待审批的运行直接置为取消
+        # 等待审批/待执行的运行直接置为取消
         run.transition(STATUS_CANCELLED)
-        await self._persist_run(run)
+        await self._commit(run, status=STATUS_CANCELLED, finished=True)
         return {"ok": True, "status": run.status}
 
     async def get_run(self, run_id: str, user_id: int) -> Optional[Dict[str, Any]]:
@@ -241,12 +444,33 @@ class AgentRuntimeService:
             return {"error": str(e)}
         if snapshot is None:
             return None
+        actions, has_interrupt = self._extract_snapshot_actions(snapshot)
         return {
             "thread_id": thread_id,
             "checkpoint_id": getattr(snapshot, "id", None),
             "next": list(getattr(snapshot, "next", ()) or ()),
             "has_pending_writes": bool(getattr(snapshot, "pending_writes", None)),
+            "has_interrupt": has_interrupt,
+            "pending_actions": actions,
         }
+
+    @staticmethod
+    def _extract_snapshot_actions(snapshot: Any) -> Tuple[List[Dict[str, Any]], bool]:
+        """从 Checkpoint 快照提取未决 HITL 动作（恢复审批所需）。
+
+        动作带稳定 action_id（FR-06）：重启后重提取与中断时记录同一 ID。
+        """
+        actions: List[Dict[str, Any]] = []
+        has_interrupt = False
+        for task in (getattr(snapshot, "tasks", None) or ()):
+            for it in (getattr(task, "interrupts", None) or ()):
+                has_interrupt = True
+                value = _field(it, "value", it)
+                interrupt_id = str(_field(it, "id", "") or "")
+                if isinstance(value, dict) and "action_requests" in value:
+                    for ridx, req in enumerate(value["action_requests"]):
+                        actions.append(_action_from_req(req, interrupt_id, ridx))
+        return actions, has_interrupt
 
     # ── 内部：启动与驱动 ──────────────────────────────────────────────────
 
@@ -260,35 +484,154 @@ class AgentRuntimeService:
         idempotency_key: Optional[str] = None,
         use_memory_context: str = "",
         db_info: Optional[Dict[str, Any]] = None,
-    ) -> Tuple[RunHandle, LegacyEventAdapter]:
+    ) -> Tuple[RunHandle, LegacyEventAdapter, AsyncGenerator[Dict[str, Any], None]]:
+        """创建 Run（DB pending）→ Worker CAS Claim → 执行；返回句柄、适配器与旧契约事件流。
+
+        幂等：同一幂等键同一请求摘要返回已有 Run（绝不重复执行）；
+        同一幂等键不同请求摘要抛 IdempotencyConflict。
+        """
         thread_id = make_thread_id(agent_config["id"], session_id, uuid.uuid4().hex)
-        run = await self.registry.create(
+        run_id = uuid.uuid4().hex
+        snapshot = {k: v for k, v in (agent_config or {}).items() if not k.startswith("_")}
+        request_hash = _request_hash(
+            agent_config, messages, user_id, session_id, use_memory_context, db_info
+        )
+        input_payload = {
+            "messages": messages,
+            "use_memory_context": use_memory_context,
+            "db_info": db_info,
+        }
+
+        async with AsyncSessionLocal() as db:
+            repo = RunRepository(db)
+            row, created = await repo.create_run(
+                run_id=run_id,
+                agent_id=agent_config["id"],
+                session_id=session_id,
+                user_id=user_id,
+                thread_id=thread_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                input_payload=input_payload,
+                agent_config_snapshot=snapshot,
+            )
+            await db.commit()
+            run_id = row.id
+            thread_id = row.thread_id
+
+        run = self.registry.attach(
+            run_id=run_id,
             agent_id=agent_config["id"],
             session_id=session_id,
             user_id=user_id,
             thread_id=thread_id,
             idempotency_key=idempotency_key,
+            status=STATUS_PENDING if created else row.status,
         )
-        if run.task is not None:
-            # 幂等命中：复用已有运行
-            return run, LegacyEventAdapter(run.run_id)
+        adapter = LegacyEventAdapter(run_id)
 
-        adapter = LegacyEventAdapter(run.run_id)
+        if not created:
+            # 幂等命中：绝不重复创建/重复执行
+            if run.task is not None and not run.task.done():
+                return run, adapter, self._bus_stream(run, adapter)
+            return run, adapter, self._replay_db_stream(run_id, run, adapter)
+
+        assert self.worker is not None
+        claimed = await self.worker.claim_run(run_id)
+        if claimed is None:
+            # 极小概率被其他 Worker 先行领取：退化为数据库回放流，不重复执行
+            return run, adapter, self._replay_db_stream(run_id, run, adapter)
+
+        run.lease_version = claimed.lease_version
+        run.worker_id = self.worker.worker_id
+        run.attempt = claimed.attempt or 1
         run.transition(STATUS_RUNNING)
-        await self._persist_run(run)
-        run.task = asyncio.create_task(
-            self._drive(
-                run,
-                adapter,
+        self.worker.supervise(
+            run,
+            adapter,
+            RunJob(
+                run_id=run_id,
+                user_id=user_id,
                 messages=messages,
-                resume=None,
                 agent_config=agent_config,
                 use_memory_context=use_memory_context,
                 db_info=db_info,
-                user_id=user_id,
-            )
+            ),
         )
-        return run, adapter
+        return run, adapter, self._bus_stream(run, adapter)
+
+    async def _bus_stream(
+        self, run: RunHandle, adapter: LegacyEventAdapter
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """本进程执行：直连事件总线的旧契约事件流。"""
+        async for ev in run.bus.events():
+            for legacy in adapter.adapt(ev):
+                yield legacy
+
+    async def _replay_db_stream(
+        self, run_id: str, run: RunHandle, adapter: LegacyEventAdapter
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """幂等命中 / 跨进程执行时的事件流：统一从事件仓库消费（FR-07）。"""
+        async for legacy in self.replay_events(run_id):
+            yield legacy
+
+    async def replay_events(
+        self,
+        run_id: str,
+        after_seq: Optional[int] = None,
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """按持久化事件日志消费 Run 事件流（SSE 断线回放 + 跨进程订阅，FR-07）。
+
+        - 事实来源为 ``agent_run_events``；内存 EventBus 仅是本地通知优化，
+          因此 API 实例与执行 Worker 不同进程也能消费到完整事件流；
+        - 旧契约事件 seq 从 0 连续递增：``after_seq`` 之前的事件仅重建
+          适配器状态不重复下发，之后逐条下发直至终态（不丢失、不重复、
+          不乱序）；``after_seq=None`` 表示从头消费（含 seq=0）；
+        - 无事件日志的旧运行按状态合成旧契约终态，保持行为兼容。
+        """
+        adapter = LegacyEventAdapter(run_id)
+        db_seq = 0
+        poll = max(0.05, float(getattr(settings, "AGENT_RUNTIME_POLL_INTERVAL", 1.0)))
+
+        def _visible(ev_dict: Dict[str, Any]) -> bool:
+            return after_seq is None or int(ev_dict.get("seq") or 0) > after_seq
+
+        while True:
+            async with AsyncSessionLocal() as db:
+                rows = await EventRepository(db).list_after(run_id, db_seq)
+            if rows:
+                for row in rows:
+                    db_seq = row.sequence
+                    ev = RuntimeEvent(
+                        type=row.event_type,
+                        run_id=run_id,
+                        data=row.payload or {},
+                        sequence=row.sequence,
+                        thread_id=row.thread_id or "",
+                    )
+                    for old in adapter.adapt(ev):
+                        if _visible(old):
+                            yield old
+                if adapter.finished:
+                    return
+                continue
+
+            async with AsyncSessionLocal() as db:
+                run_row = await RunRepository(db).get_run(run_id)
+            if run_row is None:
+                if db_seq == 0:
+                    yield {"type": "error", "content": "运行不存在"}
+                    yield {"type": "done", "status": "failed"}
+                return
+            if run_row.status in TERMINAL_STATUSES or run_row.status == STATUS_WAITING_APPROVAL:
+                if adapter.finished:
+                    return
+                # 事件日志缺失/已清理的旧运行：按状态合成旧契约终态
+                for old in adapter.adapt(_synthetic_terminal_event(run_row)):
+                    if _visible(old):
+                        yield old
+                return
+            await asyncio.sleep(poll)
 
     async def _drive(
         self,
@@ -345,6 +688,8 @@ class AgentRuntimeService:
                 enable_hitl=getattr(settings, "AGENT_ENABLE_HITL", True),
                 sandbox_mode=getattr(settings, "AGENT_SANDBOX_MODE", "restricted"),
                 allow_network=getattr(settings, "AGENT_ALLOW_NETWORK", True),
+                worker_id=run.worker_id,
+                lease_version=run.lease_version or 0,
             )
 
             tool_specs = self._resolve_tool_specs(agent_config)
@@ -370,12 +715,27 @@ class AgentRuntimeService:
                 skill_files = self._skill_files()
                 if resume is not None:
                     payload: Any = Command(resume=resume)
+                elif messages is None:
+                    # 恢复续跑：Checkpoint 已含全部输入，从断点继续（不重复写入消息）
+                    payload = None
                 else:
-                    payload = {"messages": messages_to_langchain(messages or []), **skill_files}
+                    payload = {
+                        "messages": messages_to_langchain(
+                            messages or [], namespace=run.thread_id
+                        ),
+                        **skill_files,
+                    }
 
                 config = make_run_config(run.thread_id, run.run_id, scope.user_id)
                 config["recursion_limit"] = ctx.budget.max_steps * 3 + 10
+                # FR-10：模型调用按一次请求计数（Runnable 生命周期回调，不按 Chunk）
+                config["callbacks"] = [ModelUsageCallback(ctx)]
                 run_config = config
+
+                # FR-09：挂起/重启恢复后从事件日志重建已产生的最终文本片段，
+                # 保证跨 _drive 调用（审批恢复 / 崩溃恢复）最终文本完整
+                if not run.final_text_parts:
+                    run.final_text_parts = await self._load_prior_final_text(run.run_id)
 
                 try:
                     async with asyncio.timeout(ctx.budget.run_timeout_seconds):
@@ -385,26 +745,55 @@ class AgentRuntimeService:
 
             # 结束分支
             if run.status == STATUS_RUNNING:
-                run.final_text = "".join(adapter.final_text_parts)
+                # FR-09：run.final_text 唯一权威收集在执行侧（_consume_stream 累积
+                # 的 run.final_text_parts），事件适配器只做协议转换；
+                # 先持久化最终结果，再写回 Session、最后才发布 RUN_COMPLETED
+                run.final_text = "".join(run.final_text_parts)
                 run.summary = {
                     "tool_calls": ctx.tool_calls,
                     "model_calls": ctx.model_calls,
+                    "model_node_runs": ctx.model_node_runs,
+                    "tokens_generated": ctx.tokens_generated,
+                    "steps": ctx.steps,
                     "elapsed_seconds": round(ctx.elapsed(), 2),
                 }
                 run.transition(STATUS_COMPLETED)
+                await self._commit(
+                    run,
+                    status=STATUS_COMPLETED,
+                    final_text=run.final_text,
+                    summary=run.summary,
+                    finished=True,
+                )
+                await self._write_back_session(run)  # FR-08.2：Runtime 统一写回
                 await bus.publish(RuntimeEvent(
                     type=RUN_COMPLETED,
                     run_id=run.run_id,
                     data={"final_text": run.final_text, "summary": run.summary},
                 ))
 
+        except PersistenceError:
+            # 关键状态写入失败：立即停止推进，绝不带病执行副作用（R-12 / 任务书 §0.7）
+            logger.critical("run %s 关键状态持久化失败，停止推进", run.run_id, exc_info=True)
+            raise
         except asyncio.CancelledError:
+            if run.suspend_requested:
+                # 挂起（优雅关闭 / 租约丢失）：不改写状态，保留 running 供其他 Worker 恢复
+                logger.info("run %s 挂起执行（不写入 cancelled）", run.run_id)
+                raise
             if not run.is_terminal:
                 try:
                     run.transition(STATUS_CANCELLED)
                 except Exception:
                     pass
-            await self._persist_run(run)
+            try:
+                await self._commit(run, status=STATUS_CANCELLED, finished=True)
+            except PersistenceError:
+                logger.critical("run %s 取消状态持久化失败", run.run_id, exc_info=True)
+            try:
+                await self._write_back_session(run)  # FR-08.2：终态统一写回
+            except Exception:
+                logger.exception("run %s 取消态会话写回失败", run.run_id)
             await bus.publish(RuntimeEvent(type=RUN_CANCELLED, run_id=run.run_id))
             raise
         except _RunLimitExceeded as e:
@@ -412,6 +801,9 @@ class AgentRuntimeService:
         except (ToolCallLimitExceededError, ModelCallLimitExceededError, GraphRecursionError) as e:
             # 执行预算超限（工具/模型次数、步数）→ 明确 limit_exceeded 状态
             await self._fail(run, f"执行预算超限: {e}", status=STATUS_LIMIT_EXCEEDED, bus=bus)
+        except BudgetExceededError as e:
+            # FR-10.7：预算耗尽 → limit_exceeded（不得误报 failed）
+            await self._fail(run, str(e), status=STATUS_LIMIT_EXCEEDED, bus=bus)
         except ModelCapabilityError as e:
             await self._fail(run, f"模型能力不满足: {e}", status=STATUS_FAILED, bus=bus)
         except ToolPolicyError as e:
@@ -420,7 +812,6 @@ class AgentRuntimeService:
             logger.exception("run %s 执行失败", run.run_id)
             await self._fail(run, str(e), status=STATUS_FAILED, bus=bus)
         finally:
-            await self._persist_run(run)
             telemetry.record_run(
                 log_fields,
                 status=run.status,
@@ -430,7 +821,15 @@ class AgentRuntimeService:
             )
 
     async def _consume_stream(self, agent, payload, run_config, ctx, run, bus) -> None:
-        """消费 astream：模型增量 / 计划 / 中断 -> 事件总线。"""
+        """消费 astream：模型增量 / 计划 / 中断 -> 事件总线。
+
+        FR-09：run.final_text 的唯一权威收集在本函数（执行侧）——可见模型
+        文本在发布 MODEL_DELTA 前先累积到 run.final_text_parts，事件适配器
+        只做协议转换，不承担最终结果收集。
+        FR-10：模型调用次数由 ModelUsageCallback 按请求计数（此处不按 Chunk
+        递增）；steps/model_node_runs 递增位置 = updates 中主图 model 节点
+        完成（一次 = 一个 agent 轮次）。
+        """
         interrupted = False
         async for mode, chunk in agent.astream(
             payload, config=run_config, stream_mode=["updates", "messages"]
@@ -439,15 +838,20 @@ class AgentRuntimeService:
                 msg, meta = chunk
                 if isinstance(msg, (AIMessage, AIMessageChunk)) and meta.get("langgraph_node") == "model":
                     # 模型增量（含非流式整段消息；仅主模型节点可见文本）
-                    text = msg.content if isinstance(msg.content, str) else ""
+                    # FR-09.5：结构化/多模态内容按明确规则提取文本，不静默丢弃
+                    text = _extract_text(msg.content)
                     if text:
-                        ctx.model_calls += 1
+                        # FR-09：权威收集（执行侧）——先累积再发布，消费端时序无关
+                        run.final_text_parts.append(text)
                         await bus.publish(RuntimeEvent(
                             type=MODEL_DELTA, run_id=run.run_id, data={"text": text}
                         ))
             elif mode == "updates":
                 if not isinstance(chunk, dict):
                     continue
+                if "model" in chunk:
+                    ctx.model_node_runs += 1
+                    ctx.steps += 1
                 if "__interrupt__" in chunk:
                     interrupted = True
                     await self._handle_interrupt(chunk["__interrupt__"], run, bus)
@@ -461,6 +865,8 @@ class AgentRuntimeService:
                         ))
         if interrupted:
             run.transition(STATUS_WAITING_APPROVAL)
+            # 暂停态必须先持久化成功，再对外宣告（失败向上抛出）
+            await self._commit(run, status=STATUS_WAITING_APPROVAL)
             await bus.publish(RuntimeEvent(
                 type=RUN_WAITING_APPROVAL, run_id=run.run_id,
                 data={"actions": redact_sensitive(run.pending_actions)},
@@ -472,14 +878,11 @@ class AgentRuntimeService:
         if isinstance(items, tuple):
             items = list(items)
         for it in items:
-            value = getattr(it, "value", it)
+            value = _field(it, "value", it)
+            interrupt_id = str(_field(it, "id", "") or "")
             if isinstance(value, dict) and "action_requests" in value:
-                for req in value["action_requests"]:
-                    actions.append({
-                        "tool": req.get("name") or req.get("action") or req.get("tool"),
-                        "args": redact_sensitive(req.get("args") or {}),
-                        "description": req.get("description", ""),
-                    })
+                for ridx, req in enumerate(value["action_requests"]):
+                    actions.append(_action_from_req(req, interrupt_id, ridx))
         run.pending_actions = actions
         await self._record_approval_requests(run.run_id, actions)
         await bus.publish(RuntimeEvent(
@@ -492,10 +895,65 @@ class AgentRuntimeService:
             run.transition(status)
         except Exception:
             pass
+        # 失败状态必须持久化成功（失败则 PersistenceError 向上抛出）
+        await self._commit(run, status=status, error=error, finished=True)
+        try:
+            await self._write_back_session(run)  # FR-08.2：终态统一写回
+        except Exception:
+            logger.exception("run %s 失败态会话写回失败", run.run_id)
         await bus.publish(RuntimeEvent(
             type=RUN_FAILED, run_id=run.run_id,
             data={"error": error, "status": status},
         ))
+
+    async def _load_prior_final_text(self, run_id: str) -> List[str]:
+        """FR-09：从持久化事件日志重建本 Run 已产生的最终文本片段（MODEL_DELTA），
+        供挂起/重启恢复后的 _drive 调用继续累积，保证最终文本跨恢复完整。"""
+        async with AsyncSessionLocal() as db:
+            rows = await EventRepository(db).list_after(run_id, 0)
+        return [
+            r.payload.get("text", "")
+            for r in rows
+            if r.event_type == MODEL_DELTA and r.payload and r.payload.get("text")
+        ]
+
+    async def _write_back_session(self, run: RunHandle) -> None:
+        """FR-08.2：Assistant 最终结果由 Runtime 统一写回 Session。
+
+        Run 进入终态（completed/failed/cancelled/limit_exceeded）时写回一次
+        assistant 消息（content=run.final_text，steps=持久化事件重建的旧契约轨迹）。
+        客户端断线不再丢失写回。写回失败向上抛出（Completion 路径调用方
+        先已持久化 Run 结果，失败态路径调用方仅记日志）。
+        """
+        if not run.session_id:
+            return
+        from sqlalchemy import select
+        from sqlalchemy.orm.attributes import flag_modified
+
+        from app.models.agent import AgentSession
+
+        steps: List[Dict[str, Any]] = []
+        async for legacy in self.replay_events(run.run_id):
+            if legacy.get("type") != "done":
+                steps.append(legacy)
+
+        async with AsyncSessionLocal() as db:
+            res = await db.execute(
+                select(AgentSession).where(AgentSession.id == run.session_id)
+            )
+            sess = res.scalar_one_or_none()
+            if sess is None:
+                logger.warning("run %s 会话 %s 不存在，跳过写回", run.run_id, run.session_id)
+                return
+            msgs = list(sess.messages or [])
+            msgs.append({
+                "role": "assistant",
+                "content": run.final_text or "",
+                "steps": steps,
+            })
+            sess.messages = msgs
+            flag_modified(sess, "messages")
+            await db.commit()
 
     # ── 内部：装载 ────────────────────────────────────────────────────────
 
@@ -569,67 +1027,258 @@ class AgentRuntimeService:
             f"db_query/db_count/db_aggregate 工具将作用于该数据库（只读）。可用表：{tables}"
         )
 
-    # ── 内部：持久化 ──────────────────────────────────────────────────────
+    # ── 内部：持久化（关键写入失败一律向上抛出） ──────────────────────────
 
-    async def _persist_run(self, run: RunHandle) -> None:
+    async def _commit(
+        self,
+        run: RunHandle,
+        *,
+        status: str,
+        error: Optional[str] = None,
+        final_text: Optional[str] = None,
+        summary: Optional[Dict[str, Any]] = None,
+        recovery_error: Optional[str] = None,
+        finished: bool = False,
+    ) -> bool:
+        """提交 Run 状态（fencing：lease_version 不匹配则拒绝提交）。
+
+        返回 False 表示租约已易主（旧 Worker 不得继续推进）；
+        数据库异常包装为 PersistenceError 向上抛出（R-12）。
+        """
         try:
-            from sqlalchemy import select
-            from app.models.agent import AgentRun
-
             async with AsyncSessionLocal() as db:
-                row = (await db.execute(select(AgentRun).where(AgentRun.id == run.run_id))).scalar_one_or_none()
-                if row is None:
-                    row = AgentRun(
-                        id=run.run_id, agent_id=run.agent_id, session_id=run.session_id,
-                        user_id=run.user_id, thread_id=run.thread_id,
-                    )
-                    db.add(row)
-                row.status = run.status
-                row.error = run.error
-                row.final_text = run.final_text or None
-                row.summary = run.summary or None
-                if run.is_terminal:
-                    row.finished_at = datetime.utcnow()
+                ok = await RunRepository(db).update_status(
+                    run.run_id,
+                    status=status,
+                    lease_version=run.lease_version,
+                    error=error,
+                    final_text=final_text,
+                    summary=summary,
+                    recovery_error=recovery_error,
+                    finished=finished,
+                )
                 await db.commit()
-        except Exception:
-            logger.exception("run %s 状态持久化失败", run.run_id)
+        except PersistenceError:
+            raise
+        except Exception as e:
+            raise PersistenceError(f"run {run.run_id} 状态持久化失败: {e}") from e
+        if not ok:
+            logger.warning(
+                "run %s 状态 %s 提交被拒：租约已易主（lease_version=%s）",
+                run.run_id, status, run.lease_version,
+            )
+        return ok
+
+    async def _recovery_check(
+        self, row: Any
+    ) -> Tuple[str, str, List[Dict[str, Any]]]:
+        """恢复检查（attempt > 1 的重新领取必须先判断可否安全继续）。
+
+        返回 (mode, reason, pending_actions)：
+        - fresh：首次执行 / 无 Checkpoint，用输入快照执行；
+        - continue：有 Checkpoint 且无未决中断，从断点续跑；
+        - waiting_approval：Checkpoint 停在 HITL 中断，回到待审批；
+        - needs_reconciliation：存在结果未知的副作用，禁止自动重放（FR-08）。
+        """
+        if (getattr(row, "attempt", 0) or 0) <= 1:
+            return RECOVERY_FRESH, "", []
+
+        async with AsyncSessionLocal() as db:
+            entries = await ToolExecutionRepository(db).list_unresolved(row.id)
+        # 与工具层共用同一重放决策：只有"禁止重放"的未决副作用才阻断自动恢复
+        # （read_only 可安全重试；external_idempotent 复用同一幂等键重试）
+        if any(replay_action(e.status, e.tool_name) == REPLAY_BLOCK for e in entries):
+            return (
+                RECOVERY_NEEDS_RECONCILIATION,
+                "存在结果未知的工具副作用（执行账本未决），禁止自动重放，需人工对账",
+                [],
+            )
+
+        state = await self.get_thread_state(row.thread_id)
+        if state is None:
+            # 无 Checkpoint：从输入快照重新执行不会重复副作用之外的状态
+            return RECOVERY_FRESH, "", []
+        if state.get("error"):
+            # 无法读取 Checkpoint 就无法判定恢复安全性：向上抛出，等待租约到期重试
+            raise PersistenceError(
+                f"run {row.id} 恢复检查失败：Checkpoint 不可读（{state['error']}）"
+            )
+        if state.get("has_interrupt"):
+            return RECOVERY_WAITING_APPROVAL, "", state.get("pending_actions") or []
+        return RECOVERY_CONTINUE, "", []
 
     async def _record_approval_requests(self, run_id: str, actions: List[Dict[str, Any]]) -> None:
-        try:
-            from app.models.agent import AgentApproval
+        """审批请求先持久化（FR-06.2）：action_id 幂等，重启重放不产生重复记录。"""
+        from sqlalchemy import select
+        from app.models.agent import AgentApproval
 
+        try:
             async with AsyncSessionLocal() as db:
                 for a in actions:
+                    action_id = str(a.get("action_id") or hashlib.sha256(
+                        (str(a.get("tool")) + json.dumps(
+                            a.get("args") or {}, ensure_ascii=False, sort_keys=True, default=str
+                        )).encode("utf-8")
+                    ).hexdigest()[:40])
+                    existing = (await db.execute(
+                        select(AgentApproval).where(
+                            AgentApproval.run_id == run_id,
+                            AgentApproval.action_id == action_id,
+                        )
+                    )).scalar_one_or_none()
+                    if existing is not None:
+                        continue  # 幂等：重放/重启不重复登记
                     db.add(AgentApproval(
                         run_id=run_id,
                         tool_name=str(a.get("tool") or "unknown"),
                         action_summary=json.dumps(a.get("args") or {}, ensure_ascii=False)[:2000],
+                        action_id=action_id,
+                        tool_call_id=a.get("tool_call_id"),
+                        args_hash=a.get("args_hash"),
+                        action_payload=a.get("args") or None,
+                        decision_status="pending",
                     ))
                 await db.commit()
-        except Exception:
-            logger.exception("审批记录写入失败")
+        except Exception as e:
+            raise PersistenceError(f"run {run_id} 审批记录写入失败: {e}") from e
 
-    async def _record_approval_decision(self, run_id: str, decisions: List[Dict[str, Any]], user_id: int) -> None:
-        try:
+    @staticmethod
+    def _match_approval_row(rows: List[Any], dec: Dict[str, Any], idx: int) -> Optional[Any]:
+        """决策与审批动作匹配：带 action_id 精确匹配，否则按登记顺序对齐。"""
+        action_id = dec.get("action_id")
+        if action_id is not None:
+            for r in rows:
+                if r.action_id == action_id:
+                    return r
+            return None
+        return rows[idx] if idx < len(rows) else None
+
+    async def _check_decisions(self, run_id: str, decisions: List[Dict[str, Any]]) -> str:
+        """审批决策校验（不落库）。返回 'ok'（可受理）| 'idempotent'（重复一致提交）。
+
+        - 未知决策类型 / 未知审批动作 -> ApprovalInvalid
+        - 同一动作改判 -> ApprovalConflict（F-11：冲突必须显式拒绝，不得静默覆盖）
+        """
+        valid_types = {"approve", "reject"}
+        if not decisions:
+            raise ApprovalInvalid("审批决策为空")
+        from sqlalchemy import select
+        from app.models.agent import AgentApproval
+
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(
+                select(AgentApproval).where(AgentApproval.run_id == run_id).order_by(AgentApproval.id)
+            )).scalars().all()
+        verdicts: List[str] = []
+        for i, dec in enumerate(decisions):
+            dtype = str(dec.get("type") or "").strip()
+            if dtype not in valid_types:
+                raise ApprovalInvalid(f"未知决策类型: {dtype!r}（仅支持 approve / reject）")
+            row = self._match_approval_row(rows, dec, i)
+            if row is None:
+                raise ApprovalInvalid(f"未知审批动作: {dec.get('action_id') or f'#{i + 1}'}")
+            if row.decision is not None:
+                if row.decision == dtype:
+                    verdicts.append("idempotent")
+                else:
+                    raise ApprovalConflict(
+                        f"审批动作 {row.action_id or row.id} 已决策为 {row.decision}，"
+                        f"与新决策 {dtype} 冲突"
+                    )
+            else:
+                verdicts.append("record")
+        return "idempotent" if verdicts and all(v == "idempotent" for v in verdicts) else "ok"
+
+    async def check_decisions(
+        self,
+        run_id: str,
+        decisions: List[Dict[str, Any]],
+        deciding_user_id: int,
+    ) -> str:
+        """审批前置校验（不落库，API 层映射 HTTP 403/400/409）。"""
+        run = self.registry.get(run_id)
+        owner: Optional[int] = run.user_id if run is not None else None
+        if run is None:
             from sqlalchemy import select
-            from app.models.agent import AgentApproval
+            from app.models.agent import AgentRun
 
             async with AsyncSessionLocal() as db:
+                row = (await db.execute(
+                    select(AgentRun).where(AgentRun.id == run_id)
+                )).scalar_one_or_none()
+            if row is None:
+                raise ApprovalInvalid("运行不存在或不在待审批状态")
+            owner = row.user_id
+        if owner not in (None, deciding_user_id):
+            raise ApprovalForbidden("无权审批该运行")
+        return await self._check_decisions(run_id, decisions)
+
+    async def _record_approval_decision(self, run_id: str, decisions: List[Dict[str, Any]], user_id: int) -> None:
+        """审批决策先持久化（FR-04.6）：冲突/非法决策拒绝；重复一致决策幂等。
+
+        关键写入失败必须向上抛出：决策未落库不得发送恢复命令。
+        """
+        from sqlalchemy import select
+        from app.models.agent import AgentApproval
+
+        try:
+            async with AsyncSessionLocal() as db:
                 rows = (await db.execute(
-                    select(AgentApproval).where(AgentApproval.run_id == run_id, AgentApproval.decision.is_(None))
+                    select(AgentApproval).where(AgentApproval.run_id == run_id).order_by(AgentApproval.id)
                 )).scalars().all()
-                for row, dec in zip(rows, decisions):
-                    row.decision = dec.get("type", "approve")
+                for i, dec in enumerate(decisions):
+                    row = self._match_approval_row(rows, dec, i)
+                    if row is None:
+                        raise ApprovalInvalid(f"未知审批动作: {dec.get('action_id') or f'#{i + 1}'}")
+                    if row.decision is not None:
+                        if row.decision != dec.get("type"):
+                            raise ApprovalConflict(
+                                f"审批动作 {row.action_id or row.id} 已决策为 {row.decision}，"
+                                f"与新决策 {dec.get('type')} 冲突"
+                            )
+                        continue  # 重复一致决策：幂等，不重复写入
+                    row.decision = str(dec.get("type"))
                     row.message = dec.get("message")
                     row.decided_by = user_id
                     row.decided_at = datetime.utcnow()
+                    row.decision_status = "approved" if dec.get("type") == "approve" else "rejected"
                 await db.commit()
-        except Exception:
-            logger.exception("审批决策写入失败")
+        except (ApprovalInvalid, ApprovalConflict):
+            raise
+        except Exception as e:
+            raise PersistenceError(f"run {run_id} 审批决策写入失败: {e}") from e
 
 
 class _RunLimitExceeded(Exception):
     pass
+
+
+def _request_hash(
+    agent_config: Dict[str, Any],
+    messages: List[Dict[str, Any]],
+    user_id: int,
+    session_id: Optional[int],
+    use_memory_context: str,
+    db_info: Optional[Dict[str, Any]],
+) -> str:
+    """规范化请求摘要：同一幂等键不同请求内容 → IdempotencyConflict（F-06）。"""
+    canonical = json.dumps(
+        {
+            "agent_id": agent_config.get("id"),
+            "user_id": user_id,
+            "session_id": session_id,
+            "messages": messages,
+            "use_memory_context": use_memory_context,
+            "db_info": db_info,
+            "agent_config": {
+                k: v for k, v in (agent_config or {}).items() if not k.startswith("_")
+            },
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        default=str,
+    )
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
 _service: Optional[AgentRuntimeService] = None

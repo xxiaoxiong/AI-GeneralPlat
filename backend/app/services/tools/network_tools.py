@@ -39,37 +39,34 @@ TOOLS: List[Dict[str, Any]] = [
 
 
 async def execute_http_get(params: dict) -> str:
+    # 请求异常不在此处吞掉：运行时工具账本需按异常语义区分 failed / unknown
     url = params.get("url", "")
     timeout = int(params.get("timeout", 15))
     headers = params.get("headers", {}) or {}
     query_params = params.get("params", {}) or {}
+    async with httpx.AsyncClient(timeout=timeout, verify=(_settings.AGENT_CA_BUNDLE or _settings.AGENT_TLS_VERIFY)) as client:
+        resp = await client.get(url, headers=headers, params=query_params)
     try:
-        async with httpx.AsyncClient(timeout=timeout, verify=(_settings.AGENT_CA_BUNDLE or _settings.AGENT_TLS_VERIFY)) as client:
-            resp = await client.get(url, headers=headers, params=query_params)
-        try:
-            body = json.dumps(resp.json(), ensure_ascii=False, indent=2)
-        except Exception:
-            body = resp.text
-        return f"HTTP {resp.status_code} GET {url}\n{body[:3000]}"
-    except Exception as e:
-        return f"HTTP GET 请求失败: {e}"
+        body = json.dumps(resp.json(), ensure_ascii=False, indent=2)
+    except Exception:
+        body = resp.text
+    return f"HTTP {resp.status_code} GET {url}\n{body[:3000]}"
 
 
 async def execute_http_post(params: dict) -> str:
+    # 请求异常不在此处吞掉：超时/连接中断可能发生在远端已成功之后，
+    # 必须让调用方标记 unknown 而不是伪失败（F-07/F-08）
     url = params.get("url", "")
     timeout = int(params.get("timeout", 15))
     headers = params.get("headers", {}) or {}
     body = params.get("body", {}) or {}
+    async with httpx.AsyncClient(timeout=timeout, verify=(_settings.AGENT_CA_BUNDLE or _settings.AGENT_TLS_VERIFY)) as client:
+        resp = await client.post(url, json=body, headers=headers)
     try:
-        async with httpx.AsyncClient(timeout=timeout, verify=(_settings.AGENT_CA_BUNDLE or _settings.AGENT_TLS_VERIFY)) as client:
-            resp = await client.post(url, json=body, headers=headers)
-        try:
-            resp_body = json.dumps(resp.json(), ensure_ascii=False, indent=2)
-        except Exception:
-            resp_body = resp.text
-        return f"HTTP {resp.status_code} POST {url}\n{resp_body[:3000]}"
-    except Exception as e:
-        return f"HTTP POST 请求失败: {e}"
+        resp_body = json.dumps(resp.json(), ensure_ascii=False, indent=2)
+    except Exception:
+        resp_body = resp.text
+    return f"HTTP {resp.status_code} POST {url}\n{resp_body[:3000]}"
 
 
 HANDLERS = {

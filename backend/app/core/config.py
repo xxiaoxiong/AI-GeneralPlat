@@ -108,6 +108,14 @@ class Settings(BaseSettings):
     AGENT_MAX_FILE_SIZE_MB: int = 10            # 单文件大小上限
     AGENT_DISABLED_SKILLS: str = ""             # 逗号分隔禁用的 skill 名
     AGENT_EVENT_RETENTION_DAYS: int = 30        # 运行记录保留天数
+    AGENT_EVENT_CLEANUP_INTERVAL: float = 3600.0  # 事件保留清理执行间隔（秒，仅清理终态超期 Run）
+
+    # ── Durable Execution（Phase 2）：Worker 租约协调 ────────────────────
+    AGENT_RUNTIME_WORKER_ID: str = ""           # Worker 标识（空=自动生成 hostname-pid-随机）
+    AGENT_RUNTIME_LEASE_SECONDS: int = 60       # Run 租约时长；过期后可被其他 Worker 接管
+    AGENT_RUNTIME_HEARTBEAT_INTERVAL: float = 15.0  # 续租间隔（应小于租约的 1/2）
+    AGENT_RUNTIME_POLL_INTERVAL: float = 1.0    # 扫描待执行/孤儿 Run 的间隔
+    AGENT_RUNTIME_SHUTDOWN_GRACE: float = 30.0  # 优雅关闭时等待在途 Run 的秒数
 
     @property
     def cors_origins_list(self) -> List[str]:

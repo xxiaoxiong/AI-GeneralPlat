@@ -1,0 +1,41 @@
+﻿python : C:\Program Files\Python311\Lib\site-packages\pytest_asyncio\plugin.py:300: PytestDeprecationWarning: The confi
+guration option "asyncio_default_fixture_loop_scope" is unset.
+所在位置 行:15 字符: 2373
++ ... M = 'dumb'; python -X faulthandler -c "import faulthandler,pytest,sys ...
++                 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+    + CategoryInfo          : NotSpecified: (C:\Program File...cope" is unset.:String) [], RemoteException
+    + FullyQualifiedErrorId : NativeCommandError
+ 
+The event loop scope for asynchronous fixtures will default to the "fixture" caching scope. Future versions of pytest-a
+syncio will default the loop scope for asynchronous fixtures to "function" scope. Set the default fixture loop scope ex
+plicitly in order to avoid unexpected behavior in the future. Valid fixture loop scopes are: "function", "class", "modu
+le", "package", "session"
+
+  warnings.warn(PytestDeprecationWarning(_DEFAULT_FIXTURE_LOOP_SCOPE_UNSET))
+........................................................................ [ 68%]
+.................................                                        [100%]
+============================== warnings summary ===============================
+app\core\config.py:6
+  D:\MyPersonalFile\MyStudyFile\AI\MyCode\AI-GeneralPlat\backend\app\core\config.py:6: PydanticDeprecatedSince20: Support for class-based `config` is deprecated, use ConfigDict instead. Deprecated in Pydantic V2.0 to be removed in V3.0. See Pydantic V2 Migration Guide at https://errors.pydantic.dev/2.14/migration/
+    class Settings(BaseSettings):
+
+tests/test_agent_runtime.py::TestE2E::test_multi_step_tool_calling
+tests/test_agent_runtime.py::TestE2E::test_multi_step_tool_calling
+  D:\MyPersonalFile\MyStudyFile\AI\MyCode\AI-GeneralPlat\backend\tests\test_agent_runtime.py:351: LangChainDeprecationWarning: Calling .text() as a method is deprecated. Use .text as a property instead (e.g., message.text).
+    final_text, events = await run_graph(model, [echo_tool], [HumanMessage(content="调用 echo")])
+
+tests/test_agent_runtime.py::TestE2E::test_tool_failure_reported_to_model
+tests/test_agent_runtime.py::TestE2E::test_tool_failure_reported_to_model
+  D:\MyPersonalFile\MyStudyFile\AI\MyCode\AI-GeneralPlat\backend\tests\test_agent_runtime.py:402: LangChainDeprecationWarning: Calling .text() as a method is deprecated. Use .text as a property instead (e.g., message.text).
+    final_text, _ = await run_graph(model, [spec_tool], [HumanMessage(content="试一下")])
+
+tests/test_agent_runtime.py: 40 warnings
+  D:\MyPersonalFile\MyStudyFile\AI\MyCode\AI-GeneralPlat\backend\tests\test_agent_runtime.py:449: LangChainDeprecationWarning: Calling .text() as a method is deprecated. Use .text as a property instead (e.g., message.text).
+    final, _ = await run_graph(
+
+tests/test_api_smoke.py::TestRunEventsReplay::test_events_replay_forbidden_for_other_user
+  D:\MyPersonalFile\MyStudyFile\AI\MyCode\AI-GeneralPlat\backend\app\core\redis.py:23: DeprecationWarning: Call to deprecated close. (Use aclose() instead) -- Deprecated since version 5.0.1.
+    await redis_client.close()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+105 passed, 46 warnings in 10.08s

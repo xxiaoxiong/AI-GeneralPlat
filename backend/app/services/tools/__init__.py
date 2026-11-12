@@ -78,7 +78,7 @@ class ToolExecutor:
         self.db           = db
         self.agent_config = agent_config
 
-    async def execute(self, tool_name: str, tool_input: dict) -> str:
+    async def execute(self, tool_name: str, tool_input: dict, *, raise_on_error: bool = False) -> str:
         try:
             if tool_name in _SYNC_HANDLERS:
                 return _SYNC_HANDLERS[tool_name](tool_input)
@@ -103,6 +103,9 @@ class ToolExecutor:
             return f"错误：未知工具 '{tool_name}'"
 
         except Exception as e:
+            if raise_on_error:
+                # 运行时工具账本需要真实异常区分 failed / unknown，向上抛出
+                raise
             return f"工具执行错误: {e}"
 
     async def _custom_http_tool(self, tool_config: dict, params: dict) -> str:

@@ -59,6 +59,10 @@ class ToolPolicyError(Exception):
     """策略拒绝（执行前拦截）"""
 
 
+class BudgetExceededError(ToolPolicyError):
+    """执行预算超限（FR-10.7）：必须映射为 limit_exceeded，不得误报 failed。"""
+
+
 @dataclass
 class ToolPolicy:
     """一次运行的工具授权与安全边界。"""
