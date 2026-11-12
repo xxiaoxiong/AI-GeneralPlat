@@ -15,7 +15,10 @@ from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.agent import AgentToolExecution
+from app.models.agent import AgentRun, AgentToolExecution
+from ..lifecycle import STATUS_RUNNING, RunExecutionLease
+from .errors import RunLeaseLost
+from .run_repository import _sql_now
 
 TOOL_EXEC_PREPARED = "prepared"
 TOOL_EXEC_EXECUTING = "executing"
@@ -81,13 +84,40 @@ class ToolExecutionRepository:
         )
         return res.scalar_one_or_none()
 
+    async def _verify_lease(self, lease: RunExecutionLease) -> None:
+        """LF-07：Ledger 写入前校验执行权（同事务内，数据库时间比较）。
+
+        校验 Run ID / Worker ID / Lease Version / Run 处于 running /
+        Lease 未过期；任一不满足抛 ``RunLeaseLost``，旧 Worker 的
+        Tool Ledger 写入一律被拒绝。
+        """
+        res = await self.session.execute(
+            select(AgentRun.id).where(
+                AgentRun.id == lease.run_id,
+                AgentRun.worker_id == lease.worker_id,
+                AgentRun.lease_version == lease.lease_version,
+                AgentRun.status == STATUS_RUNNING,
+                AgentRun.lease_expires_at.isnot(None),
+                AgentRun.lease_expires_at > _sql_now(self.session),
+            )
+        )
+        if res.first() is None:
+            raise RunLeaseLost(
+                f"run {lease.run_id} 执行权校验失败"
+                f"（worker={lease.worker_id} lease_version={lease.lease_version}），"
+                "拒绝 Tool Ledger 写入"
+            )
+
     async def mark_executing(
         self,
         exec_id: int,
         *,
         worker_id: Optional[str] = None,
         lease_version: int = 0,
+        lease: Optional[RunExecutionLease] = None,
     ) -> bool:
+        if lease is not None:
+            await self._verify_lease(lease)
         res = await self.session.execute(
             update(AgentToolExecution)
             .where(
@@ -122,25 +152,34 @@ class ToolExecutionRepository:
         *,
         result_payload: Optional[Any] = None,
         external_operation_id: Optional[str] = None,
+        lease: Optional[RunExecutionLease] = None,
     ) -> bool:
         return await self._finish(
             exec_id, TOOL_EXEC_SUCCEEDED,
             result_payload=result_payload,
             external_operation_id=external_operation_id,
+            lease=lease,
         )
 
-    async def mark_failed(self, exec_id: int, *, error: Optional[str] = None) -> bool:
-        return await self._finish(exec_id, TOOL_EXEC_FAILED, error=error)
+    async def mark_failed(
+        self, exec_id: int, *, error: Optional[str] = None,
+        lease: Optional[RunExecutionLease] = None,
+    ) -> bool:
+        return await self._finish(exec_id, TOOL_EXEC_FAILED, error=error, lease=lease)
 
-    async def mark_unknown(self, exec_id: int, *, error: Optional[str] = None) -> bool:
+    async def mark_unknown(
+        self, exec_id: int, *, error: Optional[str] = None,
+        lease: Optional[RunExecutionLease] = None,
+    ) -> bool:
         """结果无法确认（F-07/F-08）：禁止自动重放，等待核对。"""
-        return await self._finish(exec_id, TOOL_EXEC_UNKNOWN, error=error)
+        return await self._finish(exec_id, TOOL_EXEC_UNKNOWN, error=error, lease=lease)
 
     async def mark_needs_reconciliation(
-        self, exec_id: int, *, error: Optional[str] = None
+        self, exec_id: int, *, error: Optional[str] = None,
+        lease: Optional[RunExecutionLease] = None,
     ) -> bool:
         return await self._finish(
-            exec_id, TOOL_EXEC_NEEDS_RECONCILIATION, error=error
+            exec_id, TOOL_EXEC_NEEDS_RECONCILIATION, error=error, lease=lease
         )
 
     async def _finish(
@@ -151,7 +190,10 @@ class ToolExecutionRepository:
         result_payload: Optional[Any] = None,
         error: Optional[str] = None,
         external_operation_id: Optional[str] = None,
+        lease: Optional[RunExecutionLease] = None,
     ) -> bool:
+        if lease is not None:
+            await self._verify_lease(lease)
         values: Dict[str, Any] = {
             "status": status,
             "finished_at": datetime.utcnow(),

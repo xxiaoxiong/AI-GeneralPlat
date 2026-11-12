@@ -45,6 +45,7 @@ from .repositories import (
     HEARTBEAT_PAUSED,
     RunRepository,
 )
+from .repositories.errors import RunLeaseLost
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型标注，避免循环导入
     from .service import AgentRuntimeService
@@ -219,6 +220,7 @@ class RunWorker:
         )
         handle.lease_version = row.lease_version
         handle.worker_id = self.worker_id
+        handle.lease_expires_at = row.lease_expires_at
         handle.attempt = row.attempt or 0
         if handle.status == STATUS_PENDING:
             handle.transition(STATUS_RUNNING)
@@ -318,10 +320,17 @@ class RunWorker:
             self._active.pop(handle.run_id, None)
         exc = drive_task.exception() if not drive_task.cancelled() else None
         if exc is not None:
-            logger.critical(
-                "run %s 执行驱动以异常结束（租约将到期后由恢复流程接管）: %r",
-                handle.run_id, exc,
-            )
+            if isinstance(exc, RunLeaseLost):
+                # fencing 拒绝属于受控终止（已发布 run_suspended），不是崩溃
+                logger.warning(
+                    "run %s 执行权丢失，驱动受控终止（由有效 Worker/恢复流程接管）: %r",
+                    handle.run_id, exc,
+                )
+            else:
+                logger.critical(
+                    "run %s 执行驱动以异常结束（租约将到期后由恢复流程接管）: %r",
+                    handle.run_id, exc,
+                )
 
     async def _heartbeat_loop(
         self, handle: RunHandle, lease_version: Optional[int], drive_task: asyncio.Task

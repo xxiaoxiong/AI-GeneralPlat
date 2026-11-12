@@ -54,6 +54,20 @@ class InvalidTransition(Exception):
 
 
 @dataclass
+class RunExecutionLease:
+    """执行权身份（P0-02）。
+
+    一切 Run 状态与 Tool Ledger 写入必须携带并通过校验：
+    Run ID / Worker ID / Lease Version / Lease 未过期（数据库时间比较）。
+    """
+
+    run_id: str
+    worker_id: str
+    lease_version: int
+    lease_expires_at: Optional[datetime] = None
+
+
+@dataclass
 class RunHandle:
     run_id: str
     agent_id: int
@@ -73,6 +87,7 @@ class RunHandle:
     # ── Durable Execution（Phase 2）：租约与执行尝试 ─────────────────────
     lease_version: Optional[int] = None   # 当前持有租约的 fencing token（未持有时为 None）
     worker_id: Optional[str] = None       # 当前租约持有者
+    lease_expires_at: Optional[datetime] = None  # 租约到期时间（数据库时间基准）
     attempt: int = 0                      # 执行尝试次数（与 agent_runs.attempt 同步）
     # 挂起请求：优雅关闭 / 租约丢失时置位——取消执行但不写 cancelled，
     # 保留 running 状态供其他 Worker 经 Checkpoint 恢复
@@ -96,6 +111,17 @@ class RunHandle:
     @property
     def is_terminal(self) -> bool:
         return self.status in TERMINAL_STATUSES
+
+    def execution_lease(self) -> Optional[RunExecutionLease]:
+        """当前执行权身份；未持有时返回 None（P0-02）。"""
+        if not self.worker_id or not self.lease_version:
+            return None
+        return RunExecutionLease(
+            run_id=self.run_id,
+            worker_id=self.worker_id,
+            lease_version=self.lease_version,
+            lease_expires_at=self.lease_expires_at,
+        )
 
 
 class RunRegistry:

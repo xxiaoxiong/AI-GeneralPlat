@@ -38,7 +38,9 @@ from ..events import (
     RuntimeEvent,
     redact_sensitive,
 )
+from ..lifecycle import RunExecutionLease
 from ..repositories import PersistenceError, ToolExecutionRepository
+from ..repositories.errors import RunLeaseLost
 from ..telemetry import telemetry
 from .classification import (
     CLASS_READ_ONLY,
@@ -329,11 +331,22 @@ class ToolAdapterFactory:
             idempotency_key=idempotency_key,
         ))
 
+    def _execution_lease(self) -> Optional[RunExecutionLease]:
+        """当前执行权身份（P0-02 LF-07）：Ledger 写入随带并由仓库校验。"""
+        if self.ctx.worker_id and self.ctx.lease_version:
+            return RunExecutionLease(
+                run_id=self.ctx.run_id,
+                worker_id=self.ctx.worker_id,
+                lease_version=self.ctx.lease_version,
+            )
+        return None
+
     async def _ledger_mark_executing(self, exec_id: int) -> bool:
         return await self._ledger_op(lambda repo: repo.mark_executing(
             exec_id,
             worker_id=self.ctx.worker_id,
             lease_version=self.ctx.lease_version,
+            lease=self._execution_lease(),
         ))
 
     async def _ledger_mark(
@@ -344,14 +357,18 @@ class ToolAdapterFactory:
         error: Optional[str] = None,
         result_payload: Optional[Any] = None,
     ) -> bool:
+        lease = self._execution_lease()
+
         async def op(repo: ToolExecutionRepository) -> bool:
             if status == "succeeded":
-                return await repo.mark_succeeded(exec_id, result_payload=result_payload)
+                return await repo.mark_succeeded(
+                    exec_id, result_payload=result_payload, lease=lease
+                )
             if status == "failed":
-                return await repo.mark_failed(exec_id, error=error)
+                return await repo.mark_failed(exec_id, error=error, lease=lease)
             if status == "unknown":
-                return await repo.mark_unknown(exec_id, error=error)
-            return await repo.mark_needs_reconciliation(exec_id, error=error)
+                return await repo.mark_unknown(exec_id, error=error, lease=lease)
+            return await repo.mark_needs_reconciliation(exec_id, error=error, lease=lease)
 
         return await self._ledger_op(op)
 
@@ -365,7 +382,7 @@ class ToolAdapterFactory:
                 result = await op(repo)
                 await db.commit()
                 return result
-        except PersistenceError:
+        except (PersistenceError, RunLeaseLost):
             raise
         except Exception as e:
             raise ToolLedgerError(f"工具执行账本写入失败: {e}") from e

@@ -33,6 +33,7 @@ from app.services.agent_runtime.lifecycle import (
     STATUS_WAITING_APPROVAL,
     ALLOWED_TRANSITIONS,
     InvalidTransition,
+    RunExecutionLease,
     RunHandle,
     RunRegistry,
 )
@@ -45,6 +46,10 @@ from app.services.agent_runtime.repositories import (
     IdempotencyConflict,
     RunRepository,
     ToolExecutionRepository,
+)
+from app.services.agent_runtime.repositories.errors import (
+    IllegalTransition,
+    RunLeaseLost,
 )
 from app.services.agent_runtime.repositories.tool_execution_repository import (
     TOOL_EXEC_EXECUTING,
@@ -251,7 +256,8 @@ async def test_heartbeat_three_state_semantics():
         await s.commit()
         v1 = await RunRepository(s).claim(run.id, "worker-a", 30)
         assert await RunRepository(s).update_status(
-            run.id, status=STATUS_COMPLETED, lease_version=v1
+            run.id, status=STATUS_COMPLETED,
+            lease=RunExecutionLease(run_id=run.id, worker_id="worker-a", lease_version=v1),
         )
         await s.commit()
         assert await RunRepository(s).heartbeat(run.id, "worker-a", v1, 30) == HEARTBEAT_FINISHED
@@ -263,7 +269,8 @@ async def test_heartbeat_three_state_semantics():
         await s.commit()
         v1 = await RunRepository(s).claim(run.id, "worker-a", 30)
         assert await RunRepository(s).update_status(
-            run.id, status=STATUS_NEEDS_RECONCILIATION, lease_version=v1
+            run.id, status=STATUS_NEEDS_RECONCILIATION,
+            lease=RunExecutionLease(run_id=run.id, worker_id="worker-a", lease_version=v1),
         )
         await s.commit()
         assert await RunRepository(s).heartbeat(run.id, "worker-a", v1, 30) == HEARTBEAT_PAUSED
@@ -286,11 +293,12 @@ async def test_release_invalidates_old_worker():
         v1 = await RunRepository(s).claim(run.id, "worker-a", 30)
         assert await RunRepository(s).release(run.id, "worker-a", v1)
 
-        # release 后旧 fencing token 不能再提交状态（F-13）
-        ok = await RunRepository(s).update_status(
-            run.id, status=STATUS_COMPLETED, lease_version=v1
-        )
-        assert not ok
+        # release 后旧 fencing token 不能再提交状态（F-13 / LF-03）
+        with pytest.raises(RunLeaseLost):
+            await RunRepository(s).update_status(
+                run.id, status=STATUS_COMPLETED,
+                lease=RunExecutionLease(run_id=run.id, worker_id="worker-a", lease_version=v1),
+            )
         row = await RunRepository(s).get_run(run.id)
         assert row.status == STATUS_RUNNING  # 状态未被旧 Worker 篡改
 
@@ -304,8 +312,9 @@ async def test_update_status_fencing_requires_match():
         v1 = await RunRepository(s).claim(run.id, "worker-a", 30)
 
         assert await RunRepository(s).update_status(
-            run.id, status=STATUS_COMPLETED, lease_version=v1, final_text="done",
-            summary={"model_calls": 1}, finished=True,
+            run.id, status=STATUS_COMPLETED,
+            lease=RunExecutionLease(run_id=run.id, worker_id="worker-a", lease_version=v1),
+            final_text="done", summary={"model_calls": 1}, finished=True,
         )
         row = await RunRepository(s).get_run(run.id)
         assert row.status == STATUS_COMPLETED and row.final_text == "done"
@@ -508,7 +517,9 @@ async def test_event_cleanup_only_terminal_and_expired():
         done_run, _ = await _create_run(runs)
         await runs.claim(done_run.id, "w", 30)
         await runs.update_status(
-            done_run.id, status=STATUS_COMPLETED, lease_version=1, finished=True
+            done_run.id, status=STATUS_COMPLETED,
+            lease=RunExecutionLease(run_id=done_run.id, worker_id="w", lease_version=1),
+            finished=True,
         )
         live_run, _ = await _create_run(runs)
         live_run.status = STATUS_WAITING_APPROVAL
@@ -1503,7 +1514,9 @@ async def test_event_retention_cleanup_wired_in_worker():
         old_run, _ = await _create_run(runs)   # 终态但超期
         await runs.claim(old_run.id, "w", 30)
         await runs.update_status(
-            old_run.id, status=STATUS_COMPLETED, lease_version=1, finished=True
+            old_run.id, status=STATUS_COMPLETED,
+            lease=RunExecutionLease(run_id=old_run.id, worker_id="w", lease_version=1),
+            finished=True,
         )
         live_run, _ = await _create_run(runs)  # 仍在运行
         live_run.status = STATUS_WAITING_APPROVAL

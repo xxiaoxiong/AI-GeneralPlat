@@ -65,6 +65,7 @@ from .lifecycle import (
     STATUS_RUNNING,
     STATUS_WAITING_APPROVAL,
     TERMINAL_STATUSES,
+    InvalidTransition,
     RunHandle,
     RunRegistry,
 )
@@ -77,6 +78,7 @@ from .repositories import (
     RunRepository,
     ToolExecutionRepository,
 )
+from .repositories.errors import IllegalTransition, RunLeaseLost
 from .telemetry import telemetry
 from .tools.classification import REPLAY_BLOCK, replay_action
 from .tools.policy import BudgetExceededError, ToolPolicy, ToolPolicyError
@@ -347,6 +349,7 @@ class AgentRuntimeService:
         adapter = LegacyEventAdapter(run_id)
         run.lease_version = row.lease_version
         run.worker_id = self.worker.worker_id
+        run.lease_expires_at = row.lease_expires_at
         run.attempt = row.attempt or run.attempt
         run.transition(STATUS_RUNNING)
 
@@ -368,26 +371,20 @@ class AgentRuntimeService:
     async def cancel_run(self, run_id: str, user_id: int) -> Dict[str, Any]:
         run = self.registry.get(run_id)
         if run is None:
-            # 无内存句柄：按数据库状态取消（pending 可直接取消）
+            # 无内存句柄：按数据库状态取消（pending 走无 Lease 专用 CAS）
             async with AsyncSessionLocal() as db:
-                row = await RunRepository(db).get_run(run_id)
-            if row is None or row.user_id not in (None, user_id):
-                return {"ok": False, "error": "运行不存在"}
-            if row.status in TERMINAL_STATUSES:
-                return {"ok": True, "status": row.status}
-            if row.status == STATUS_PENDING:
-                handle = self.registry.attach(
-                    run_id=row.id,
-                    agent_id=row.agent_id,
-                    session_id=row.session_id,
-                    user_id=row.user_id,
-                    thread_id=row.thread_id,
-                    idempotency_key=row.idempotency_key,
-                    status=row.status,
-                )
-                handle.transition(STATUS_CANCELLED)
-                await self._commit(handle, status=STATUS_CANCELLED, finished=True)
-                return {"ok": True, "status": STATUS_CANCELLED}
+                repo = RunRepository(db)
+                row = await repo.get_run(run_id)
+                if row is None or row.user_id not in (None, user_id):
+                    return {"ok": False, "error": "运行不存在"}
+                if row.status in TERMINAL_STATUSES:
+                    return {"ok": True, "status": row.status}
+                if row.status == STATUS_PENDING:
+                    ok = await repo.cancel_without_lease(run_id)
+                    await db.commit()
+                    if ok:
+                        return {"ok": True, "status": STATUS_CANCELLED}
+                    return {"ok": False, "error": "运行状态已变更（可能已被 Worker 领取），无法直接取消"}
             return {"ok": False, "error": "运行执行中由其他 Worker 持有，无法直接取消"}
         if run.user_id != user_id:
             return {"ok": False, "error": "无权取消该运行"}
@@ -397,10 +394,25 @@ class AgentRuntimeService:
             # _drive 的 CancelledError 分支负责落库 cancelled（fencing 校验）
             run.task.cancel()
             return {"ok": True, "status": "cancelling"}
-        # 等待审批/待执行的运行直接置为取消
-        run.transition(STATUS_CANCELLED)
-        await self._commit(run, status=STATUS_CANCELLED, finished=True)
-        return {"ok": True, "status": run.status}
+        # 无执行权（pending / 等待审批 / 待核对）：无 Lease 专用 CAS（LF-06），
+        # 不得用无条件更新覆盖正在执行的 Run
+        async with AsyncSessionLocal() as db:
+            ok = await RunRepository(db).cancel_without_lease(
+                run_id,
+                from_statuses=(
+                    STATUS_PENDING,
+                    STATUS_WAITING_APPROVAL,
+                    STATUS_NEEDS_RECONCILIATION,
+                ),
+            )
+            await db.commit()
+        if ok:
+            try:
+                run.transition(STATUS_CANCELLED)
+            except InvalidTransition:
+                pass
+            return {"ok": True, "status": STATUS_CANCELLED}
+        return {"ok": False, "error": "运行状态已变更，无法直接取消"}
 
     async def get_run(self, run_id: str, user_id: int) -> Optional[Dict[str, Any]]:
         run = self.registry.get(run_id)
@@ -545,6 +557,7 @@ class AgentRuntimeService:
 
         run.lease_version = claimed.lease_version
         run.worker_id = self.worker.worker_id
+        run.lease_expires_at = claimed.lease_expires_at
         run.attempt = claimed.attempt or 1
         run.transition(STATUS_RUNNING)
         self.worker.supervise(
@@ -843,15 +856,21 @@ class AgentRuntimeService:
                     run.transition(STATUS_CANCELLED)
                 except Exception:
                     pass
+            committed = True
             try:
                 await self._commit(run, status=STATUS_CANCELLED, finished=True)
             except PersistenceError:
                 logger.critical("run %s 取消状态持久化失败", run.run_id, exc_info=True)
-            try:
-                await self._write_back_session(run)  # FR-08.2：终态统一写回
-            except Exception:
-                logger.exception("run %s 取消态会话写回失败", run.run_id)
-            await bus.publish(RuntimeEvent(type=RUN_CANCELLED, run_id=run.run_id))
+            except (RunLeaseLost, IllegalTransition) as e:
+                # 提交被拒：不得谎报 cancelled —— 不写回、不发布取消事件
+                logger.warning("run %s 取消态提交被拒：%s", run.run_id, e)
+                committed = False
+            if committed:
+                try:
+                    await self._write_back_session(run)  # FR-08.2：终态统一写回
+                except Exception:
+                    logger.exception("run %s 取消态会话写回失败", run.run_id)
+                await bus.publish(RuntimeEvent(type=RUN_CANCELLED, run_id=run.run_id))
             raise
         except _RunLimitExceeded as e:
             await self._fail(run, str(e), status=STATUS_LIMIT_EXCEEDED, bus=bus)
@@ -865,6 +884,19 @@ class AgentRuntimeService:
             await self._fail(run, f"模型能力不满足: {e}", status=STATUS_FAILED, bus=bus)
         except ToolPolicyError as e:
             await self._fail(run, f"安全策略拒绝: {e}", status=STATUS_FAILED, bus=bus)
+        except RunLeaseLost as e:
+            # P0-02 E / LF-04：fencing 失败 —— 立即中止推进：
+            # 不写 Session、不发布 RUN_COMPLETED / RUN_FAILED、不产生新副作用，
+            # 保留数据库中当前有效 Worker 的状态；本地流以 run_suspended 边界终止
+            logger.warning("run %s 执行权丢失（fencing 拒绝），中止推进：%s", run.run_id, e)
+            try:
+                await bus.publish(RuntimeEvent(
+                    type=RUN_SUSPENDED, run_id=run.run_id,
+                    data={"reason": "lease_lost"},
+                ))
+            except Exception:
+                logger.exception("run %s 执行权丢失事件发布失败", run.run_id)
+            raise
         except Exception as e:
             logger.exception("run %s 执行失败", run.run_id)
             await self._fail(run, str(e), status=STATUS_FAILED, bus=bus)
@@ -947,13 +979,34 @@ class AgentRuntimeService:
         ))
 
     async def _fail(self, run: RunHandle, error: str, *, status: str, bus: EventBus) -> None:
-        run.error = error
+        """失败路径（P0-02 F）：不得覆盖已提交的终态。
+
+        - Run 已是终态（如 completed 后 Session 写回异常）：直接返回，
+          不写库、不发布 RUN_FAILED（完成态不得降级为 failed）；
+        - 非法状态迁移：不吞掉后继续写库；
+        - 提交被拒（RunLeaseLost / IllegalTransition）：跳过写库与事件发布
+          （数据库 CAS 是最终状态权威）。
+        """
+        if run.is_terminal:
+            logger.warning(
+                "run %s 已处于终态 %s，拒绝降级为 %s（不写库、不发布失败事件）",
+                run.run_id, run.status, status,
+            )
+            return
         try:
             run.transition(status)
-        except Exception:
-            pass
-        # 失败状态必须持久化成功（失败则 PersistenceError 向上抛出）
-        await self._commit(run, status=status, error=error, finished=True)
+        except InvalidTransition as e:
+            logger.warning(
+                "run %s 非法状态迁移 %s -> %s，拒绝写库：%s",
+                run.run_id, run.status, status, e,
+            )
+            return
+        run.error = error
+        try:
+            await self._commit(run, status=status, error=error, finished=True)
+        except (RunLeaseLost, IllegalTransition):
+            # 提交被拒：不写 Session、不发布 RUN_FAILED（不覆盖有效状态）
+            return
         try:
             await self._write_back_session(run)  # FR-08.2：终态统一写回
         except Exception:
@@ -1096,18 +1149,26 @@ class AgentRuntimeService:
         summary: Optional[Dict[str, Any]] = None,
         recovery_error: Optional[str] = None,
         finished: bool = False,
-    ) -> bool:
-        """提交 Run 状态（fencing：lease_version 不匹配则拒绝提交）。
+    ) -> None:
+        """提交 Run 状态（P0-02：全条件 Fencing，失败显式抛出）。
 
-        返回 False 表示租约已易主（旧 Worker 不得继续推进）；
-        数据库异常包装为 PersistenceError 向上抛出（R-12）。
+        - ``RunLeaseLost``：租约易主/过期 —— 调用方必须立即停止推进
+          （不写 Session、不发布终态事件、不产生新副作用）；
+        - ``IllegalTransition``：终态覆盖/非法迁移 —— 不得继续写库；
+        - ``PersistenceError``：数据库异常（R-12）。
+        不再返回易被忽略的布尔值：所有调用点必须显式处理异常。
         """
+        lease = run.execution_lease()
+        if lease is None:
+            raise RunLeaseLost(
+                f"run {run.run_id} 无有效执行权（worker/lease_version 缺失），状态 {status} 提交被拒"
+            )
         try:
             async with AsyncSessionLocal() as db:
-                ok = await RunRepository(db).update_status(
+                await RunRepository(db).update_status(
                     run.run_id,
                     status=status,
-                    lease_version=run.lease_version,
+                    lease=lease,
                     error=error,
                     final_text=final_text,
                     summary=summary,
@@ -1115,16 +1176,16 @@ class AgentRuntimeService:
                     finished=finished,
                 )
                 await db.commit()
+        except (RunLeaseLost, IllegalTransition) as e:
+            logger.warning(
+                "run %s 状态 %s 提交被拒（fencing/状态机）：%s",
+                run.run_id, status, e,
+            )
+            raise
         except PersistenceError:
             raise
         except Exception as e:
             raise PersistenceError(f"run {run.run_id} 状态持久化失败: {e}") from e
-        if not ok:
-            logger.warning(
-                "run %s 状态 %s 提交被拒：租约已易主（lease_version=%s）",
-                run.run_id, status, run.lease_version,
-            )
-        return ok
 
     async def _recovery_check(
         self, row: Any
