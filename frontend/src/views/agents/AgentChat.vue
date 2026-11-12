@@ -158,8 +158,8 @@
               </div>
 
               <!-- 错误信息（即使关闭思考链也显示） -->
-              <div v-if="!showThinking && msg.steps?.some(s => s.type === 'error')" class="error-banner">
-                <span v-for="(step, ei) in msg.steps.filter(s => s.type === 'error')" :key="ei">
+              <div v-if="!showThinking && msg.steps?.some((s: any) => s.type === 'error')" class="error-banner">
+                <span v-for="(step, ei) in msg.steps.filter((s: any) => s.type === 'error')" :key="ei">
                   ⚠️ {{ step.content }}
                 </span>
               </div>
@@ -234,6 +234,26 @@
       </div>
 
       <!-- 输入区 -->
+      <!-- HITL 审批面板：高风险工具等待人工批准 -->
+      <div v-if="pendingApproval" class="approval-panel">
+        <div class="approval-title">⚠️ 需要人工审批</div>
+        <div v-for="(a, i) in pendingApproval.actions" :key="i" class="approval-action">
+          <div class="approval-tool">工具：{{ a.tool }}</div>
+          <div class="approval-desc" v-if="a.description">{{ a.description }}</div>
+          <div class="approval-args" v-if="a.args && Object.keys(a.args).length">
+            参数：{{ JSON.stringify(a.args) }}
+          </div>
+        </div>
+        <div class="approval-buttons">
+          <el-button type="success" size="small" :disabled="streaming" @click="decideApproval('approve')">
+            批准执行
+          </el-button>
+          <el-button type="danger" size="small" plain :disabled="streaming" @click="decideApproval('reject')">
+            拒绝执行
+          </el-button>
+        </div>
+      </div>
+
       <div class="input-area">
         <el-input
           v-model="inputText"
@@ -533,73 +553,7 @@ async function sendMessage() {
 
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
 
-    const reader = response.body!.getReader()
-    const decoder = new TextDecoder()
-    let buffer = ''
-    let finalContent = ''
-    let outerDone = false
-    let clarifySuggestions: string[] = []
-
-    while (!outerDone) {
-      const { done, value } = await reader.read()
-      if (done) break
-
-      buffer += decoder.decode(value, { stream: true })
-      const lines = buffer.split('\n')
-      buffer = lines.pop() || ''
-
-      for (const line of lines) {
-        if (!line.startsWith('data: ')) continue
-        try {
-          const event = JSON.parse(line.slice(6))
-
-          if (event.type === 'done') { outerDone = true; break }
-
-          const cur = messages.value[streamingIdx]
-
-          if (event.type === 'thought') {
-            streamingStatus.value = '💭 思考中...'
-            messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
-          } else if (event.type === 'action') {
-            streamingStatus.value = `⚡ 调用工具: ${event.tool}`
-            messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
-          } else if (event.type === 'observation') {
-            streamingStatus.value = '👁 获取结果...'
-            messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
-          } else if (event.type === 'clarify') {
-            streamingStatus.value = '❓ 追问中...'
-            clarifySuggestions = event.suggestions || []
-            messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
-          } else if (event.type === 'verify') {
-            streamingStatus.value = '🔍 校验中...'
-            messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
-          } else if (event.type === 'final_start') {
-            streamingStatus.value = '✍️ 生成回答...'
-            messages.value[streamingIdx] = { ...cur, streamingAnswer: '' }
-          } else if (event.type === 'final_chunk') {
-            messages.value[streamingIdx] = { ...cur, streamingAnswer: (cur.streamingAnswer || '') + event.content }
-          } else if (event.type === 'final') {
-            finalContent = event.content
-            messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
-          } else if (event.type === 'error') {
-            messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
-          }
-
-          await scrollToBottom()
-        } catch { /* ignore parse errors */ }
-      }
-    }
-
-    // 替换流式消息为最终消息（检查会话是否已切换）
-    if (currentSession.value?.id === sessionIdForThisRequest) {
-      const finalSteps = (messages.value[streamingIdx]?.steps || []).filter((s: any) => s.type !== 'final')
-      messages.value[streamingIdx] = {
-        role: 'assistant',
-        content: finalContent,
-        steps: finalSteps,
-        clarify_suggestions: clarifySuggestions,
-      }
-    }
+    await consumeSse(response, streamingIdx, sessionIdForThisRequest)
 
     // 更新会话列表（反映新的消息数）
     await loadSessions()
@@ -632,6 +586,121 @@ async function sendMessage() {
 function stopGeneration() {
   if (abortController) {
     abortController.abort()
+  }
+}
+
+// ── HITL 审批（DeepAgents 中断 → 批准/拒绝 → 恢复）────────────────────────
+const pendingApproval = ref<null | { runId: string; actions: any[] }>(null)
+
+async function consumeSse(response: Response, streamingIdx: number, sessionIdForThisRequest: number) {
+  const reader = response.body!.getReader()
+  const decoder = new TextDecoder()
+  let buffer = ''
+  let finalContent = ''
+  let outerDone = false
+  let clarifySuggestions: string[] = []
+  let waitingApproval = false
+
+  while (!outerDone) {
+    const { done, value } = await reader.read()
+    if (done) break
+
+    buffer += decoder.decode(value, { stream: true })
+    const lines = buffer.split('\n')
+    buffer = lines.pop() || ''
+
+    for (const line of lines) {
+      if (!line.startsWith('data: ')) continue
+      try {
+        const event = JSON.parse(line.slice(6))
+
+        if (event.type === 'done') {
+          outerDone = true
+          if (event.status === 'waiting_approval') waitingApproval = true
+          break
+        }
+
+        const cur = messages.value[streamingIdx]
+
+        if (event.type === 'thought') {
+          if (event.approval) {
+            pendingApproval.value = { runId: event.approval.run_id, actions: event.approval.actions || [] }
+          }
+          streamingStatus.value = '💭 思考中...'
+          messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
+        } else if (event.type === 'action') {
+          streamingStatus.value = `⚡ 调用工具: ${event.tool}`
+          messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
+        } else if (event.type === 'observation') {
+          streamingStatus.value = '👁 获取结果...'
+          messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
+        } else if (event.type === 'clarify') {
+          streamingStatus.value = '❓ 追问中...'
+          clarifySuggestions = event.suggestions || []
+          messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
+        } else if (event.type === 'verify') {
+          streamingStatus.value = '🔍 校验中...'
+          messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
+        } else if (event.type === 'final_start') {
+          streamingStatus.value = '✍️ 生成回答...'
+          messages.value[streamingIdx] = { ...cur, streamingAnswer: '' }
+        } else if (event.type === 'final_chunk') {
+          messages.value[streamingIdx] = { ...cur, streamingAnswer: (cur.streamingAnswer || '') + event.content }
+        } else if (event.type === 'final') {
+          finalContent = event.content
+          messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
+        } else if (event.type === 'error') {
+          messages.value[streamingIdx] = { ...cur, steps: [...cur.steps, event] }
+        }
+
+        await scrollToBottom()
+      } catch { /* ignore parse errors */ }
+    }
+  }
+
+  // 替换流式消息为最终消息（检查会话是否已切换）
+  if (currentSession.value?.id === sessionIdForThisRequest) {
+    const finalSteps = (messages.value[streamingIdx]?.steps || []).filter((s: any) => s.type !== 'final')
+    messages.value[streamingIdx] = {
+      role: 'assistant',
+      content: waitingApproval ? '⏸ 等待人工审批（见下方审批面板）' : finalContent,
+      steps: finalSteps,
+      clarify_suggestions: clarifySuggestions,
+    }
+  }
+}
+
+async function decideApproval(type: 'approve' | 'reject', message = '') {
+  const info = pendingApproval.value
+  if (!info) return
+  pendingApproval.value = null
+  streaming.value = true
+  streamingStatus.value = type === 'approve' ? '✅ 已批准，恢复执行...' : '❌ 已拒绝，恢复执行...'
+  const streamingIdx = messages.value.length
+  messages.value.push({ role: 'streaming', steps: [], content: '', streamingAnswer: '' })
+  await scrollToBottom()
+  try {
+    const response = await fetch(`/api/v1/agents/runs/${info.runId}/resume`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${localStorage.getItem('access_token')}`,
+      },
+      body: JSON.stringify({ decisions: info.actions.map(() => ({ type, message })) }),
+    })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    await consumeSse(response, streamingIdx, currentSession.value?.id ?? -1)
+    await loadSessions()
+  } catch (e: any) {
+    messages.value[streamingIdx] = {
+      role: 'assistant',
+      content: `恢复执行失败: ${e.message}`,
+      steps: [],
+    }
+    ElMessage.error('恢复执行失败: ' + e.message)
+  } finally {
+    streaming.value = false
+    await scrollToBottom()
   }
 }
 
@@ -1008,6 +1077,19 @@ onMounted(async () => {
 .streaming-answer { position: relative; }
 
 /* 输入区 */
+.approval-panel {
+  margin: 0 20px 12px;
+  padding: 14px 16px;
+  background: #fffbeb;
+  border: 1px solid #fcd34d;
+  border-radius: 10px;
+}
+.approval-title { font-weight: 600; color: #92400e; margin-bottom: 8px; }
+.approval-action { font-size: 13px; color: #78350f; margin-bottom: 6px; }
+.approval-tool { font-weight: 600; }
+.approval-args { font-family: monospace; font-size: 12px; word-break: break-all; color: #a16207; }
+.approval-buttons { margin-top: 10px; }
+
 .input-area {
   padding: 12px 24px 16px;
   background: #fff;

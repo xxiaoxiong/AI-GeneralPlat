@@ -101,7 +101,7 @@ class ModelManager:
                 api_key=provider.api_key or "ollama",
                 base_url=provider.base_url,
                 http_client=httpx.AsyncClient(
-                    verify=False,
+                    verify=(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY),
                     timeout=settings.INFERENCE_REQUEST_TIMEOUT,
                     limits=httpx.Limits(
                         max_connections=settings.INFERENCE_CONCURRENT_REQUESTS * 2,

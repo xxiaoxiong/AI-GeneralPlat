@@ -2,6 +2,7 @@ from typing import AsyncGenerator, Dict, Any, Tuple
 from openai import AsyncOpenAI
 import httpx
 
+from app.core.config import settings
 from app.models.model_provider import ModelProvider, ModelConfig
 from app.schemas.model_provider import ChatRequest
 
@@ -13,7 +14,10 @@ class ModelService:
         return AsyncOpenAI(
             api_key=provider.api_key or "ollama",
             base_url=provider.base_url,
-            http_client=httpx.AsyncClient(verify=False, timeout=120),
+            http_client=httpx.AsyncClient(
+                verify=(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY),
+                timeout=120,
+            ),
         )
 
     @staticmethod

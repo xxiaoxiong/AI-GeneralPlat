@@ -89,6 +89,26 @@ class Settings(BaseSettings):
     CHECKPOINT_ENABLED: bool = True             # 启用断点续跑
     CHECKPOINT_DIR: str = "./data/checkpoints"  # 断点存储目录
 
+    # ── DeepAgents Runtime（阶段一新内核）────────────────────────────────────
+    AGENT_RUNTIME_ENABLED: bool = True          # 回滚开关：False 时走旧引擎路径
+    AGENT_MAX_STEPS: int = 20                   # 图执行最大步数
+    AGENT_MAX_TOOL_CALLS: int = 30              # 工具调用总次数预算
+    AGENT_MAX_MODEL_CALLS: int = 30             # 模型调用次数预算
+    AGENT_RUN_TIMEOUT: float = 300.0            # 单次运行墙钟超时（秒）
+    AGENT_CHECKPOINT_DSN: str = "memory"        # memory | sqlite:///./data/agent_checkpoints.db | postgresql+asyncpg://...
+    AGENT_STORE_DSN: str = ""                   # 跨线程记忆 Store（空=不启用）
+    AGENT_ENABLE_HITL: bool = True              # 人工审批（高危工具 interrupt_on）
+    AGENT_SANDBOX_MODE: str = "restricted"      # restricted / disabled / external（disabled 时禁用高危执行工具）
+    AGENT_ALLOW_NETWORK: bool = True            # 允许工具网络访问
+    AGENT_TLS_VERIFY: bool = True               # TLS 证书校验（禁止生产关闭）
+    AGENT_CA_BUNDLE: str = ""                   # 自定义 CA 证书路径（内网自签）
+    AGENT_NETWORK_ALLOWLIST: str = ""           # 逗号分隔受信任主机；配置后仅允许名单内（可含内网）
+    AGENT_NETWORK_BLOCKED_CIDRS: str = ""       # 逗号分隔封禁网段
+    AGENT_FILES_ROOT: str = "./data/agent_files"  # 工具文件工作区根目录
+    AGENT_MAX_FILE_SIZE_MB: int = 10            # 单文件大小上限
+    AGENT_DISABLED_SKILLS: str = ""             # 逗号分隔禁用的 skill 名
+    AGENT_EVENT_RETENTION_DAYS: int = 30        # 运行记录保留天数
+
     @property
     def cors_origins_list(self) -> List[str]:
         return json.loads(self.CORS_ORIGINS)

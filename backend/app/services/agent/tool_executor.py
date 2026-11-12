@@ -345,7 +345,7 @@ class EnhancedToolExecutor:
         method = tool_config.get("method", "GET").upper()
         for k, v in params.items():
             url = url.replace(f"{{{k}}}", str(v))
-        async with httpx.AsyncClient(timeout=15, verify=False) as client:
+        async with httpx.AsyncClient(timeout=15, verify=(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY)) as client:
             resp = await client.get(url) if method == "GET" else await client.post(url, json=params)
         try:
             return json.dumps(resp.json(), ensure_ascii=False)[:2000]

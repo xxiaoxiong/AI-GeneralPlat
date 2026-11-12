@@ -12,10 +12,12 @@ from sqlalchemy.orm.attributes import flag_modified
 from pydantic import BaseModel
 
 from app.core.database import get_db, AsyncSessionLocal
+from app.core.config import settings
 from app.api.deps import get_current_user
 from app.models.user import User
 from app.models.agent import Agent, AgentSession
 from app.services.agent import AgentEngine
+from app.services.agent_runtime import get_runtime_service
 from app.services.tools import BUILTIN_TOOLS
 
 logger = logging.getLogger(__name__)
@@ -181,7 +183,7 @@ async def get_agent(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    agent = await _get_or_404(db, agent_id)
+    agent = await _get_or_404(db, agent_id, current_user)
     return _agent_to_dict(agent)
 
 
@@ -192,7 +194,7 @@ async def update_agent(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    agent = await _get_or_404(db, agent_id)
+    agent = await _get_or_404(db, agent_id, current_user)
     for field, val in body.dict().items():
         setattr(agent, field, val)
     await db.commit()
@@ -206,7 +208,7 @@ async def delete_agent(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    agent = await _get_or_404(db, agent_id)
+    agent = await _get_or_404(db, agent_id, current_user)
     agent.is_active = False
     await db.commit()
     return {"message": "已删除"}
@@ -220,7 +222,7 @@ async def list_sessions(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    await _get_or_404(db, agent_id)
+    await _get_or_404(db, agent_id, current_user)
     res = await db.execute(
         select(AgentSession)
         .where(AgentSession.agent_id == agent_id, AgentSession.user_id == current_user.id)
@@ -237,7 +239,7 @@ async def create_session(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    await _get_or_404(db, agent_id)
+    await _get_or_404(db, agent_id, current_user)
     session = AgentSession(agent_id=agent_id, user_id=current_user.id, messages=[])
     db.add(session)
     await db.commit()
@@ -274,7 +276,11 @@ async def delete_session(
     current_user: User = Depends(get_current_user),
 ):
     res = await db.execute(
-        select(AgentSession).where(AgentSession.id == session_id, AgentSession.agent_id == agent_id)
+        select(AgentSession).where(
+            AgentSession.id == session_id,
+            AgentSession.agent_id == agent_id,
+            AgentSession.user_id == current_user.id,
+        )
     )
     session = res.scalar_one_or_none()
     if not session:
@@ -293,16 +299,21 @@ async def agent_chat(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    agent = await _get_or_404(db, agent_id)
+    agent = await _get_or_404(db, agent_id, current_user)
     agent_config = _agent_to_dict(agent)
 
-    # 加载或创建会话
+    # 加载或创建会话（仅限当前用户的会话）
     session = None
     if body.session_id:
         res = await db.execute(
-            select(AgentSession).where(AgentSession.id == body.session_id)
+            select(AgentSession).where(
+                AgentSession.id == body.session_id,
+                AgentSession.user_id == current_user.id,
+            )
         )
         session = res.scalar_one_or_none()
+        if not session:
+            raise HTTPException(status_code=404, detail="会话不存在")
 
     if not session:
         session = AgentSession(agent_id=agent_id, user_id=current_user.id, messages=[])
@@ -379,12 +390,26 @@ async def agent_chat(
         # 非流式：收集所有步骤后返回
         steps = []
         final_content = ""
-        async for event in AgentEngine.run_stream(agent_config, messages, db):
-            if event["type"] == "done":
-                break
-            steps.append(event)
-            if event["type"] == "final":
-                final_content = event["content"]
+        if settings.AGENT_RUNTIME_ENABLED:
+            result = await get_runtime_service().run_to_completion(
+                agent_config=agent_config,
+                messages=messages,
+                user_id=current_user.id,
+                session_id=session.id,
+                use_memory_context=agent_config.get("_memory_context", ""),
+                db_info=agent_config.get("_db_info"),
+            )
+            steps = result["steps"]
+            final_content = result["content"]
+            if result["status"] != "completed":
+                steps = steps + [{"type": "error", "content": f"运行状态: {result['status']}"}]
+        else:
+            async for event in AgentEngine.run_stream(agent_config, messages, db):
+                if event["type"] == "done":
+                    break
+                steps.append(event)
+                if event["type"] == "final":
+                    final_content = event["content"]
 
         # 保存到会话（使用独立会话，避免引擎污染）
         messages.append({"role": "assistant", "content": final_content, "steps": steps})
@@ -403,11 +428,29 @@ async def agent_chat(
         return {"session_id": session.id, "steps": steps, "content": final_content}
 
     # 流式 SSE
+    runtime_stream = None
+    run_id = None
+    if settings.AGENT_RUNTIME_ENABLED:
+        # 先启动运行拿到 run_id，供响应头 X-Run-Id（重连/状态查询用）
+        run_id, runtime_stream = await get_runtime_service().start_run(
+            agent_config=agent_config,
+            messages=messages,
+            user_id=current_user.id,
+            session_id=session.id,
+            use_memory_context=agent_config.get("_memory_context", ""),
+            db_info=agent_config.get("_db_info"),
+        )
+
     async def event_stream():
         collected_steps = []
         final_content = ""
 
-        async for event in AgentEngine.run_stream(agent_config, messages, db):
+        if settings.AGENT_RUNTIME_ENABLED:
+            stream = runtime_stream
+        else:
+            stream = AgentEngine.run_stream(agent_config, messages, db)
+
+        async for event in stream:
             collected_steps.append(event)
             if event["type"] == "final":
                 final_content = event["content"]
@@ -443,14 +486,17 @@ async def agent_chat(
             data = json.dumps(event, ensure_ascii=False)
             yield f"data: {data}\n\n"
 
+    headers = {
+        "Cache-Control": "no-cache",
+        "X-Accel-Buffering": "no",
+        "X-Session-Id": str(session.id),
+    }
+    if run_id:
+        headers["X-Run-Id"] = run_id
     return StreamingResponse(
         event_stream(),
         media_type="text/event-stream",
-        headers={
-            "Cache-Control": "no-cache",
-            "X-Accel-Buffering": "no",
-            "X-Session-Id": str(session.id),
-        },
+        headers=headers,
     )
 
 
@@ -464,26 +510,122 @@ async def invoke_agent(
     current_user: User = Depends(get_current_user),
 ):
     """供工作流引擎调用的同步接口"""
-    agent = await _get_or_404(db, agent_id)
+    agent = await _get_or_404(db, agent_id, current_user)
     agent_config = _agent_to_dict(agent)
     user_input = body.get("input", "")
     messages = [{"role": "user", "content": user_input}]
 
     steps = []
     final_content = ""
-    async for event in AgentEngine.run_stream(agent_config, messages, db):
-        if event["type"] == "done":
-            break
-        steps.append(event)
-        if event["type"] == "final":
-            final_content = event["content"]
+    run_status = "completed"
+    run_id = None
+    if settings.AGENT_RUNTIME_ENABLED:
+        result = await get_runtime_service().run_to_completion(
+            agent_config=agent_config,
+            messages=messages,
+            user_id=current_user.id,
+            use_memory_context="",
+            db_info=agent_config.get("_db_info"),
+        )
+        steps = result["steps"]
+        final_content = result["content"]
+        run_status = result["status"]
+        run_id = result.get("run_id")
+    else:
+        async for event in AgentEngine.run_stream(agent_config, messages, db):
+            if event["type"] == "done":
+                break
+            steps.append(event)
+            if event["type"] == "final":
+                final_content = event["content"]
 
     return {
-        "status": "ok",
+        "status": "ok" if run_status == "completed" else run_status,
         "content": final_content,
         "steps": steps,
         "iterations": len([s for s in steps if s["type"] == "thought"]),
+        "run_id": run_id,
     }
+
+
+# ── 运行控制（DeepAgents Runtime：取消 / 审批 / 恢复 / 状态）───────────────────
+
+class ApprovalDecision(BaseModel):
+    type: str = "approve"    # approve / reject
+    message: str = ""
+
+
+class ResumeRequest(BaseModel):
+    decisions: List[ApprovalDecision]
+
+
+@router.get("/runs/{run_id}")
+async def get_run_status(
+    run_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """查询运行状态（SSE 断连后重连 / 轮询用）"""
+    info = await get_runtime_service().get_run(run_id, current_user.id)
+    if not info:
+        raise HTTPException(status_code=404, detail="运行不存在")
+    return info
+
+
+@router.post("/runs/{run_id}/cancel")
+async def cancel_run(
+    run_id: str,
+    current_user: User = Depends(get_current_user),
+):
+    """取消运行（区分用户主动取消与失败）"""
+    result = await get_runtime_service().cancel_run(run_id, current_user.id)
+    if not result.get("ok"):
+        raise HTTPException(status_code=400, detail=result.get("error", "取消失败"))
+    return result
+
+
+@router.post("/runs/{run_id}/resume")
+async def resume_run(
+    run_id: str,
+    body: ResumeRequest,
+    current_user: User = Depends(get_current_user),
+):
+    """HITL 审批后恢复运行：返回 SSE 流（与 /chat 相同事件契约）"""
+    decisions = [{"type": d.type, "message": d.message} for d in body.decisions]
+
+    async def event_stream():
+        async for event in get_runtime_service().resume_run(run_id, decisions, current_user.id):
+            data = json.dumps(event, ensure_ascii=False)
+            yield f"data: {data}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Run-Id": run_id},
+    )
+
+
+@router.post("/runs/{run_id}/approve")
+async def approve_run(
+    run_id: str,
+    body: ResumeRequest = None,
+    current_user: User = Depends(get_current_user),
+):
+    """便捷审批：默认全部批准"""
+    decisions = (
+        [{"type": d.type, "message": d.message} for d in body.decisions]
+        if body else [{"type": "approve", "message": ""}]
+    )
+
+    async def event_stream():
+        async for event in get_runtime_service().resume_run(run_id, decisions, current_user.id):
+            data = json.dumps(event, ensure_ascii=False)
+            yield f"data: {data}\n\n"
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Run-Id": run_id},
+    )
 
 
 # ── 辅助函数 ──────────────────────────────────────────────────────────────────
@@ -509,10 +651,13 @@ async def _save_session(session_id: int, messages: list, new_title: str = None):
         logger.error(f"会话 {session_id} 保存失败: {e}", exc_info=True)
 
 
-async def _get_or_404(db: AsyncSession, agent_id: int) -> Agent:
+async def _get_or_404(db: AsyncSession, agent_id: int, current_user: User = None) -> Agent:
     res = await db.execute(select(Agent).where(Agent.id == agent_id, Agent.is_active == True))
     agent = res.scalar_one_or_none()
     if not agent:
+        raise HTTPException(status_code=404, detail="Agent 不存在")
+    # 所有权校验：非公开 Agent 仅所有者可见/可操作
+    if current_user is not None and agent.owner_id not in (None, current_user.id):
         raise HTTPException(status_code=404, detail="Agent 不存在")
     return agent
 

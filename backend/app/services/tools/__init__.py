@@ -111,7 +111,8 @@ class ToolExecutor:
         method = tool_config.get("method", "GET").upper()
         for k, v in params.items():
             url = url.replace(f"{{{k}}}", str(v))
-        async with httpx.AsyncClient(timeout=15, verify=False) as client:
+        from app.core.config import settings as _settings
+        async with httpx.AsyncClient(timeout=15, verify=(_settings.AGENT_CA_BUNDLE or _settings.AGENT_TLS_VERIFY)) as client:
             resp = await client.get(url) if method == "GET" else await client.post(url, json=params)
         try:
             return json.dumps(resp.json(), ensure_ascii=False)[:2000]

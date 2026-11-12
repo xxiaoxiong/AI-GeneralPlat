@@ -198,7 +198,9 @@ class KnowledgeService:
                         if stripped:
                             self.texts.append(stripped)
 
-            async with httpx.AsyncClient(timeout=15, verify=False,
+            from app.core.config import settings as _settings
+            async with httpx.AsyncClient(timeout=15,
+                                         verify=(_settings.AGENT_CA_BUNDLE or _settings.AGENT_TLS_VERIFY),
                                          headers={"User-Agent": "Mozilla/5.0"}) as client:
                 resp = await client.get(url)
                 resp.raise_for_status()

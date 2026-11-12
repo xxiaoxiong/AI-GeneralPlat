@@ -52,3 +52,42 @@ class AgentSession(Base):
 
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AgentRun(Base):
+    """一次 Agent 执行实例（LangGraph thread 上的运行记录）"""
+    __tablename__ = "agent_runs"
+
+    id = Column(String(36), primary_key=True)          # run_id (uuid4 hex)
+    agent_id = Column(Integer, ForeignKey("agents.id"), nullable=False, index=True)
+    session_id = Column(Integer, ForeignKey("agent_sessions.id"), nullable=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=True, index=True)
+    thread_id = Column(String(128), nullable=False, index=True)
+
+    status = Column(String(24), default="pending", index=True)
+    # pending / running / waiting_approval / completed / failed / cancelled / limit_exceeded
+
+    idempotency_key = Column(String(128), nullable=True, index=True)
+    error = Column(Text, nullable=True)
+    final_text = Column(Text, nullable=True)
+    summary = Column(JSON, nullable=True)              # 工具调用数、耗时等
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    finished_at = Column(DateTime, nullable=True)
+
+
+class AgentApproval(Base):
+    """HITL 审批记录"""
+    __tablename__ = "agent_approvals"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    run_id = Column(String(36), ForeignKey("agent_runs.id"), nullable=False, index=True)
+    tool_name = Column(String(100), nullable=False)
+    action_summary = Column(Text, nullable=True)       # 脱敏后的参数摘要
+    decision = Column(String(24), nullable=True)       # approve / reject / timeout
+    decided_by = Column(Integer, ForeignKey("users.id"), nullable=True)
+    message = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    decided_at = Column(DateTime, nullable=True)
