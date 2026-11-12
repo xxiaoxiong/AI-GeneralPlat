@@ -26,6 +26,7 @@ from langgraph.errors import GraphRecursionError
 from langgraph.types import Command
 
 from app.core.config import settings
+from app.models.agent import AgentRun as AgentRunRow, AgentSession
 from app.core.database import AsyncSessionLocal
 
 from .context import (
@@ -75,11 +76,14 @@ from .persistence import CheckpointerFactory, make_run_config, make_thread_id
 from .repositories import (
     EventRepository,
     IdempotencyConflict,
+    OUTBOX_DELIVERED,
     PersistenceError,
     RunRepository,
+    SessionOutboxRepository,
+    SessionRepository,
     ToolExecutionRepository,
 )
-from .repositories.errors import IllegalTransition, RunLeaseLost
+from .repositories.errors import IllegalTransition, RunLeaseLost, SessionBusy
 from .telemetry import telemetry
 from .tools.classification import (
     CHECKPOINT_MISSING,
@@ -202,6 +206,8 @@ class AgentRuntimeService:
         idempotency_key: Optional[str] = None,
         use_memory_context: str = "",
         db_info: Optional[Dict[str, Any]] = None,
+        endpoint: str = "chat",
+        user_message: Optional[Dict[str, Any]] = None,
     ) -> Tuple[str, AsyncGenerator[Dict[str, Any], None]]:
         """启动运行并返回 (run_id, 事件流)：run_id 可先行写入响应头（X-Run-Id）。"""
         run, _adapter, stream = await self._start(
@@ -212,8 +218,78 @@ class AgentRuntimeService:
             idempotency_key=idempotency_key,
             use_memory_context=use_memory_context,
             db_info=db_info,
+            endpoint=endpoint,
+            user_message=user_message,
         )
         return run.run_id, stream
+
+    async def start_run_with_session(
+        self,
+        *,
+        agent_config: Dict[str, Any],
+        messages: List[Dict[str, Any]],
+        user_id: int,
+        session_id: Optional[int] = None,
+        idempotency_key: Optional[str] = None,
+        use_memory_context: str = "",
+        db_info: Optional[Dict[str, Any]] = None,
+        endpoint: str = "chat",
+        user_message: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[str, Optional[int], AsyncGenerator[Dict[str, Any], None]]:
+        """启动运行并返回 (run_id, session_id, 事件流)。
+
+        session_id 为业务事务内解析后的会话 ID（未指定时由服务创建），
+        供 API 写入 X-Session-Id 响应头。
+        """
+        run, _adapter, stream = await self._start(
+            agent_config=agent_config,
+            messages=messages,
+            user_id=user_id,
+            session_id=session_id,
+            idempotency_key=idempotency_key,
+            use_memory_context=use_memory_context,
+            db_info=db_info,
+            endpoint=endpoint,
+            user_message=user_message,
+        )
+        return run.run_id, run.session_id, stream
+
+    async def lookup_idempotent(
+        self,
+        user_id: Optional[int],
+        idempotency_key: str,
+        request_hash: str,
+    ):
+        """幂等预查（P1-01：收敛到 Service/Repository，API 不再裸查）。
+
+        - 同 Key 同请求摘要：返回已有 Run 行（调用方复用，不重复执行/追加消息）；
+        - 同 Key 不同请求摘要：抛 ``IdempotencyConflict``（API 映射 HTTP 409）。
+        """
+        async with AsyncSessionLocal() as db:
+            existing = await RunRepository(db).get_by_idempotency_key(
+                user_id, idempotency_key
+            )
+            if existing is None:
+                return None
+            return RunRepository._check_reuse(existing, request_hash)
+
+    async def idempotent_replay_stream(
+        self, run_id: str
+    ) -> AsyncGenerator[Dict[str, Any], None]:
+        """幂等命中的 SSE 回放流（P1-01）：按持久化事件重建旧契约事件。
+
+        流式请求重试命中幂等时必须保持 SSE 协议（FR-01），不得改为普通
+        JSON；回放以 ``done`` 终止（运行未终结时按当前状态合成终止事件，
+        后续进度可经 /runs/{run_id}/events 获取）。
+        """
+        ended = False
+        async for legacy in self.replay_events(run_id):
+            ended = ended or legacy.get("type") == "done"
+            yield legacy
+        if not ended:
+            async with AsyncSessionLocal() as db:
+                row = await RunRepository(db).get_run(run_id)
+            yield {"type": "done", "status": row.status if row is not None else "failed"}
 
     async def stream_run(
         self,
@@ -249,8 +325,10 @@ class AgentRuntimeService:
         idempotency_key: Optional[str] = None,
         use_memory_context: str = "",
         db_info: Optional[Dict[str, Any]] = None,
+        endpoint: str = "chat",
+        user_message: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
-        """非流式执行：返回 {status, content, steps, run_id}。"""
+        """非流式执行：返回 {status, content, steps, run_id, session_id}。"""
         run, _adapter, stream = await self._start(
             agent_config=agent_config,
             messages=messages,
@@ -259,6 +337,8 @@ class AgentRuntimeService:
             idempotency_key=idempotency_key,
             use_memory_context=use_memory_context,
             db_info=db_info,
+            endpoint=endpoint,
+            user_message=user_message,
         )
         steps: List[Dict[str, Any]] = []
         content = ""
@@ -275,6 +355,7 @@ class AgentRuntimeService:
             "content": content,
             "steps": steps,
             "run_id": run.run_id,
+            "session_id": run.session_id,
         }
 
     async def resume_run(
@@ -387,6 +468,11 @@ class AgentRuntimeService:
                     return {"ok": True, "status": row.status}
                 if row.status == STATUS_PENDING:
                     ok = await repo.cancel_without_lease(run_id)
+                    if ok and row.session_id:
+                        # 无 Lease 取消也要释放 Session 执行权（P1-02）
+                        await SessionRepository(db).release_execution(
+                            row.session_id, run_id
+                        )
                     await db.commit()
                     if ok:
                         return {"ok": True, "status": STATUS_CANCELLED}
@@ -411,6 +497,11 @@ class AgentRuntimeService:
                     STATUS_NEEDS_RECONCILIATION,
                 ),
             )
+            if ok and run.session_id:
+                # 无 Lease 取消也要释放 Session 执行权（P1-02）
+                await SessionRepository(db).release_execution(
+                    run.session_id, run_id
+                )
             await db.commit()
         if ok:
             try:
@@ -503,45 +594,48 @@ class AgentRuntimeService:
         idempotency_key: Optional[str] = None,
         use_memory_context: str = "",
         db_info: Optional[Dict[str, Any]] = None,
+        endpoint: str = "chat",
+        user_message: Optional[Dict[str, Any]] = None,
     ) -> Tuple[RunHandle, LegacyEventAdapter, AsyncGenerator[Dict[str, Any], None]]:
         """创建 Run（DB pending）→ Worker CAS Claim → 执行；返回句柄、适配器与旧契约事件流。
 
-        幂等：同一幂等键同一请求摘要返回已有 Run（绝不重复执行）；
-        同一幂等键不同请求摘要抛 IdempotencyConflict。
+        幂等（P1-01 收敛 Service/Repository）：同一幂等键同一请求摘要返回已有
+        Run（绝不重复执行、不重复追加用户消息）；同一幂等键不同请求摘要抛
+        IdempotencyConflict（API 映射 409）。新 Session 创建、用户消息追加与
+        Run 创建同一事务提交，并发幂等重试不产生孤立 Session。
         """
-        thread_id = make_thread_id(agent_config["id"], session_id, uuid.uuid4().hex)
-        run_id = uuid.uuid4().hex
         snapshot = {k: v for k, v in (agent_config or {}).items() if not k.startswith("_")}
-        request_hash = _request_hash(
-            agent_config, messages, user_id, session_id, use_memory_context, db_info
-        )
         input_payload = {
             "messages": messages,
             "use_memory_context": use_memory_context,
             "db_info": db_info,
         }
 
-        async with AsyncSessionLocal() as db:
-            repo = RunRepository(db)
-            row, created = await repo.create_run(
-                run_id=run_id,
-                agent_id=agent_config["id"],
-                session_id=session_id,
+        row, created, resolved_session_id = await self._begin_run(
+            agent_config=agent_config,
+            user_id=user_id,
+            session_id=session_id,
+            idempotency_key=idempotency_key,
+            request_hash=compute_request_hash(
+                endpoint=endpoint,
                 user_id=user_id,
-                thread_id=thread_id,
-                idempotency_key=idempotency_key,
-                request_hash=request_hash,
-                input_payload=input_payload,
-                agent_config_snapshot=snapshot,
-            )
-            await db.commit()
-            run_id = row.id
-            thread_id = row.thread_id
+                agent_id=agent_config.get("id"),
+                session_id=session_id,
+                user_input=(user_message or {}).get("content")
+                or _last_user_input(messages),
+                agent_config=agent_config,
+            ),
+            input_payload=input_payload,
+            snapshot=snapshot,
+            user_message=user_message,
+        )
+        run_id = row.id
+        thread_id = row.thread_id
 
         run = self.registry.attach(
             run_id=run_id,
             agent_id=agent_config["id"],
-            session_id=session_id,
+            session_id=resolved_session_id,
             user_id=user_id,
             thread_id=thread_id,
             idempotency_key=idempotency_key,
@@ -558,7 +652,8 @@ class AgentRuntimeService:
         assert self.worker is not None
         claimed = await self.worker.claim_run(run_id)
         if claimed is None:
-            # 极小概率被其他 Worker 先行领取：退化为数据库回放流，不重复执行
+            # 极小概率被其他 Worker 先行领取（或 Session 执行权被占）：
+            # 退化为数据库回放流，不重复执行
             return run, adapter, self._replay_db_stream(run_id, run, adapter)
 
         run.lease_version = claimed.lease_version
@@ -579,6 +674,97 @@ class AgentRuntimeService:
             ),
         )
         return run, adapter, self._bus_stream(run, adapter)
+
+    async def _begin_run(
+        self,
+        *,
+        agent_config: Dict[str, Any],
+        user_id: int,
+        session_id: Optional[int],
+        idempotency_key: Optional[str],
+        request_hash: Optional[str],
+        input_payload: Dict[str, Any],
+        snapshot: Dict[str, Any],
+        user_message: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[AgentRunRow, bool, Optional[int]]:
+        """业务事务（P1-01/P1-02）：幂等预查 + Session 创建 + 用户消息追加
+        + Run 创建 + Session 执行权 Claim，单事务原子提交。
+
+        - 幂等命中（同 Key 同摘要）：返回原 Run，不触碰 Session/消息；
+        - 同 Key 不同摘要：``IdempotencyConflict``（API 映射 409）；
+        - 并发同 Key：后到者在 Run 唯一约束上收敛为复用，同一事务回滚，
+          不产生孤立 Session、不重复追加用户消息；
+        - Session 执行权 CAS 失败：整事务回滚并抛 ``SessionBusy``（明确冲突）。
+        """
+        async with AsyncSessionLocal() as db:
+            repo = RunRepository(db)
+            sess_repo = SessionRepository(db)
+
+            # 1) 幂等命中：同摘要复用原 Run，绝不重复执行/追加用户消息
+            if idempotency_key:
+                existing = await repo.get_by_idempotency_key(user_id, idempotency_key)
+                if existing is not None:
+                    checked = RunRepository._check_reuse(existing, request_hash)
+                    return checked, False, checked.session_id
+
+            # 2) Session 定位 / 创建（与 Run 创建同事务）
+            resolved_session_id = session_id
+            if resolved_session_id is None and user_message is not None:
+                new_sess = AgentSession(
+                    agent_id=agent_config["id"],
+                    user_id=user_id,
+                    messages=[],
+                )
+                db.add(new_sess)
+                await db.flush()
+                resolved_session_id = new_sess.id
+
+            # 3) 用户消息追加（稳定 message_id + version 乐观锁合并；与 Run 原子）
+            if user_message is not None and resolved_session_id is not None:
+                content = str(user_message.get("content") or "")
+                await sess_repo.append_messages(
+                    resolved_session_id,
+                    [{
+                        "message_id": uuid.uuid4().hex,
+                        "role": user_message.get("role") or "user",
+                        "content": content,
+                        "created_at": datetime.utcnow().isoformat(),
+                    }],
+                    title=content[:50] if content else None,
+                )
+
+            # 4) Run 创建（幂等唯一约束兜底并发；thread_id 随解析后的 Session 生成）
+            thread_id = make_thread_id(
+                agent_config["id"], resolved_session_id, uuid.uuid4().hex
+            )
+            row, created = await repo.create_run(
+                run_id=uuid.uuid4().hex,
+                agent_id=agent_config["id"],
+                session_id=resolved_session_id,
+                user_id=user_id,
+                thread_id=thread_id,
+                idempotency_key=idempotency_key,
+                request_hash=request_hash,
+                input_payload=input_payload,
+                agent_config_snapshot=snapshot,
+            )
+            if not created:
+                # 并发幂等重试收敛（create_run 冲突路径已 rollback 本事务）：
+                # 返回既有 Run，不重复执行、Session 创建/消息追加随回滚撤销
+                return row, False, row.session_id
+
+            # 5) Session 执行权原子 Claim（P1-02 A：单 Session 单活跃 Run）
+            if resolved_session_id is not None:
+                ok = await sess_repo.claim_execution(
+                    resolved_session_id, row.id, self.worker.lease_seconds
+                )
+                if not ok:
+                    raise SessionBusy(
+                        f"session {resolved_session_id} 有正在执行的 Run，请稍后重试"
+                    )
+
+            await db.commit()
+            return row, True, resolved_session_id
 
     async def _bus_stream(
         self, run: RunHandle, adapter: LegacyEventAdapter
@@ -824,7 +1010,11 @@ class AgentRuntimeService:
                     summary=run.summary,
                     finished=True,
                 )
-                await self._write_back_session(run)  # FR-08.2：Runtime 统一写回
+                try:
+                    await self._write_back_session(run)  # FR-08.2：Runtime 统一写回
+                except Exception:
+                    # P1-02 C：写回失败不改变 Run 终态、不影响事件流（Outbox 重试）
+                    logger.exception("run %s 完成态会话写回失败", run.run_id)
                 await bus.publish(RuntimeEvent(
                     type=RUN_COMPLETED,
                     run_id=run.run_id,
@@ -1034,42 +1224,100 @@ class AgentRuntimeService:
         ]
 
     async def _write_back_session(self, run: RunHandle) -> None:
-        """FR-08.2：Assistant 最终结果由 Runtime 统一写回 Session。
+        """FR-08.2 + P1-02 C：Assistant 最终结果经 Outbox 写回 Session。
 
-        Run 进入终态（completed/failed/cancelled/limit_exceeded）时写回一次
-        assistant 消息（content=run.final_text，steps=持久化事件重建的旧契约轨迹）。
-        客户端断线不再丢失写回。写回失败向上抛出（Completion 路径调用方
-        先已持久化 Run 结果，失败态路径调用方仅记日志）。
+        Run 终态与写回解耦：终态提交时已同事务入队 ``SessionResultOutbox``，
+        本方法执行实际写回——按 ``source_run_id`` 去重 + ``version`` 乐观锁合并，
+        写回与 ``mark_delivered`` 同事务提交（重试不会重复追加 Assistant 消息）。
+        写回失败仅增加 ``attempts`` 并保留 pending（Outbox Worker 重试，服务
+        重启后可恢复），绝不改变 Run 终态。写回失败向上抛出（Completion 路径
+        调用方先已持久化 Run 结果，失败态路径调用方仅记日志）。
         """
-        if not run.session_id:
-            return
-        from sqlalchemy import select
-        from sqlalchemy.orm.attributes import flag_modified
+        await self._deliver_outbox(run.run_id)
 
-        from app.models.agent import AgentSession
+    async def _deliver_outbox(self, run_id: str) -> None:
+        """按 Outbox 记录执行一次 Session 写回（幂等、可重试）。"""
+        async with AsyncSessionLocal() as db:
+            outbox = await SessionOutboxRepository(db).get_by_run(run_id)
+            row = await RunRepository(db).get_run(run_id)
+
+        if outbox is not None and outbox.status == OUTBOX_DELIVERED:
+            return  # 已写回：幂等跳过
+        session_id = row.session_id if row is not None else (
+            outbox.session_id if outbox is not None else None
+        )
+        if session_id is None:
+            if outbox is not None:
+                async with AsyncSessionLocal() as db:
+                    await SessionOutboxRepository(db).mark_delivered(run_id)
+                    await db.commit()
+            return
 
         steps: List[Dict[str, Any]] = []
-        async for legacy in self.replay_events(run.run_id):
+        async for legacy in self.replay_events(run_id):
             if legacy.get("type") != "done":
                 steps.append(legacy)
 
+        try:
+            async with AsyncSessionLocal() as db:
+                await SessionRepository(db).append_messages(
+                    session_id,
+                    [{
+                        "message_id": uuid.uuid4().hex,
+                        "role": "assistant",
+                        "content": (row.final_text or "") if row is not None else "",
+                        "steps": steps,
+                        "source_run_id": run_id,
+                        "created_at": datetime.utcnow().isoformat(),
+                    }],
+                    source_run_id=run_id,
+                )
+                outbox_repo = SessionOutboxRepository(db)
+                if await outbox_repo.get_by_run(run_id) is None:
+                    await outbox_repo.enqueue(run_id, session_id)
+                await outbox_repo.mark_delivered(run_id)
+                await db.commit()
+        except LookupError:
+            # 会话已删除：跳过写回并标记完成，避免无限重试
+            logger.warning("run %s 会话 %s 不存在，跳过写回", run_id, session_id)
+            await self._settle_outbox(run_id, session_id, error=None)
+        except Exception as e:
+            # 写回失败：保留 pending 供重试（服务重启后可恢复），向上抛出
+            await self._settle_outbox(run_id, session_id, error=str(e))
+            raise
+
+    async def _settle_outbox(
+        self, run_id: str, session_id: Optional[int], *, error: Optional[str]
+    ) -> None:
         async with AsyncSessionLocal() as db:
-            res = await db.execute(
-                select(AgentSession).where(AgentSession.id == run.session_id)
-            )
-            sess = res.scalar_one_or_none()
-            if sess is None:
-                logger.warning("run %s 会话 %s 不存在，跳过写回", run.run_id, run.session_id)
-                return
-            msgs = list(sess.messages or [])
-            msgs.append({
-                "role": "assistant",
-                "content": run.final_text or "",
-                "steps": steps,
-            })
-            sess.messages = msgs
-            flag_modified(sess, "messages")
+            outbox_repo = SessionOutboxRepository(db)
+            if await outbox_repo.get_by_run(run_id) is None:
+                await outbox_repo.enqueue(run_id, session_id)
+            if error is None:
+                await outbox_repo.mark_delivered(run_id)
+            else:
+                await outbox_repo.record_failure(run_id, error)
             await db.commit()
+
+    async def deliver_pending_outbox(self, limit: int = 20) -> int:
+        """Outbox Worker：恢复扫描 pending 写回任务。
+
+        服务重启后未完成的写回可继续恢复；已 delivered 的按 source_run_id
+        幂等跳过，重试不会重复追加 Assistant 消息。
+        """
+        async with AsyncSessionLocal() as db:
+            rows = await SessionOutboxRepository(db).list_pending(limit)
+            run_ids = [r.run_id for r in rows]
+        delivered = 0
+        for rid in run_ids:
+            try:
+                await self._deliver_outbox(rid)
+                delivered += 1
+            except Exception as e:
+                logger.warning(
+                    "outbox 写回 run %s 失败（保留 pending 供重试）：%s", rid, e
+                )
+        return delivered
 
     # ── 内部：装载 ────────────────────────────────────────────────────────
 
@@ -1181,6 +1429,16 @@ class AgentRuntimeService:
                     recovery_error=recovery_error,
                     finished=finished,
                 )
+                if finished and run.session_id:
+                    # Run 终态与 Session 写回解耦（P1-02 C）：同一事务提交
+                    # Run 终态 + SessionResultOutbox（写回由 Outbox Worker 完成，
+                    # 写回失败/重试不改变 Run 终态）；同事务释放 Session 执行权。
+                    await SessionOutboxRepository(db).enqueue(
+                        run.run_id, run.session_id
+                    )
+                    await SessionRepository(db).release_execution(
+                        run.session_id, run.run_id
+                    )
                 await db.commit()
         except (RunLeaseLost, IllegalTransition) as e:
             logger.warning(
@@ -1412,25 +1670,45 @@ class _RunLimitExceeded(Exception):
     pass
 
 
-def _request_hash(
-    agent_config: Dict[str, Any],
-    messages: List[Dict[str, Any]],
-    user_id: int,
+# 摘要纳入的 Agent 配置版本字段（执行语义相关，必要且稳定）；
+# 易变的服务端临时字段（如检索到的记忆上下文、预加载表列表）与明文凭据不纳入
+_AGENT_CONFIG_VERSION_KEYS = (
+    "id",
+    "model_config_id",
+    "system_prompt",
+    "max_iterations",
+    "max_tokens",
+    "temperature",
+    "tools",
+    "knowledge_base_id",
+    "database_connection_id",
+)
+
+
+def compute_request_hash(
+    *,
+    endpoint: str,
+    user_id: Optional[int],
+    agent_id: Any,
     session_id: Optional[int],
-    use_memory_context: str,
-    db_info: Optional[Dict[str, Any]],
+    user_input: str,
+    agent_config: Optional[Dict[str, Any]],
 ) -> str:
-    """规范化请求摘要：同一幂等键不同请求内容 → IdempotencyConflict（F-06）。"""
+    """规范化请求摘要（P1-01）。
+
+    至少包含：user_id、agent_id、session_id、endpoint/操作类型、用户本次输入、
+    必要的 Agent 配置版本。服务端易变临时字段（``_`` 前缀 / 记忆检索上下文 /
+    预加载表列表）与明文凭据不纳入摘要。
+    """
     canonical = json.dumps(
         {
-            "agent_id": agent_config.get("id"),
+            "endpoint": endpoint,
             "user_id": user_id,
+            "agent_id": agent_id,
             "session_id": session_id,
-            "messages": messages,
-            "use_memory_context": use_memory_context,
-            "db_info": db_info,
-            "agent_config": {
-                k: v for k, v in (agent_config or {}).items() if not k.startswith("_")
+            "user_input": user_input,
+            "config_version": {
+                k: (agent_config or {}).get(k) for k in _AGENT_CONFIG_VERSION_KEYS
             },
         },
         ensure_ascii=False,
@@ -1438,6 +1716,14 @@ def _request_hash(
         default=str,
     )
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _last_user_input(messages: List[Dict[str, Any]]) -> str:
+    """取用户本次输入（最后一条 user 消息内容），作为请求摘要的输入项。"""
+    for m in reversed(messages or []):
+        if isinstance(m, dict) and m.get("role") == "user":
+            return str(m.get("content") or "")
+    return str((messages[-1].get("content") or "")) if messages else ""
 
 
 _service: Optional[AgentRuntimeService] = None

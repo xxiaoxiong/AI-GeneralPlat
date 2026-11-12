@@ -3,6 +3,7 @@ from .errors import (
     IllegalTransition,
     PersistenceError,
     RunLeaseLost,
+    SessionBusy,
     ToolCallIdentityConflict,
 )
 from .run_repository import (
@@ -14,12 +15,19 @@ from .run_repository import (
 )
 from .tool_execution_repository import ToolExecutionRepository
 from .event_repository import EventRepository
+from .session_repository import (
+    OUTBOX_DELIVERED,
+    OUTBOX_PENDING,
+    SessionOutboxRepository,
+    SessionRepository,
+)
 
 __all__ = [
     "IdempotencyConflict",
     "IllegalTransition",
     "PersistenceError",
     "RunLeaseLost",
+    "SessionBusy",
     "ToolCallIdentityConflict",
     "HEARTBEAT_OK",
     "HEARTBEAT_FINISHED",
@@ -28,4 +36,8 @@ __all__ = [
     "RunRepository",
     "ToolExecutionRepository",
     "EventRepository",
+    "SessionRepository",
+    "SessionOutboxRepository",
+    "OUTBOX_PENDING",
+    "OUTBOX_DELIVERED",
 ]

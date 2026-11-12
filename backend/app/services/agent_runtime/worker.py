@@ -49,6 +49,7 @@ from .repositories import (
     HEARTBEAT_PAUSED,
     RunRepository,
 )
+from .repositories.session_repository import SessionRepository
 from .repositories.errors import RunLeaseLost
 
 if TYPE_CHECKING:  # pragma: no cover - 仅类型标注，避免循环导入
@@ -128,6 +129,8 @@ class RunWorker:
             60.0, float(getattr(settings, "AGENT_EVENT_CLEANUP_INTERVAL", 3600.0))
         )
         self._next_event_cleanup = time.monotonic() + self._event_cleanup_interval
+        # Session 写回 Outbox 泵（P1-02 C）：周期恢复未完成写回，重启可续
+        self._next_outbox_pump = 0.0
 
     # ── 生命周期 ─────────────────────────────────────────────────────────
 
@@ -189,6 +192,19 @@ class RunWorker:
                         run_id, self.worker_id, self.lease_seconds
                     )
                 row = await repo.get_run(run_id) if lease_version is not None else None
+                if row is not None and row.session_id and not await SessionRepository(db).claim_execution(
+                    row.session_id, run_id, self.lease_seconds
+                ):
+                    # Session 执行权被其他活跃 Run 持有（P1-02 A：单 Session 单
+                    # 活跃 Run）：释放 Run 领取回到可领取状态，等待 Session
+                    # 空闲后由轮询重试，绝不并发驱动同一 Session
+                    await repo.release(run_id, self.worker_id, lease_version)
+                    await db.commit()
+                    logger.info(
+                        "run %s 未取得 session %s 执行权，放弃本次领取",
+                        run_id, row.session_id,
+                    )
+                    return None
                 await db.commit()
             return row
         except Exception:
@@ -345,7 +361,9 @@ class RunWorker:
                 await asyncio.sleep(self.heartbeat_interval)
                 if drive_task.done():
                     return
-                result = await self._heartbeat(handle.run_id, lease_version)
+                result = await self._heartbeat(
+                    handle.run_id, lease_version, session_id=handle.session_id
+                )
                 if result in (HEARTBEAT_FINISHED, HEARTBEAT_PAUSED):
                     return
                 if result == HEARTBEAT_LOST:
@@ -360,7 +378,9 @@ class RunWorker:
         except asyncio.CancelledError:
             raise
 
-    async def _heartbeat(self, run_id: str, lease_version: Optional[int]) -> str:
+    async def _heartbeat(
+        self, run_id: str, lease_version: Optional[int], *, session_id: Optional[int] = None
+    ) -> str:
         if lease_version is None:
             return HEARTBEAT_OK
         try:
@@ -368,6 +388,11 @@ class RunWorker:
                 result = await RunRepository(db).heartbeat(
                     run_id, self.worker_id, lease_version, self.lease_seconds
                 )
+                if result == HEARTBEAT_OK and session_id:
+                    # 续租同时保持 Session 执行权存活（P1-02 A）
+                    await SessionRepository(db).claim_execution(
+                        session_id, run_id, self.lease_seconds
+                    )
                 await db.commit()
             return result
         except Exception:
@@ -416,6 +441,10 @@ class RunWorker:
                         time.monotonic() + self._event_cleanup_interval
                     )
                     await self._cleanup_events()
+                if time.monotonic() >= self._next_outbox_pump:
+                    # Session 写回 Outbox 泵（P1-02 C）：服务重启后未完成写回可恢复
+                    self._next_outbox_pump = time.monotonic() + 5.0
+                    await self.service.deliver_pending_outbox()
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -439,6 +468,26 @@ class RunWorker:
 
     async def _claim_execute_row(self, row: Any) -> None:
         try:
+            if row.session_id:
+                # Session 执行权（P1-02 A）：领取后执行前必须持有；被其他活跃
+                # Run 占用则释放 Run 领取（回到可领取状态），绝不并发驱动同一
+                # Session，等待 Session 空闲后由轮询重试
+                async with AsyncSessionLocal() as db:
+                    ok = await SessionRepository(db).claim_execution(
+                        row.session_id, row.id, self.lease_seconds
+                    )
+                    if ok:
+                        await db.commit()
+                    else:
+                        await RunRepository(db).release(
+                            row.id, self.worker_id, row.lease_version
+                        )
+                        await db.commit()
+                        logger.info(
+                            "run %s 未取得 session %s 执行权，放弃本次领取",
+                            row.id, row.session_id,
+                        )
+                        return
             await self.run_claimed(row, self._job_from_row(row))
         except Exception:
             logger.exception("Worker 驱动 run %s 异常", row.id)

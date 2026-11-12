@@ -10,6 +10,10 @@ class IdempotencyConflict(Exception):
     """幂等键已用于不同请求内容（request_hash 不一致）。"""
 
 
+class SessionBusy(Exception):
+    """Session 执行权被其他活跃 Run 持有（P1-02）：明确冲突，不得并发驱动同一 Session。"""
+
+
 class RunLeaseLost(GraphBubbleUp):
     """执行权丢失（租约易主 / 租约过期）：调用方必须立即停止推进（P0-02）。
 

@@ -113,7 +113,7 @@ def test_fresh_mysql8_upgrades_to_head(mysql_dsn):
 
     tables, cols_map, unique_map = _inspect()
     assert {"agent_runs", "agent_run_events", "agent_tool_executions",
-            "agent_approvals"} <= tables
+            "agent_approvals", "session_result_outbox"} <= tables
 
     run_cols = cols_map.get("agent_runs", set())
     for col in (
@@ -126,6 +126,15 @@ def test_fresh_mysql8_upgrades_to_head(mysql_dsn):
                 "decision_status"):
         assert col in cols_map.get("agent_approvals", set()), f"agent_approvals 缺少列 {col}"
     assert "thread_id" in cols_map.get("agent_run_events", set())
+
+    # P1-02（Batch 5）：Session 乐观锁 / 执行权列 + Outbox 结构
+    sess_cols = cols_map.get("agent_sessions", set())
+    for col in ("version", "active_run_id", "active_run_lease_expires_at"):
+        assert col in sess_cols, f"agent_sessions 缺少列 {col}"
+    for col in ("run_id", "session_id", "status", "attempts", "last_error"):
+        assert col in cols_map.get("session_result_outbox", set()), \
+            f"session_result_outbox 缺少列 {col}"
+    assert _has_unique(unique_map, "session_result_outbox", "run_id")
 
     # 唯一约束（MySQL 保留约束语义，按列组合验证）
     assert _has_unique(unique_map, "agent_runs", "idempotency_key", "user_id")

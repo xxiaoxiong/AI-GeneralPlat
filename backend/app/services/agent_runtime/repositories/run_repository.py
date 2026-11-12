@@ -19,11 +19,11 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
-from sqlalchemy import case, func, or_, select, text, update
+from sqlalchemy import case, exists, func, or_, select, text, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models.agent import AgentRun
+from app.models.agent import AgentRun, AgentSession
 from ..lifecycle import (
     ALLOWED_TRANSITIONS,
     PAUSED_STATUSES,
@@ -399,6 +399,21 @@ class RunRepository:
                     AgentRun.worker_id.is_(None),
                     AgentRun.lease_expires_at.is_(None),
                     AgentRun.lease_expires_at < _sql_now(self.session),
+                ),
+                # P1-02 A：跳过 Session 执行权被其他未过期活跃 Run 持有的 Run
+                #（单 Session 单活跃 Run；持有者租约过期后自然可领取/接管）
+                or_(
+                    AgentRun.session_id.is_(None),
+                    ~exists(
+                        select(AgentSession.id).where(
+                            AgentSession.id == AgentRun.session_id,
+                            AgentSession.active_run_id.isnot(None),
+                            AgentSession.active_run_id != AgentRun.id,
+                            AgentSession.active_run_lease_expires_at.isnot(None),
+                            AgentSession.active_run_lease_expires_at
+                            > _sql_now(self.session),
+                        )
+                    ),
                 ),
             )
             .order_by(

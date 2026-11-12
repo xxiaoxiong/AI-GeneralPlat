@@ -53,7 +53,37 @@ class AgentSession(Base):
     # 完整对话历史（含 ReAct 思考链）
     messages = Column(JSON, default=list)
 
+    # P1-02：消息写入乐观锁版本（读取-合并-写回须 CAS，冲突合并重试）
+    version = Column(Integer, default=0, nullable=False)
+    # P1-02：Session 执行权（单 Session 单活跃 Run，数据库原子 Claim）
+    active_run_id = Column(String(36), nullable=True)          # 当前持有执行权的 Run
+    active_run_lease_expires_at = Column(DateTime, nullable=True)  # 执行权租约（过期可接管）
+
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class SessionResultOutbox(Base):
+    """Run 终态 → Session 写回的轻量 Outbox（P1-02 C）。
+
+    与 Run 终态在同一事务入队（Run completed/failed/cancelled + outbox 原子提交）；
+    Outbox Worker 异步写回 Assistant 消息，按 source_run_id（run_id 唯一约束 +
+    消息内 source_run_id 查重）去重后标记 delivered；写回失败可重试且不会
+    重复追加；服务重启后 pending 记录可继续恢复写回。
+    """
+    __tablename__ = "session_result_outbox"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    # 不设外键：Session/Run 删除不应被写回任务阻塞（写回按 run_id 去重、
+    # 按行内容幂等处理缺失场景）；run_id 唯一约束保证一 Run 一条写回任务
+    run_id = Column(String(36), nullable=False, unique=True, index=True)
+    session_id = Column(Integer, nullable=False, index=True)
+    status = Column(String(24), default="pending", nullable=False, index=True)  # pending / delivered
+    attempts = Column(Integer, default=0, nullable=False)   # 写回尝试次数
+    last_error = Column(Text, nullable=True)                # 最近一次失败原因
+
+    created_at = Column(DateTime, default=datetime.utcnow)
+    delivered_at = Column(DateTime, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
