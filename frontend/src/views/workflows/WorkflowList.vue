@@ -57,7 +57,7 @@
           <template #default="{ row }">
             <el-button style="color: #fff;" size="small" type="primary" plain @click="openEditor(row.id)">编辑</el-button>
             <el-button size="small" type="success" plain @click="openRun(row.id)">▶ 运行</el-button>
-            <el-button size="small" type="danger" @click="deleteWorkflow(row)">删除</el-button>
+            <el-button size="small" type="danger" @click="deleteWorkflow(row as Workflow)">删除</el-button>
           </template>
         </el-table-column>
       </el-table>

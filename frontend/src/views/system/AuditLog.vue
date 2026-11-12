@@ -59,7 +59,7 @@
         </el-table-column>
         <el-table-column label="详情" width="100">
           <template #default="{ row }">
-            <el-button size="small" link @click="showDetail(row)">查看</el-button>
+            <el-button size="small" link @click="showDetail(row as AuditLog)">查看</el-button>
           </template>
         </el-table-column>
       </el-table>

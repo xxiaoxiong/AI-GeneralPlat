@@ -1,4 +1,4 @@
-version: '3.9'
+name: ai-generalplat
 
 services:
   mysql:
@@ -14,10 +14,10 @@ services:
       - "3308:3306"
     volumes:
       - mysql_data:/var/lib/mysql
-      - ./docker/mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./mysql/init.sql:/docker-entrypoint-initdb.d/init.sql
     command: --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci
     healthcheck:
-      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-pai_plat_password"]
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p$$MYSQL_ROOT_PASSWORD --silent"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -39,8 +39,8 @@ services:
 
   backend:
     build:
-      context: ./backend
-      dockerfile: Dockerfile
+      context: ../backend
+      dockerfile: ../docker/backend.Dockerfile
     container_name: ai_plat_backend
     restart: unless-stopped
     ports:
@@ -57,8 +57,11 @@ services:
       ADMIN_PASSWORD: Admin@123456
       ADMIN_USERNAME: admin
       CORS_ORIGINS: '["http://localhost:5173","http://localhost:3000","http://localhost:80"]'
+      # Durable Execution：Checkpoint 落盘到 app_data 卷，重启后可恢复（memory 仅限开发）
+      AGENT_CHECKPOINT_DSN: sqlite:///./data/agent_checkpoints.db
     volumes:
       - app_data:/app/data
+      - ../log:/app/data/logs
     depends_on:
       mysql:
         condition: service_healthy
@@ -67,8 +70,8 @@ services:
 
   frontend:
     build:
-      context: ./frontend
-      dockerfile: Dockerfile
+      context: ../frontend
+      dockerfile: ../docker/frontend.Dockerfile
     container_name: ai_plat_frontend
     restart: unless-stopped
     ports:

@@ -48,11 +48,11 @@
         <el-table-column label="操作" width="220" fixed="right">
           <template #default="{ row }">
             <div class="action-btns">
-              <el-button size="small" @click="openDialog(row)">编辑</el-button>
-              <el-button size="small" :type="row.is_active ? 'warning' : 'success'" @click="toggleActive(row)">
+              <el-button size="small" @click="openDialog(row as User)">编辑</el-button>
+              <el-button size="small" :type="row.is_active ? 'warning' : 'success'" @click="toggleActive(row as User)">
                 {{ row.is_active ? '禁用' : '启用' }}
               </el-button>
-              <el-button size="small" type="danger" @click="deleteUser(row)">删除</el-button>
+              <el-button size="small" type="danger" @click="deleteUser(row as User)">删除</el-button>
             </div>
           </template>
         </el-table-column>
