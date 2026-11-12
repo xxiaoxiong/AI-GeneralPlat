@@ -1,6 +1,8 @@
 """🔍 知识检索工具：knowledge_search"""
 from typing import Dict, Any, List
 
+from .result import ToolResult
+
 from sqlalchemy import select
 
 
@@ -44,7 +46,7 @@ async def execute_knowledge_search(db, agent_config: dict, params: dict) -> str:
             f"[{i + 1}] {r.get('content', '')[:600]}" for i, r in enumerate(results)
         )
     except Exception as e:
-        return f"知识库检索失败: {e}"
+        return ToolResult.failed(f"知识库检索失败: {e}")
 
 
 HANDLERS = {

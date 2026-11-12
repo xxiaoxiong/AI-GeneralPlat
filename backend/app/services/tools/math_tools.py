@@ -2,6 +2,8 @@
 import math
 from typing import Dict, Any, List
 
+from .result import ToolResult
+
 
 TOOLS: List[Dict[str, Any]] = [
     {
@@ -32,7 +34,7 @@ def execute_calculator(params: dict) -> str:
         result = eval(expr, _SAFE_NS)
         return f"计算结果: {expr} = {result}"
     except Exception as e:
-        return f"计算错误: {e}"
+        return ToolResult.failed(f"计算错误: {e}")
 
 
 HANDLERS = {

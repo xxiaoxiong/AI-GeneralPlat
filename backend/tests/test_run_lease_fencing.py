@@ -419,6 +419,7 @@ async def test_lf07_tool_ledger_rejects_stale_worker():
         rec, _ = await ledger.begin(
             run_id=run_id, tool_call_id="tc-lf07", tool_name="calculator",
             args_snapshot={"expression": "1+1"}, args_hash="h", idempotency_key="k",
+            lease=RunExecutionLease(run_id=run_id, worker_id="worker-a", lease_version=v1),
         )
         await s.commit()
         exec_id = rec.id

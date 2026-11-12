@@ -14,6 +14,8 @@ import json
 import re
 from typing import Dict, Any, List
 
+from .result import ToolResult
+
 import httpx
 
 
@@ -341,10 +343,11 @@ async def execute_web_search(params: dict) -> str:
     error_detail = "; ".join(errors) if errors else "网络不可达"
     is_network_error = any(kw in error_detail for kw in ("连接失败", "网络不可达", "ConnectError", "超时"))
     if is_network_error:
-        return (
+        return ToolResult.failed(
             f"搜索 '{query}' 失败：无法连接到搜索引擎。\n"
             f"错误详情: {error_detail}\n"
-            f"提示: 当前环境可能无法访问外部网络。请直接使用你的知识回答用户问题，并说明无法联网搜索。"
+            f"提示: 当前环境可能无法访问外部网络。请直接使用你的知识回答用户问题，并说明无法联网搜索。",
+            retryable=True,
         )
     return (
         f"搜索 '{query}' 未找到结果。\n"
@@ -357,7 +360,7 @@ async def execute_fetch_webpage(params: dict) -> str:
     url     = params.get("url", "")
     max_len = int(params.get("max_len", 3000))
     if not url.startswith("http"):
-        return "错误：URL 必须以 http:// 或 https:// 开头"
+        return ToolResult.failed("错误：URL 必须以 http:// 或 https:// 开头")
     try:
         async with httpx.AsyncClient(timeout=20, verify=(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY), follow_redirects=True) as client:
             resp = await client.get(url, headers=_HEADERS)
@@ -374,14 +377,14 @@ async def execute_fetch_webpage(params: dict) -> str:
         suffix = f"\n\n...（内容已截断，原文共 {len(text)} 字符）" if len(text) > max_len else ""
         return f"网页内容（{url}）:\n\n{text[:max_len]}{suffix}"
     except Exception as e:
-        return f"抓取网页失败: {e}"
+        return ToolResult.failed(f"抓取网页失败: {e}", retryable=True)
 
 
 async def execute_weather(params: dict) -> str:
     city = params.get("city", "")
     days = int(params.get("days", 1))
     if not city:
-        return "错误：请提供城市名称"
+        return ToolResult.failed("错误：请提供城市名称")
     try:
         async with httpx.AsyncClient(timeout=15, verify=(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY)) as client:
             resp = await client.get(
@@ -423,7 +426,7 @@ async def execute_weather(params: dict) -> str:
 
         return "\n".join(lines)
     except Exception as e:
-        return f"天气查询失败: {e}（城市名称请尝试英文，如 Beijing）"
+        return ToolResult.failed(f"天气查询失败: {e}（城市名称请尝试英文，如 Beijing）", retryable=True)
 
 
 HANDLERS = {

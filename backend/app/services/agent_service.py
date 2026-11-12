@@ -287,7 +287,7 @@ class AgentEngine:
 
                 yield {"type": "action", "tool": tool_name, "input": tool_input, "iteration": iteration + 1}
 
-                observation = await executor.execute(tool_name, tool_input)
+                observation = (await executor.execute(tool_name, tool_input)).text
                 yield {"type": "observation", "content": observation, "iteration": iteration + 1}
 
                 working_memory.append(ChatMessage(role="assistant", content=llm_output))

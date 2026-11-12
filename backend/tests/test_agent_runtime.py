@@ -12,6 +12,7 @@
 - 执行预算超限（P0-A）
 """
 import asyncio
+import uuid
 import pytest
 import pytest_asyncio
 from typing import Any, List
@@ -109,6 +110,28 @@ def make_ctx(run_id="test-run", **kw) -> RuntimeContext:
         budget=ExecutionBudget(max_steps=10, max_tool_calls=5, max_model_calls=10, run_timeout_seconds=30),
         **kw,
     )
+
+
+async def make_db_ctx(**kw) -> RuntimeContext:
+    """P0-03：工具账本写入必须持有真实执行权（真实 run + claim）。"""
+    from app.core.database import AsyncSessionLocal
+    from app.models.agent import Agent
+    from app.services.agent_runtime.repositories import RunRepository
+
+    run_id = uuid.uuid4().hex
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        agent = await s.get(Agent, 1)
+        if agent is None:
+            s.add(Agent(id=1, name="tr-agent"))
+            await s.flush()
+        await repo.create_run(
+            run_id=run_id, agent_id=1, session_id=None, user_id=None,
+            thread_id=f"agent-1-session-{run_id[:8]}",
+        )
+        version = await repo.claim(run_id, "w-test", 30)
+        await s.commit()
+    return make_ctx(run_id=run_id, worker_id="w-test", lease_version=version, **kw)
 
 
 async def run_graph(model, tools, input_messages, ctx=None, interrupt_on=None, thread_id="t1"):
@@ -278,7 +301,7 @@ class TestToolAdapter:
         from app.services.agent_runtime.tools.adapter import ToolAdapterFactory
 
         bus = EventBus()
-        ctx = make_ctx()
+        ctx = await make_db_ctx()
         policy = ToolPolicy(allowed_tools={"calculator"})
         factory = ToolAdapterFactory(ctx, policy, bus)
         tools = factory.build([
@@ -360,7 +383,7 @@ class TestE2E:
         from app.services.agent_runtime.tools.adapter import ToolAdapterFactory
 
         bus = EventBus()
-        ctx = make_ctx()
+        ctx = await make_db_ctx()
         policy = ToolPolicy(allowed_tools={"calculator"})
         factory = ToolAdapterFactory(ctx, policy, bus)
 
@@ -383,7 +406,7 @@ class TestE2E:
         from app.services.agent_runtime.tools.adapter import ToolAdapterFactory
 
         bus = EventBus()
-        factory = ToolAdapterFactory(make_ctx(), ToolPolicy(allowed_tools={"broken_tool"}), bus)
+        factory = ToolAdapterFactory(await make_db_ctx(), ToolPolicy(allowed_tools={"broken_tool"}), bus)
 
         def _broken(x: str) -> str:
             raise ValueError("boom")
@@ -601,7 +624,7 @@ class TestTelemetry:
         t, captured = self._capturing()
         monkeypatch.setattr(adapter_mod, "telemetry", t)
         bus = EventBus()
-        factory = ToolAdapterFactory(make_ctx(), ToolPolicy(allowed_tools={"calculator"}), bus)
+        factory = ToolAdapterFactory(await make_db_ctx(), ToolPolicy(allowed_tools={"calculator"}), bus)
         await factory._execute("calculator", {"expression": "2+2"})
         with pytest.raises(ToolPolicyError):
             await factory._execute("http_get", {"url": "http://127.0.0.1/"})

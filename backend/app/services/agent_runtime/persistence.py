@@ -66,6 +66,7 @@ class CheckpointerFactory:
         self._store_dsn: Optional[str] = None
         self._checkpointer_conn: Any = None   # sqlite(postgres) 底层连接，aclose 时释放
         self._store_conn: Any = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._init_lock = asyncio.Lock()      # 单飞行：并发初始化只创建一个实例
 
     @classmethod
@@ -74,12 +75,34 @@ class CheckpointerFactory:
             cls._instance = cls()
         return cls._instance
 
+    def _ensure_loop(self) -> None:
+        """asyncio.Lock 与异步连接都绑定创建时的事件循环。
+
+        检测到运行循环变化（如测试每用例一个新事件循环）时，丢弃旧循环
+        绑定的资源并重建锁；旧连接不再复用也无法在新循环中关闭，由进程
+        退出回收。生产部署为单进程单事件循环，不受影响。
+        """
+        loop = asyncio.get_running_loop()
+        if self._loop is loop:
+            return
+        if self._loop is not None:
+            logger.info("事件循环变化，丢弃旧循环绑定的 Checkpointer/Store 资源")
+            self._checkpointer = None
+            self._checkpointer_conn = None
+            self._dsn = None
+            self._store = None
+            self._store_conn = None
+            self._store_dsn = None
+        self._loop = loop
+        self._init_lock = asyncio.Lock()
+
     def _current_dsn(self) -> str:
         return getattr(settings, "AGENT_CHECKPOINT_DSN", "memory") or "memory"
 
     # ── Checkpointer ─────────────────────────────────────────────────────
 
     async def get_checkpointer(self) -> Any:
+        self._ensure_loop()
         dsn = normalize_dsn(self._current_dsn())
         async with self._init_lock:
             if self._checkpointer is not None and self._dsn == dsn:
@@ -147,6 +170,7 @@ class CheckpointerFactory:
 
     async def get_store(self) -> Optional[Any]:
         """跨线程长期记忆 Store（AGENT_STORE_DSN 为空则不启用）。"""
+        self._ensure_loop()
         dsn = normalize_dsn(getattr(settings, "AGENT_STORE_DSN", "") or "")
         if not dsn:
             return None
@@ -186,6 +210,7 @@ class CheckpointerFactory:
 
     async def aclose(self) -> None:
         """释放 Checkpointer 与 Store 连接（应用关闭时调用）。"""
+        self._ensure_loop()
         async with self._init_lock:
             await self._close_checkpointer()
             await self._close_store()

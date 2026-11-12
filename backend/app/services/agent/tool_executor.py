@@ -300,20 +300,25 @@ class EnhancedToolExecutor:
             self._ext_engine_conn_id = None
 
     async def _execute_impl(self, tool_name: str, tool_input: Dict) -> str:
-        """实际执行工具调用"""
+        """实际执行工具调用（handler 可返回 str | ToolResult，此处统一取文本渲染）"""
+        from app.services.tools.result import normalize
+
         if tool_name in self._sync_handlers:
             loop = asyncio.get_event_loop()
-            return await loop.run_in_executor(
+            ret = await loop.run_in_executor(
                 None, self._sync_handlers[tool_name], tool_input
             )
+            return normalize(ret).text
 
         if tool_name in self._async_handlers:
-            return await self._async_handlers[tool_name](tool_input)
+            return normalize(await self._async_handlers[tool_name](tool_input)).text
 
         if tool_name in self._db_handlers:
             db_session, need_close = await self._get_db_session()
             try:
-                result = await self._db_handlers[tool_name](db_session, tool_input)
+                result = normalize(
+                    await self._db_handlers[tool_name](db_session, tool_input)
+                ).text
                 # 在结果前标注实际查询的数据库名称
                 db_info = self.agent_config.get("_db_info")
                 if db_info:
@@ -326,7 +331,9 @@ class EnhancedToolExecutor:
                     await db_session.close()
 
         if tool_name in self._agent_handlers:
-            return await self._agent_handlers[tool_name](self.db, self.agent_config, tool_input)
+            return normalize(
+                await self._agent_handlers[tool_name](self.db, self.agent_config, tool_input)
+            ).text
 
         # 自定义 HTTP 工具
         custom = next(

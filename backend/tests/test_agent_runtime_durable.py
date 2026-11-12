@@ -21,7 +21,8 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.core.database import AsyncSessionLocal, engine, init_db
-from app.models.agent import AgentApproval, AgentRun, AgentRunEvent, AgentSession, AgentToolExecution
+from app.models.agent import Agent, AgentApproval, AgentRun, AgentRunEvent, AgentSession, AgentToolExecution
+from app.models.user import User
 from app.services.agent_runtime.lifecycle import (
     STATUS_CANCELLED,
     STATUS_COMPLETED,
@@ -104,8 +105,36 @@ async def _create_run(repo: RunRepository, **kw):
         thread_id=f"agent-1-session-{run_id[:8]}",
     )
     defaults.update(kw)
+    # 真实 PG/MySQL 有外键约束：确保 agent / user 行存在
+    if await repo.session.get(Agent, 1) is None:
+        repo.session.add(Agent(id=1, name="durable-agent"))
+        await repo.session.flush()
+    uid = defaults.get("user_id")
+    if uid is not None and await repo.session.get(User, uid) is None:
+        repo.session.add(User(
+            id=uid, username=f"u{uid}", email=f"u{uid}@test.local",
+            hashed_password="x",
+        ))
+        await repo.session.flush()
     run, created = await repo.create_run(**defaults)
     return run, created
+
+
+async def _claimed_run(worker_id: str = "w-tool"):
+    """创建真实 AgentRun 并 claim 执行权 -> (run_id, lease_version)。
+
+    P0-03：Tool Ledger 全部写入强制校验执行权，测试必须持有真实有效租约。
+    """
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)
+        version = await repo.claim(run.id, worker_id, 30)
+        await s.commit()
+    return run.id, version
+
+
+def _lease_for(run_id: str, version: int, worker_id: str = "w-tool") -> RunExecutionLease:
+    return RunExecutionLease(run_id=run_id, worker_id=worker_id, lease_version=version)
 
 
 # ── FR-01 Run 持久化与幂等创建 ─────────────────────────────────────────────
@@ -363,38 +392,42 @@ async def test_claim_next_picks_expired_running_for_recovery():
 @pytest.mark.asyncio
 async def test_ledger_begin_is_idempotent_per_tool_call_id():
     """稳定身份是 (run_id, tool_call_id)：重复登记返回同一记录。"""
+    run_id, version = await _claimed_run()
+    lease = _lease_for(run_id, version)
     async with AsyncSessionLocal() as s:
         ledger = ToolExecutionRepository(s)
-        run_id = _uid()
         rec1, c1 = await ledger.begin(
             run_id=run_id, tool_call_id="call-1", tool_name="http_post",
-            args_hash="h", idempotency_key="idem-1",
+            args_hash="h", idempotency_key="idem-1", lease=lease,
         )
         rec2, c2 = await ledger.begin(
             run_id=run_id, tool_call_id="call-1", tool_name="http_post",
-            args_hash="h", idempotency_key="idem-1",
+            args_hash="h", idempotency_key="idem-1", lease=lease,
         )
         assert c1 and not c2 and rec1.id == rec2.id
 
         # 相同参数、不同 tool_call_id 是两次独立操作（禁止 args_hash 当调用 ID）
         rec3, c3 = await ledger.begin(
             run_id=run_id, tool_call_id="call-2", tool_name="http_post",
-            args_hash="h", idempotency_key="idem-2",
+            args_hash="h", idempotency_key="idem-2", lease=lease,
         )
         assert c3 and rec3.id != rec1.id
 
 
 @pytest.mark.asyncio
 async def test_ledger_success_flow():
+    run_id, version = await _claimed_run()
+    lease = _lease_for(run_id, version)
     async with AsyncSessionLocal() as s:
         ledger = ToolExecutionRepository(s)
-        run_id = _uid()
-        rec, _ = await ledger.begin(run_id=run_id, tool_call_id="c1", tool_name="t")
+        rec, _ = await ledger.begin(
+            run_id=run_id, tool_call_id="c1", tool_name="t", lease=lease
+        )
         assert rec.status == TOOL_EXEC_PREPARED
 
-        assert await ledger.mark_executing(rec.id, worker_id="w", lease_version=1)
+        assert await ledger.mark_executing(rec.id, lease=lease)
         assert await ledger.mark_succeeded(
-            rec.id, result_payload={"ok": True}, external_operation_id="op-9"
+            rec.id, result_payload={"ok": True}, external_operation_id="op-9", lease=lease
         )
         row = await ledger.get(run_id, "c1")
         assert row.status == TOOL_EXEC_SUCCEEDED
@@ -406,15 +439,21 @@ async def test_ledger_success_flow():
 
 @pytest.mark.asyncio
 async def test_ledger_succeeded_is_immutable():
+    """P0-03：成功记录不可被失败覆盖 —— 状态迁移被拒必须显式抛出。"""
+    run_id, version = await _claimed_run()
+    lease = _lease_for(run_id, version)
     async with AsyncSessionLocal() as s:
         ledger = ToolExecutionRepository(s)
-        run_id = _uid()
-        rec, _ = await ledger.begin(run_id=run_id, tool_call_id="c1", tool_name="t")
-        await ledger.mark_executing(rec.id)
-        await ledger.mark_succeeded(rec.id, result_payload={"ok": True})
+        rec, _ = await ledger.begin(
+            run_id=run_id, tool_call_id="c1", tool_name="t", lease=lease
+        )
+        await ledger.mark_executing(rec.id, lease=lease)
+        await ledger.mark_succeeded(rec.id, result_payload={"ok": True}, lease=lease)
 
-        assert not await ledger.mark_failed(rec.id, error="late failure")
-        assert not await ledger.mark_succeeded(rec.id, result_payload={"ok": False})
+        with pytest.raises(IllegalTransition):
+            await ledger.mark_failed(rec.id, error="late failure", lease=lease)
+        with pytest.raises(IllegalTransition):
+            await ledger.mark_succeeded(rec.id, result_payload={"ok": False}, lease=lease)
         row = await ledger.get(run_id, "c1")
         assert row.status == TOOL_EXEC_SUCCEEDED
         assert row.result_payload == {"ok": True}
@@ -423,18 +462,21 @@ async def test_ledger_succeeded_is_immutable():
 @pytest.mark.asyncio
 async def test_ledger_unknown_blocks_replay():
     """结果未知的外部调用：不得自动重放，进入 needs_reconciliation（FR-05/原则 E）。"""
+    run_id, version = await _claimed_run()
+    lease = _lease_for(run_id, version)
     async with AsyncSessionLocal() as s:
         ledger = ToolExecutionRepository(s)
-        run_id = _uid()
-        rec, _ = await ledger.begin(run_id=run_id, tool_call_id="c1", tool_name="http_post")
-        await ledger.mark_executing(rec.id)
-        await ledger.mark_unknown(rec.id, error="响应超时，远端结果未知")
+        rec, _ = await ledger.begin(
+            run_id=run_id, tool_call_id="c1", tool_name="http_post", lease=lease
+        )
+        await ledger.mark_executing(rec.id, lease=lease)
+        await ledger.mark_unknown(rec.id, error="响应超时，远端结果未知", lease=lease)
 
         assert await ledger.has_unsafe_entries(run_id)
         unresolved = await ledger.list_unresolved(run_id)
         assert [u.status for u in unresolved] == [TOOL_EXEC_UNKNOWN]
 
-        await ledger.mark_needs_reconciliation(rec.id, error="等待人工核对")
+        await ledger.mark_needs_reconciliation(rec.id, error="等待人工核对", lease=lease)
         row = await ledger.get(run_id, "c1")
         assert row.status == TOOL_EXEC_NEEDS_RECONCILIATION
         assert await ledger.has_unsafe_entries(run_id)
@@ -442,12 +484,15 @@ async def test_ledger_unknown_blocks_replay():
 
 @pytest.mark.asyncio
 async def test_ledger_no_unsafe_after_success():
+    run_id, version = await _claimed_run()
+    lease = _lease_for(run_id, version)
     async with AsyncSessionLocal() as s:
         ledger = ToolExecutionRepository(s)
-        run_id = _uid()
-        rec, _ = await ledger.begin(run_id=run_id, tool_call_id="c1", tool_name="t")
-        await ledger.mark_executing(rec.id)
-        await ledger.mark_succeeded(rec.id)
+        rec, _ = await ledger.begin(
+            run_id=run_id, tool_call_id="c1", tool_name="t", lease=lease
+        )
+        await ledger.mark_executing(rec.id, lease=lease)
+        await ledger.mark_succeeded(rec.id, lease=lease)
         assert not await ledger.has_unsafe_entries(run_id)
 
 
@@ -819,20 +864,23 @@ async def test_recovery_unsafe_ledger_blocks_auto_replay():
     async with AsyncSessionLocal() as s:
         repo = RunRepository(s)
         run, _ = await _create_run(repo)
-        await repo.claim(run.id, "dead-worker", 30)
-        await s.commit()
+        version = await repo.claim(run.id, "dead-worker", 30)
         run_id = run.id
-        row = await repo.get_run(run_id)
-        row.lease_expires_at = row.lease_expires_at.replace(year=2000)
-        # 崩溃在副作用结果未知的窗口：账本记录为 unknown。
+        lease = _lease_for(run_id, version, worker_id="dead-worker")
+        # 崩溃在副作用结果未知的窗口：账本记录为 unknown（写入时执行权有效）。
         # webhook_notify 无下游幂等能力 -> 禁止自动重放（http_post 等
         # external_idempotent 工具允许复用同一幂等键重试，见 T-05）
         ledger = ToolExecutionRepository(s)
         rec, _ = await ledger.begin(
             run_id=run_id, tool_call_id="call_1", tool_name="webhook_notify",
             args_snapshot={"url": "https://hooks.example.com/x"},
+            lease=lease,
         )
-        await ledger.mark_unknown(rec.id, error="网络超时，远端是否成功未知")
+        await ledger.mark_executing(rec.id, lease=lease)
+        await ledger.mark_unknown(rec.id, error="网络超时，远端是否成功未知", lease=lease)
+        await s.commit()
+        row = await repo.get_run(run_id)
+        row.lease_expires_at = row.lease_expires_at.replace(year=2000)  # 租约过期
         await s.commit()
 
     await svc.worker.start()
@@ -1007,12 +1055,14 @@ def _coro(value):
 # ── FR-05 工具账本故障注入（T-04 / T-05） ──────────────────────────────────
 
 
-def _make_ctx(run_id: str) -> RuntimeContext:
+def _make_ctx(run_id: str, worker_id: str = "w-tool", lease_version: int = 1) -> RuntimeContext:
     return RuntimeContext(
         scope=RunScope(user_id=1),
         run_id=run_id,
         thread_id=f"thr-{run_id}",
         agent_id=1,
+        worker_id=worker_id,
+        lease_version=lease_version,
     )
 
 
@@ -1047,8 +1097,8 @@ async def test_t01_multi_step_tool_ledger_stable_ids_and_keys(monkeypatch):
         "app.services.agent_runtime.tools.adapter.ToolExecutor",
         _fake_executor(behavior),
     )
-    run_id = _uid()
-    adapter = _make_adapter(_make_ctx(run_id), {"calculator", "web_search"})
+    run_id, lv = await _claimed_run()
+    adapter = _make_adapter(_make_ctx(run_id, lease_version=lv), {"calculator", "web_search"})
     await adapter._execute("calculator", {"tool_call_id": "tc-a", "expression": "1+1"})
     await adapter._execute("web_search", {"tool_call_id": "tc-b", "query": "langgraph"})
     assert calls == ["calculator", "web_search"]
@@ -1081,8 +1131,8 @@ async def test_t04_tool_success_then_crash_replay_returns_cached_result(monkeypa
         "app.services.agent_runtime.tools.adapter.ToolExecutor",
         _fake_executor(behavior),
     )
-    run_id = _uid()
-    adapter = _make_adapter(_make_ctx(run_id), {"calculator"})
+    run_id, lv = await _claimed_run()
+    adapter = _make_adapter(_make_ctx(run_id, lease_version=lv), {"calculator"})
     out1 = await adapter._execute("calculator", {"tool_call_id": "tc-1", "expression": "2+2"})
     assert out1 == "42"
     assert len(calls) == 1
@@ -1093,7 +1143,7 @@ async def test_t04_tool_success_then_crash_replay_returns_cached_result(monkeypa
     assert rec.result_payload == "42"
 
     # 模拟崩溃后重建 Runtime（新 ctx/adapter），Graph 重放同一 tool_call
-    adapter2 = _make_adapter(_make_ctx(run_id), {"calculator"})
+    adapter2 = _make_adapter(_make_ctx(run_id, lease_version=lv), {"calculator"})
     out2 = await adapter2._execute("calculator", {"tool_call_id": "tc-1", "expression": "2+2"})
     assert out2 == "42"  # 返回持久化结果
     assert len(calls) == 1  # 工具不重复执行
@@ -1118,8 +1168,8 @@ async def test_t05_unknown_result_blocks_replay_without_idempotency(monkeypatch)
         "app.services.agent_runtime.tools.adapter.ToolExecutor",
         _fake_executor(behavior),
     )
-    run_id = _uid()
-    adapter = _make_adapter(_make_ctx(run_id), {"webhook_notify"})
+    run_id, lv = await _claimed_run()
+    adapter = _make_adapter(_make_ctx(run_id, lease_version=lv), {"webhook_notify"})
     out1 = await adapter._execute(
         "webhook_notify", {"tool_call_id": "tc-9", "url": "https://hooks.example.com/x"}
     )
@@ -1131,7 +1181,7 @@ async def test_t05_unknown_result_blocks_replay_without_idempotency(monkeypatch)
     assert rec.status == TOOL_EXEC_UNKNOWN
 
     # 重建 Runtime 重放：禁止再次执行
-    adapter2 = _make_adapter(_make_ctx(run_id), {"webhook_notify"})
+    adapter2 = _make_adapter(_make_ctx(run_id, lease_version=lv), {"webhook_notify"})
     out2 = await adapter2._execute(
         "webhook_notify", {"tool_call_id": "tc-9", "url": "https://hooks.example.com/x"}
     )
@@ -1165,9 +1215,9 @@ async def test_t05_idempotent_retry_reuses_same_key(monkeypatch):
         _fake_executor(behavior),
     )
     monkeypatch.setattr(ToolPolicy, "check_url", lambda self, url: None)  # 跳过 DNS/SSRF 检查
-    run_id = _uid()
+    run_id, lv = await _claimed_run()
     payload = {"tool_call_id": "tc-7", "url": "https://api.example.com/orders", "body": {"sku": "A-1"}}
-    adapter = _make_adapter(_make_ctx(run_id), {"http_post"})
+    adapter = _make_adapter(_make_ctx(run_id, lease_version=lv), {"http_post"})
     out1 = await adapter._execute("http_post", dict(payload))
     assert "工具执行错误" in out1
     assert len(calls) == 1
@@ -1178,7 +1228,7 @@ async def test_t05_idempotent_retry_reuses_same_key(monkeypatch):
     assert rec.status == TOOL_EXEC_UNKNOWN
 
     # 重试（恢复重放）：external_idempotent 允许复用同一幂等键重试
-    adapter2 = _make_adapter(_make_ctx(run_id), {"http_post"})
+    adapter2 = _make_adapter(_make_ctx(run_id, lease_version=lv), {"http_post"})
     out2 = await adapter2._execute("http_post", dict(payload))
     assert out2 == "HTTP 201 订单已创建"
     assert calls[0] == calls[1]  # 复用同一 Idempotency-Key

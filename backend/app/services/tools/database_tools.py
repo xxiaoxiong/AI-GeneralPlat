@@ -10,6 +10,8 @@ from typing import Dict, Any, List
 
 from sqlalchemy import text
 
+from .result import ToolResult
+
 
 TOOLS: List[Dict[str, Any]] = [
     {
@@ -125,7 +127,7 @@ async def execute_db_schema(db, params: dict) -> str:
         else:
             # 查看指定表的列信息
             if not _VALID_TABLE.match(table):
-                return "错误：表名不合法（只允许字母、数字、下划线）"
+                return ToolResult.failed("错误：表名不合法（只允许字母、数字、下划线）")
 
             try:
                 # MySQL
@@ -154,7 +156,7 @@ async def execute_db_schema(db, params: dict) -> str:
                     return f"表 `{table}` 的结构：\n\n" + _rows_to_markdown(cols, rows)
 
     except Exception as e:
-        return f"查询表结构错误: {e}"
+        return ToolResult.failed(f"查询表结构错误: {e}")
 
 
 async def execute_db_query(db, params: dict) -> str:
@@ -163,11 +165,11 @@ async def execute_db_query(db, params: dict) -> str:
     limit = min(int(params.get("limit", 20)), 50)
 
     if not re.match(r"^\s*select\b", sql, re.IGNORECASE):
-        return "错误：只允许 SELECT 查询"
+        return ToolResult.failed("错误：只允许 SELECT 查询")
 
     # SQL 注入防护
     if _DANGEROUS_KEYWORDS.search(sql):
-        return "错误：SQL 中包含不允许的关键词（只允许 SELECT 查询）"
+        return ToolResult.failed("错误：SQL 中包含不允许的关键词（只允许 SELECT 查询）")
 
     try:
         result = await db.execute(text(sql))
@@ -177,7 +179,7 @@ async def execute_db_query(db, params: dict) -> str:
             return "查询结果为空（0行）"
         return _rows_to_markdown(cols, rows)
     except Exception as e:
-        return f"SQL执行错误: {e}"
+        return ToolResult.failed(f"SQL执行错误: {e}")
 
 
 async def execute_db_count(db, params: dict) -> str:
@@ -185,15 +187,15 @@ async def execute_db_count(db, params: dict) -> str:
     table = params.get("table", "")
     condition = params.get("condition", "1=1") or "1=1"
     if not _VALID_TABLE.match(table):
-        return "错误：表名不合法（只允许字母、数字、下划线）"
+        return ToolResult.failed("错误：表名不合法（只允许字母、数字、下划线）")
     if _DANGEROUS_KEYWORDS.search(condition):
-        return "错误：条件中包含不允许的关键词"
+        return ToolResult.failed("错误：条件中包含不允许的关键词")
     try:
         result = await db.execute(text(f"SELECT COUNT(*) FROM `{table}` WHERE {condition}"))
         count = result.scalar()
         return f"表 `{table}` 满足条件 [{condition}] 的记录数：**{count}**"
     except Exception as e:
-        return f"计数查询错误: {e}"
+        return ToolResult.failed(f"计数查询错误: {e}")
 
 
 async def execute_db_aggregate(db, params: dict) -> str:
@@ -205,11 +207,11 @@ async def execute_db_aggregate(db, params: dict) -> str:
     condition = params.get("condition", "1=1") or "1=1"
 
     if agg_func not in _ALLOWED_AGG:
-        return f"错误：不支持的聚合函数 '{agg_func}'，请用 SUM/AVG/MAX/MIN/COUNT"
+        return ToolResult.failed(f"错误：不支持的聚合函数 '{agg_func}'，请用 SUM/AVG/MAX/MIN/COUNT")
     if not _VALID_TABLE.match(table):
-        return "错误：表名不合法"
+        return ToolResult.failed("错误：表名不合法")
     if _DANGEROUS_KEYWORDS.search(condition):
-        return "错误：条件中包含不允许的关键词"
+        return ToolResult.failed("错误：条件中包含不允许的关键词")
 
     try:
         sel_prefix = f"{group_by}, " if group_by else ""
@@ -225,7 +227,7 @@ async def execute_db_aggregate(db, params: dict) -> str:
             return "聚合结果为空"
         return _rows_to_markdown(cols, rows)
     except Exception as e:
-        return f"聚合查询错误: {e}"
+        return ToolResult.failed(f"聚合查询错误: {e}")
 
 
 HANDLERS = {

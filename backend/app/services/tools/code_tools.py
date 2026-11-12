@@ -8,6 +8,8 @@ import re
 import traceback
 from typing import Dict, List
 
+from .result import ToolResult
+
 
 TOOLS: List[Dict] = [
     {
@@ -69,17 +71,22 @@ def _check_ast_safety(code: str) -> str | None:
     return None
 
 
-def execute_python_exec(params: dict) -> str:
+def execute_python_exec(params: dict) -> ToolResult:
+    """受限 Python 执行（P0-05 §7.2 C：错误/超时必须返回明确失败结果）。
+
+    注意：这是受限执行环境（AST 检查 + 内置白名单 + 线程超时），
+    不是安全沙箱 —— 能力边界如实标注（任务书 §0.2）。
+    """
     code = params.get("code", "").strip()
     timeout_sec = min(int(params.get("timeout", 5)), 10)
 
     if not code:
-        return "错误：代码为空"
+        return ToolResult.failed("错误：代码为空")
 
     # AST 安全检查
     err = _check_ast_safety(code)
     if err:
-        return f"安全检查失败: {err}"
+        return ToolResult.failed(f"安全检查失败: {err}")
 
     # 构建安全的执行环境
     safe_globals = {
@@ -128,10 +135,11 @@ def execute_python_exec(params: dict) -> str:
     t.join(timeout=timeout_sec)
 
     if t.is_alive():
-        return f"执行超时（>{timeout_sec}s），请检查是否有死循环"
+        # 超时必须返回明确失败结果（§7.2 C）
+        return ToolResult.failed(f"执行超时（>{timeout_sec}s），请检查是否有死循环")
 
     if result_container["error"]:
-        return f"执行错误:\n{result_container['error']}"
+        return ToolResult.failed(f"执行错误:\n{result_container['error']}")
 
     parts = []
     stdout_out = result_container["output"] or ""
@@ -142,7 +150,7 @@ def execute_python_exec(params: dict) -> str:
     if not parts:
         parts.append("代码执行成功（无输出）")
 
-    return "\n".join(parts)
+    return ToolResult.succeeded("\n".join(parts))
 
 
 HANDLERS = {
