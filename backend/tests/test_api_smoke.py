@@ -475,3 +475,40 @@ class TestRunEventsReplay:
             headers=_auth(db_setup["user2_id"]),
         )
         assert r.status_code in (403, 404)
+
+
+# ── AT-15 / §11-5：Reconciliation 仅限管理员（未授权被拒） ─────────────────
+
+class TestReconcileAuthz:
+    def test_reconcile_requires_superuser(self, client, db_setup):
+        """P1-03 D：未授权用户（非超管）不能进行 Reconciliation（403）；
+        超管通过 get_current_superuser 门禁。"""
+        import os
+
+        from app.models.user import User
+
+        # 非超管（db_setup 的 u2 默认 is_superuser=False）-> 403
+        r = client.post(
+            "/api/v1/agents/runs/some-run/reconcile",
+            json={"tool_call_id": "tc-x", "disposition": "unresolved"},
+            headers=_auth(db_setup["user2_id"]),
+        )
+        assert r.status_code == 403, f"非超管不得调用 Reconciliation: {r.status_code}"
+
+        # 超管 -> 通过授权门禁（不是 401/403）
+        engine = create_engine(os.environ["DATABASE_SYNC_URL"])
+        with Session(engine) as s:
+            admin = User(
+                username="api_admin", email="admin@test.dev",
+                hashed_password="x", is_active=True, is_superuser=True,
+            )
+            s.add(admin)
+            s.commit()
+            admin_id = admin.id
+        r = client.post(
+            "/api/v1/agents/runs/some-run/reconcile",
+            json={"tool_call_id": "tc-x", "disposition": "unresolved"},
+            headers=_auth(admin_id),
+        )
+        assert r.status_code not in (401, 403), \
+            f"超管应通过 Reconciliation 授权门禁: {r.status_code}"

@@ -241,20 +241,29 @@ class RunWorker:
         if handle.status == STATUS_PENDING:
             handle.transition(STATUS_RUNNING)
 
-        # 显式恢复（HITL resume）跳过恢复检查：决策合法性由审批层负责（Phase 4）
-        if job.resume is not None:
-            mode, reason, actions = RECOVERY_FRESH, "", []
-        else:
-            mode, reason, actions, _recovery_meta = await self.service._recovery_check(row)
-
-        if mode == RECOVERY_NEEDS_RECONCILIATION:
-            await self._pause_run(handle, STATUS_NEEDS_RECONCILIATION, reason=reason)
+        # 显式恢复（HITL resume）不得跳过 Checkpoint 校验直接 RECOVERY_FRESH（P1-03 D
+        # 堵洞）：Checkpoint 丢失时**不得自动重新推理**生成新工具调用，应要求明确的
+        # 人工重启策略或创建新 Run（转 needs_reconciliation）。
+        is_resume = job.resume is not None
+        mode, reason, actions, _recovery_meta = await self.service._recovery_check(row)
+        if is_resume and mode in (RECOVERY_FRESH, RECOVERY_NEEDS_RECONCILIATION):
+            await self._pause_run(
+                handle, STATUS_NEEDS_RECONCILIATION,
+                reason="Checkpoint 丢失，HITL 恢复无法进行（拒绝自动重新推理）；"
+                       "请人工核对处置或创建新 Run",
+            )
             return
-        if mode == RECOVERY_WAITING_APPROVAL:
-            await self._pause_run(handle, STATUS_WAITING_APPROVAL, actions=actions)
-            return
 
-        if mode == RECOVERY_CONTINUE:
+        # 恢复驱动（非 resume）按恢复模式分流；resume 带决策直接续跑（Command(resume)）
+        if not is_resume:
+            if mode == RECOVERY_NEEDS_RECONCILIATION:
+                await self._pause_run(handle, STATUS_NEEDS_RECONCILIATION, reason=reason)
+                return
+            if mode == RECOVERY_WAITING_APPROVAL:
+                await self._pause_run(handle, STATUS_WAITING_APPROVAL, actions=actions)
+                return
+
+        if mode == RECOVERY_CONTINUE and not is_resume:
             job = replace(job, messages=None, resume=None)
         elif job.messages is None and job.resume is None:
             # 恢复路径：从数据库输入快照重建请求输入
@@ -334,6 +343,9 @@ class RunWorker:
             results = await asyncio.gather(drive_task, hb_task, return_exceptions=True)
             await self._release(handle, lease_version)
             self._active.pop(handle.run_id, None)
+            # P1-04 §12：Run 终态后释放 Registry 热数据（Task 已完成），避免长期运行
+            # 进程内 _runs/_by_idem 线性增长；状态真相恒在 DB，释放不影响查询/回放/幂等。
+            self.service.registry.release(handle.run_id)
         exc = drive_task.exception() if not drive_task.cancelled() else None
         if exc is not None:
             if isinstance(exc, RunLeaseLost):
@@ -375,8 +387,22 @@ class RunWorker:
                     handle.suspend_reason = "lease_lost"
                     drive_task.cancel()
                     return
+                # 心跳轮询发现取消意图（P1-04 §12）：取消执行驱动（在途外部工具
+                # 不伪造取消完成；_drive CancelledError 分支负责落库 cancelled）
+                if await self._cancel_requested(handle.run_id):
+                    logger.info("run %s 心跳发现取消请求，取消执行", handle.run_id)
+                    drive_task.cancel()
+                    return
         except asyncio.CancelledError:
             raise
+
+    async def _cancel_requested(self, run_id: str) -> bool:
+        try:
+            async with AsyncSessionLocal() as db:
+                return await RunRepository(db).is_cancel_requested(run_id)
+        except Exception:
+            logger.warning("run %s 取消意图查询失败（忽略本轮）", run_id, exc_info=True)
+            return False
 
     async def _heartbeat(
         self, run_id: str, lease_version: Optional[int], *, session_id: Optional[int] = None

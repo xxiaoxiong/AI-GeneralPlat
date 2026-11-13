@@ -117,11 +117,30 @@ alembic downgrade b7c8d9e0f1a2   # 回到 durable execution 迁移之前
 
 2. 核对：凭 `idempotency_key` / `external_operation_id` / `args_snapshot` 到下游系统查询该操作
    是否已生效（**必须以查代猜**）；
-3. 处置：
-   - 下游已生效 → 将账本行人工置 `succeeded`（补录 `result_payload`），Run 可恢复继续；
-   - 下游未生效 → 将账本行置 `failed` 后触发重试（`POST /runs/{run_id}/resume`）；
-   - 无法查证 → 保持 `needs_reconciliation`，业务侧人工补偿，**禁止盲目重放**；
-4. 记录：所有人工处置留工单，关联 `run_id + tool_call_id`。
+3. 处置：调用正式核对接口 `POST /runs/{run_id}/reconcile`（仅超管/授权运维角色），
+   **禁止手工 UPDATE 账本状态**。按核对结论选择 `disposition`：
+   - `confirmed_succeeded`：下游已生效 → 账本补录 `external_operation_id` 并置 `succeeded`，
+     Run 可按需恢复继续；
+   - `confirmed_not_executed`：确认下游未生效 → 置 `prepared`（允许按安全策略恢复/重试）；
+     **若 Checkpoint 已丢失，不得自动重新推理**，须走明确的人工重启策略或创建新 Run；
+   - `unresolved`：无法查证 → 保持 `needs_reconciliation`（持续阻断），业务侧人工补偿，
+     **禁止盲目重放**。
+
+   请求体（`tool_call_id` / `idempotency_key` 二选一精确定位账本行）：
+
+   ```json
+   {
+     "tool_call_id": "tc-xxx",
+     "disposition": "confirmed_succeeded",
+     "external_operation_id": "OP-123",
+     "note": "下游查询确认已生效"
+   }
+   ```
+
+   接口在事务内做条件状态迁移（`WHERE status='needs_reconciliation'`），并写审计
+   （`reconcile_decision` / `reconciled_by` / `reconciled_at` / `reconcile_note` /
+   `external_operation_id`）；重复处置幂等、越权 403、非法处置 400。
+4. 记录：核对接口已落审计列，另留工单关联 `run_id + tool_call_id` 备查。
 
 ## 6. 监控与巡检建议
 

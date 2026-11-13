@@ -13,7 +13,7 @@ from pydantic import BaseModel
 
 from app.core.database import get_db, AsyncSessionLocal
 from app.core.config import settings
-from app.api.deps import get_current_user
+from app.api.deps import get_current_user, get_current_superuser
 from app.models.user import User
 from app.models.agent import Agent, AgentSession
 from app.services.agent import AgentEngine
@@ -698,6 +698,15 @@ class ResumeRequest(BaseModel):
     decisions: List[ApprovalDecision]
 
 
+class RunReconcileRequest(BaseModel):
+    """人工核对请求（P1-03 §11 D）：needs_reconciliation 执行的管理员处置。"""
+    tool_call_id: Optional[str] = None
+    idempotency_key: Optional[str] = None
+    disposition: str = "unresolved"  # confirmed_succeeded / confirmed_not_executed / unresolved
+    external_operation_id: Optional[str] = None
+    note: Optional[str] = None
+
+
 def _decisions_payload(body: Optional[ResumeRequest]) -> List[dict]:
     if body is None:
         return [{"type": "approve", "message": "", "action_id": None}]
@@ -762,6 +771,33 @@ async def stream_run_events(
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Run-Id": run_id},
     )
+
+
+@router.post("/runs/{run_id}/reconcile")
+async def reconcile_run(
+    run_id: str,
+    body: RunReconcileRequest,
+    current_user: User = Depends(get_current_superuser),
+):
+    """人工核对（P1-03 §11 D）：needs_reconciliation 执行的管理员处置。
+
+    仅超管可调用。三处置 confirmed_succeeded / confirmed_not_executed / unresolved；
+    条件状态迁移 + 审计（核对人/时间/外部 operation ID/说明）；Checkpoint 丢失时
+    不得自动重新推理（本接口从不驱动图执行）。
+    """
+    try:
+        result = await get_runtime_service().reconcile_run(
+            run_id,
+            tool_call_id=body.tool_call_id,
+            idempotency_key=body.idempotency_key,
+            disposition=body.disposition,
+            external_operation_id=body.external_operation_id,
+            note=body.note,
+            reconciled_by=current_user.id,
+        )
+    except ApprovalInvalid as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    return result
 
 
 @router.post("/runs/{run_id}/cancel")

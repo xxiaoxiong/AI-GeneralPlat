@@ -342,6 +342,36 @@ class RunRepository:
         )
         return res.rowcount == 1
 
+    async def request_cancel(self, run_id: str, user_id: Optional[int] = None) -> bool:
+        """CAS 写入取消意图（P1-04 §12）：DB 是取消意图的唯一真相源。
+
+        幂等：已请求则不重复写；仅非终态写入。返回是否本次写入。
+        Worker 心跳轮询读取该标记发现取消；在途外部工具不得伪造取消完成。
+        """
+        res = await self.session.execute(
+            update(AgentRun)
+            .where(
+                AgentRun.id == run_id,
+                AgentRun.cancel_requested.is_(False),
+                AgentRun.status.notin_(TERMINAL_STATUSES),
+            )
+            .values(
+                cancel_requested=True,
+                cancel_requested_at=datetime.utcnow(),
+                cancel_requested_by=user_id,
+                updated_at=datetime.utcnow(),
+            ),
+            execution_options={"synchronize_session": False},
+        )
+        return res.rowcount == 1
+
+    async def is_cancel_requested(self, run_id: str) -> bool:
+        """查询取消意图（P1-04 §12）：Worker 心跳轮询据此发现取消请求。"""
+        res = await self.session.execute(
+            select(AgentRun.cancel_requested).where(AgentRun.id == run_id)
+        )
+        return bool(res.scalar_one_or_none())
+
     # ── 租约：原子 Claim / Heartbeat / Release（FR-02 / P0-02 B） ───────
 
     async def claim(self, run_id: str, worker_id: str, lease_seconds: int) -> Optional[int]:

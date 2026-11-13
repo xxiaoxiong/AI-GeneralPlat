@@ -409,21 +409,25 @@ class AgentRuntimeService:
                 yield {"type": "done", "status": "failed"}
             return
 
+        # 当前批次动作（决策前快照）：历史批次均已决策，未决策的即当前 Interrupt 批次
+        batch_action_ids = await self._current_batch_action_ids(run_id)
+
         # 审批决策必须先持久化成功（关键写入失败向上抛出，不得带病执行副作用）
         await self._record_approval_decision(run_id, decisions, deciding_user_id)
 
-        # 图内恢复用决策：按审批登记顺序对齐 action_requests（与 Checkpoint 一致）
-        from sqlalchemy import select
-        from app.models.agent import AgentApproval
-
-        async with AsyncSessionLocal() as db:
-            rows = (await db.execute(
-                select(AgentApproval).where(AgentApproval.run_id == run_id).order_by(AgentApproval.id)
-            )).scalars().all()
-        graph_decisions = [
-            {"type": r.decision, "message": r.message or ""}
-            for r in rows if r.decision is not None
-        ]
+        # 图内恢复用决策（P1-03 A）：**只按当前 Interrupt 批次**的动作顺序构造。
+        # langchain HITL batched 模式 decisions 数组与 action_requests 按位置对齐
+        # 且数量必须一致 —— 禁止把历史 Interrupt 批次的决策带入当前 Command(resume)
+        # （否则历史决策会错位/溢出当前批次）。
+        graph_decisions = await self._build_resume_decisions(run_id, batch_action_ids)
+        if graph_decisions is None:
+            yield {
+                "type": "error",
+                "content": "当前 Interrupt 批次审批决策不完整或缺失，无法恢复",
+                "code": ApprovalInvalid.code,
+            }
+            yield {"type": "done", "status": STATUS_WAITING_APPROVAL}
+            return
 
         # 原子领取（waiting_approval -> running + 租约 + fencing token）
         assert self.worker is not None
@@ -466,22 +470,32 @@ class AgentRuntimeService:
                     return {"ok": False, "error": "运行不存在"}
                 if row.status in TERMINAL_STATUSES:
                     return {"ok": True, "status": row.status}
-                if row.status == STATUS_PENDING:
+                row_status, row_session_id = row.status, row.session_id
+                # CAS 写入取消意图（P1-04 §12：DB 是取消意图唯一真相源）
+                await repo.request_cancel(run_id, user_id)
+                await db.commit()
+                if row_status == STATUS_PENDING:
                     ok = await repo.cancel_without_lease(run_id)
-                    if ok and row.session_id:
+                    if ok and row_session_id:
                         # 无 Lease 取消也要释放 Session 执行权（P1-02）
                         await SessionRepository(db).release_execution(
-                            row.session_id, run_id
+                            row_session_id, run_id
                         )
                     await db.commit()
                     if ok:
                         return {"ok": True, "status": STATUS_CANCELLED}
                     return {"ok": False, "error": "运行状态已变更（可能已被 Worker 领取），无法直接取消"}
-            return {"ok": False, "error": "运行执行中由其他 Worker 持有，无法直接取消"}
+            # running 且无内存句柄（Worker 崩溃/他机持有）：已写取消意图，
+            # 由持有 Worker 心跳轮询发现并取消（在途外部工具不伪造取消完成）
+            return {"ok": True, "status": "cancelling"}
         if run.user_id != user_id:
             return {"ok": False, "error": "无权取消该运行"}
         if run.is_terminal:
             return {"ok": True, "status": run.status}
+        # CAS 写入取消意图（DB 是取消意图唯一真相源），随后尽快终止
+        async with AsyncSessionLocal() as db:
+            await RunRepository(db).request_cancel(run_id, user_id)
+            await db.commit()
         if run.task and not run.task.done():
             # _drive 的 CancelledError 分支负责落库 cancelled（fencing 校验）
             run.task.cancel()
@@ -512,37 +526,34 @@ class AgentRuntimeService:
         return {"ok": False, "error": "运行状态已变更，无法直接取消"}
 
     async def get_run(self, run_id: str, user_id: int) -> Optional[Dict[str, Any]]:
-        run = self.registry.get(run_id)
-        if run is None:
-            async with AsyncSessionLocal() as db:
-                from sqlalchemy import select
-                from app.models.agent import AgentRun
+        """查询运行状态（P1-04）：**恒读数据库**，Registry 仅执行热数据，不作状态真相源。
 
-                row = (await db.execute(select(AgentRun).where(AgentRun.id == run_id))).scalar_one_or_none()
-                if row is None or (row.user_id not in (None, user_id)):
-                    return None
-                return {
-                    "run_id": row.id,
-                    "status": row.status,
-                    "agent_id": row.agent_id,
-                    "session_id": row.session_id,
-                    "thread_id": row.thread_id,
-                    "error": row.error,
-                    "created_at": row.created_at.isoformat() if row.created_at else None,
-                    "finished_at": row.finished_at.isoformat() if row.finished_at else None,
-                }
-        if run.user_id != user_id:
-            return None
-        return {
-            "run_id": run.run_id,
-            "status": run.status,
-            "agent_id": run.agent_id,
-            "session_id": run.session_id,
-            "thread_id": run.thread_id,
-            "error": run.error,
-            "pending_actions": redact_sensitive(run.pending_actions),
-            "created_at": run.created_at.isoformat(),
-        }
+        Worker 崩溃后 Registry 可能残留陈旧内存视图；数据库是状态唯一真相源，
+        Registry 仅补充执行热数据（未决动作）。DB 写入与读取一致性见验收测试。
+        """
+        async with AsyncSessionLocal() as db:
+            from sqlalchemy import select
+            from app.models.agent import AgentRun
+
+            row = (await db.execute(select(AgentRun).where(AgentRun.id == run_id))).scalar_one_or_none()
+            if row is None or (row.user_id not in (None, user_id)):
+                return None
+            result: Dict[str, Any] = {
+                "run_id": row.id,
+                "status": row.status,
+                "agent_id": row.agent_id,
+                "session_id": row.session_id,
+                "thread_id": row.thread_id,
+                "error": row.error,
+                "cancel_requested": bool(row.cancel_requested),
+                "created_at": row.created_at.isoformat() if row.created_at else None,
+                "finished_at": row.finished_at.isoformat() if row.finished_at else None,
+            }
+        # Registry 仅补充执行热数据（未决动作），状态真相仍是 DB
+        handle = self.registry.get(run_id)
+        if handle is not None:
+            result["pending_actions"] = redact_sensitive(handle.pending_actions)
+        return result
 
     async def get_thread_state(self, thread_id: str) -> Optional[Dict[str, Any]]:
         """查询 LangGraph 线程状态（恢复语义：checkpoint 保存全量执行状态）。"""
@@ -581,6 +592,53 @@ class AgentRuntimeService:
                     for ridx, req in enumerate(value["action_requests"]):
                         actions.append(_action_from_req(req, interrupt_id, ridx))
         return actions, has_interrupt
+
+    async def _current_batch_action_ids(self, run_id: str) -> List[str]:
+        """当前 Interrupt 批次的动作 ID（按 action_requests 顺序 = 登记 id 顺序）。
+
+        历史批次动作均已决策（否则无法推进到本批次），故当前批次恰为
+        **尚未决策**（decision IS NULL）的审批动作；登记顺序与图内
+        action_requests 位置对齐（``_record_approval_requests`` 按动作顺序插入）。
+        """
+        from sqlalchemy import select
+        from app.models.agent import AgentApproval
+
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(
+                select(AgentApproval.action_id)
+                .where(AgentApproval.run_id == run_id, AgentApproval.decision.is_(None))
+                .order_by(AgentApproval.id)
+            )).scalars().all()
+        return [str(a) for a in rows if a]
+
+    async def _build_resume_decisions(
+        self, run_id: str, batch_action_ids: List[str]
+    ) -> Optional[List[Dict[str, Any]]]:
+        """构造 Command(resume) 的 decisions 数组（P1-03 A/B）。
+
+        - 只按**当前 Interrupt 批次**（``batch_action_ids``）的动作顺序构造，
+          禁止把历史批次决策带入；
+        - 数组与 action_requests 按位置对齐、数量必须一致（langchain batched）；
+        - 每个批次动作必须有明确决策，否则返回 None（决策不完整，不得恢复）。
+        """
+        if not batch_action_ids:
+            # waiting_approval 必有未决动作；空批次属异常，保守拒绝恢复
+            return None
+        from sqlalchemy import select
+        from app.models.agent import AgentApproval
+
+        async with AsyncSessionLocal() as db:
+            rows = (await db.execute(
+                select(AgentApproval).where(AgentApproval.run_id == run_id)
+            )).scalars().all()
+        by_action = {r.action_id: r for r in rows if r.action_id}
+        graph_decisions: List[Dict[str, Any]] = []
+        for aid in batch_action_ids:
+            r = by_action.get(aid)
+            if r is None or r.decision is None:
+                return None  # 批次动作缺少决策：不完整，不得恢复
+            graph_decisions.append({"type": r.decision, "message": r.message or ""})
+        return graph_decisions
 
     # ── 内部：启动与驱动 ──────────────────────────────────────────────────
 
@@ -1560,15 +1618,39 @@ class AgentRuntimeService:
             raise PersistenceError(f"run {run_id} 审批记录写入失败: {e}") from e
 
     @staticmethod
-    def _match_approval_row(rows: List[Any], dec: Dict[str, Any], idx: int) -> Optional[Any]:
-        """决策与审批动作匹配：带 action_id 精确匹配，否则按登记顺序对齐。"""
+    def _match_approval_row(rows: List[Any], dec: Dict[str, Any], idx: int = 0) -> Optional[Any]:
+        """决策与审批动作匹配：**仅按 action_id 精确匹配**（P1-03 B）。
+
+        禁止按下标跨批次猜测审批对象；未携带 action_id 的决策无法安全定位到
+        具体动作（广播语义由调用方 ``_expand_decisions`` 处理），此处返回 None。
+        """
         action_id = dec.get("action_id")
-        if action_id is not None:
-            for r in rows:
-                if r.action_id == action_id:
-                    return r
+        if action_id is None:
             return None
-        return rows[idx] if idx < len(rows) else None
+        for r in rows:
+            if r.action_id == action_id:
+                return r
+        return None
+
+    @staticmethod
+    def _expand_decisions(decisions: List[Dict[str, Any]], rows: List[Any]) -> List[Dict[str, Any]]:
+        """把广播决策展开为逐动作决策（P1-03 B）。
+
+        - 携带 action_id：精确对应一个动作（否则保持原样，由匹配阶段判定未知动作）；
+        - 未携带 action_id：广播到当前所有**未决策**动作（便捷 "approve all"），
+          不按数组下标猜测历史动作，避免跨批次误配。
+        """
+        expanded: List[Dict[str, Any]] = []
+        for dec in decisions:
+            if dec.get("action_id") is not None:
+                expanded.append(dec)
+                continue
+            targets = [r.action_id for r in rows if r.decision is None and r.action_id]
+            if not targets:
+                expanded.append(dec)  # 无未决动作：保留原决策交由匹配阶段报未知动作
+            for aid in targets:
+                expanded.append({**dec, "action_id": aid})
+        return expanded
 
     async def _check_decisions(self, run_id: str, decisions: List[Dict[str, Any]]) -> str:
         """审批决策校验（不落库）。返回 'ok'（可受理）| 'idempotent'（重复一致提交）。
@@ -1587,7 +1669,7 @@ class AgentRuntimeService:
                 select(AgentApproval).where(AgentApproval.run_id == run_id).order_by(AgentApproval.id)
             )).scalars().all()
         verdicts: List[str] = []
-        for i, dec in enumerate(decisions):
+        for i, dec in enumerate(self._expand_decisions(decisions, rows)):
             dtype = str(dec.get("type") or "").strip()
             if dtype not in valid_types:
                 raise ApprovalInvalid(f"未知决策类型: {dtype!r}（仅支持 approve / reject）")
@@ -1631,11 +1713,15 @@ class AgentRuntimeService:
         return await self._check_decisions(run_id, decisions)
 
     async def _record_approval_decision(self, run_id: str, decisions: List[Dict[str, Any]], user_id: int) -> None:
-        """审批决策先持久化（FR-04.6）：冲突/非法决策拒绝；重复一致决策幂等。
+        """审批决策先持久化（FR-04.6 / P1-03 C）：数据库 CAS 条件更新。
 
-        关键写入失败必须向上抛出：决策未落库不得发送恢复命令。
+        - 决策写入用条件 UPDATE（``WHERE action_id=? AND decision IS NULL``），
+          并发审批同一动作时只有一个决策成功；
+        - 重复一致决策幂等（不重复写入、不重复执行）；不同决策抛
+          ``ApprovalConflict``（F-11：冲突必须显式拒绝，不得静默覆盖）；
+        - 关键写入失败必须向上抛出：决策未落库不得发送恢复命令。
         """
-        from sqlalchemy import select
+        from sqlalchemy import select, update
         from app.models.agent import AgentApproval
 
         try:
@@ -1643,27 +1729,140 @@ class AgentRuntimeService:
                 rows = (await db.execute(
                     select(AgentApproval).where(AgentApproval.run_id == run_id).order_by(AgentApproval.id)
                 )).scalars().all()
-                for i, dec in enumerate(decisions):
+                for i, dec in enumerate(self._expand_decisions(decisions, rows)):
                     row = self._match_approval_row(rows, dec, i)
                     if row is None:
                         raise ApprovalInvalid(f"未知审批动作: {dec.get('action_id') or f'#{i + 1}'}")
-                    if row.decision is not None:
-                        if row.decision != dec.get("type"):
-                            raise ApprovalConflict(
-                                f"审批动作 {row.action_id or row.id} 已决策为 {row.decision}，"
-                                f"与新决策 {dec.get('type')} 冲突"
-                            )
+                    dtype = str(dec.get("type"))
+                    # CAS：仅当 decision IS NULL 时写入，并发竞争时最多一个成功
+                    res = await db.execute(
+                        update(AgentApproval)
+                        .where(AgentApproval.id == row.id, AgentApproval.decision.is_(None))
+                        .values(
+                            decision=dtype,
+                            message=dec.get("message"),
+                            decided_by=user_id,
+                            decided_at=datetime.utcnow(),
+                            decision_status="approved" if dtype == "approve" else "rejected",
+                            updated_at=datetime.utcnow(),
+                        ),
+                        execution_options={"synchronize_session": False},
+                    )
+                    if res.rowcount == 1:
+                        continue  # 本次决策写入成功
+                    # CAS 未命中：已有决策。相同=幂等，不同=冲突
+                    cur = (await db.execute(
+                        select(AgentApproval.decision).where(AgentApproval.id == row.id)
+                    )).scalar_one_or_none()
+                    if cur == dtype:
                         continue  # 重复一致决策：幂等，不重复写入
-                    row.decision = str(dec.get("type"))
-                    row.message = dec.get("message")
-                    row.decided_by = user_id
-                    row.decided_at = datetime.utcnow()
-                    row.decision_status = "approved" if dec.get("type") == "approve" else "rejected"
+                    raise ApprovalConflict(
+                        f"审批动作 {row.action_id or row.id} 已决策为 {cur}，与新决策 {dtype} 冲突"
+                    )
                 await db.commit()
         except (ApprovalInvalid, ApprovalConflict):
             raise
         except Exception as e:
             raise PersistenceError(f"run {run_id} 审批决策写入失败: {e}") from e
+
+    async def reconcile_run(
+        self,
+        run_id: str,
+        *,
+        tool_call_id: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
+        disposition: str = "unresolved",
+        external_operation_id: Optional[str] = None,
+        note: Optional[str] = None,
+        reconciled_by: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """人工核对（P1-03 §11 D）：``needs_reconciliation`` 执行的管理员处置。
+
+        - 三处置 ``confirmed_succeeded`` / ``confirmed_not_executed`` / ``unresolved``；
+        - 条件状态迁移（仅从 ``needs_reconciliation`` 出发，专用迁移口）、审计留痕
+          （核对人/时间/处置/外部 operation ID/说明）；
+        - **Checkpoint 丢失时不得自动重新推理**生成新工具调用：本方法从不驱动图执行；
+          ``confirmed_not_executed``（允许安全恢复）在 Checkpoint 丢失时仅标记可重试，
+          并返回 ``auto_recovery_allowed=False``，要求明确的人工重启策略或创建新 Run。
+        """
+        if disposition not in (
+            "confirmed_succeeded", "confirmed_not_executed", "unresolved"
+        ):
+            raise ApprovalInvalid(
+                f"未知核对处置: {disposition!r}"
+                "（仅支持 confirmed_succeeded / confirmed_not_executed / unresolved）"
+            )
+        from sqlalchemy import select
+        from app.models.agent import AgentToolExecution
+        from .repositories.tool_execution_repository import ToolExecutionRepository
+
+        async with AsyncSessionLocal() as db:
+            repo = ToolExecutionRepository(db)
+            rec: Optional[Any] = None
+            if tool_call_id:
+                rec = await repo.get(run_id, tool_call_id)
+            elif idempotency_key:
+                rec = (await db.execute(
+                    select(AgentToolExecution).where(
+                        AgentToolExecution.run_id == run_id,
+                        AgentToolExecution.idempotency_key == idempotency_key,
+                    )
+                )).scalars().first()
+            if rec is None:
+                raise ApprovalInvalid("未找到待核对的工具执行记录")
+            was_needs_recon = rec.status == "needs_reconciliation"
+            pre_status = rec.status
+            rec_call_id = rec.tool_call_id
+            rec_idem = rec.idempotency_key
+            hit = await repo.reconcile(
+                rec.id,
+                disposition=disposition,
+                external_operation_id=external_operation_id,
+                note=note,
+                reconciled_by=reconciled_by,
+            )
+            await db.commit()
+            result_status = pre_status if not hit else {
+                "confirmed_succeeded": "succeeded",
+                "confirmed_not_executed": "prepared",
+                "unresolved": "needs_reconciliation",
+            }[disposition]
+
+        # Checkpoint 状态（仅作"可否安全自动恢复"判定，绝不触发重新推理）
+        state = await self.get_thread_state(
+            (await self._run_thread_id(run_id)) or ""
+        )
+        checkpoint_lost = state is None or bool(state.get("error"))
+        # 仅 confirmed_not_executed 会导向恢复/重试；Checkpoint 丢失则不得自动恢复
+        auto_recovery_allowed = (
+            disposition == "confirmed_not_executed" and not checkpoint_lost
+        )
+        return {
+            "run_id": run_id,
+            "tool_call_id": rec_call_id,
+            "idempotency_key": rec_idem,
+            "disposition": disposition,
+            "matched": hit,
+            "was_needs_reconciliation": was_needs_recon,
+            "status": result_status,
+            "external_operation_id": external_operation_id,
+            "checkpoint_lost": checkpoint_lost,
+            "auto_recovery_allowed": auto_recovery_allowed,
+            "message": (
+                "已记录核对处置（未触发任何重新推理）"
+                + ("；Checkpoint 丢失，需明确人工重启策略或创建新 Run，不得自动重新推理"
+                   if (disposition == "confirmed_not_executed" and checkpoint_lost) else "")
+            ),
+        }
+
+    async def _run_thread_id(self, run_id: str) -> Optional[str]:
+        from sqlalchemy import select
+        from app.models.agent import AgentRun
+
+        async with AsyncSessionLocal() as db:
+            return (await db.execute(
+                select(AgentRun.thread_id).where(AgentRun.id == run_id)
+            )).scalar_one_or_none()
 
 
 class _RunLimitExceeded(Exception):

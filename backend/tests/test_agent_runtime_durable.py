@@ -86,6 +86,12 @@ async def _db():
     async with AsyncSessionLocal() as s:
         for model in (AgentRunEvent, AgentToolExecution, AgentApproval, AgentRun):
             await s.execute(delete(model))
+        # 真实 PG/MySQL 强制外键：seed agent/user 行，保证 agent_runs.agent_id/user_id 引用有效
+        # （SQLite 默认不强制 FK，故此 seed 仅在生产库回归时起作用；不动任何断言）
+        if await s.get(Agent, 1) is None:
+            s.add(Agent(id=1, name="durable-agent"))
+        if await s.get(User, 1) is None:
+            s.add(User(id=1, username="u1", email="u1@test.local", hashed_password="x"))
         await s.commit()
     yield
     await engine.dispose()
@@ -1535,6 +1541,394 @@ async def test_t08_sse_replay_after_disconnect_no_loss():
     assert chunks == [f"t{i}" for i in range(29)]
     assert all_events[-2]["type"] == "final"
     assert all_events[-2]["content"] == "".join(chunks)
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Batch 6（P1-03 §11 / P1-04 §12）验收
+# ════════════════════════════════════════════════════════════════════════════
+
+
+def _setup_hitl_script(monkeypatch, calls, script):
+    """通用 HITL 装配：按给定模型脚本（多轮工具调用→多批次 Interrupt）。"""
+    import app.services.agent_runtime.factory as factory_mod
+
+    model = _FakeChatModel(script=list(script))
+    monkeypatch.setattr(factory_mod, "build_chat_model", lambda *a, **k: model)
+
+    async def behavior(name, args):
+        calls.append({"name": name, "args": dict(args)})
+        return "webhook 已送达"
+
+    monkeypatch.setattr(
+        "app.services.agent_runtime.tools.adapter.ToolExecutor",
+        _fake_executor(behavior),
+    )
+    monkeypatch.setattr(AgentRuntimeService, "_load_model", _fake_load_model)
+    monkeypatch.setattr(AgentRuntimeService, "_load_agent_config", _fake_load_agent_config)
+
+
+def _tool_turn(call_id: str):
+    return AIMessage(content="", tool_calls=[{
+        "name": "webhook_notify",
+        "args": {"webhook_url": "https://hooks.example.com/x", "message": call_id},
+        "id": call_id,
+    }])
+
+
+async def _consume(svc_stream):
+    return [e async for e in svc_stream]
+
+
+async def _pending_action_ids(run_id):
+    """当前未决策（= 当前 Interrupt 批次）的 action_id，按登记顺序（动作顺序）。"""
+    from sqlalchemy import select
+    async with AsyncSessionLocal() as s:
+        rows = (await s.execute(
+            select(AgentApproval.action_id).where(
+                AgentApproval.run_id == run_id, AgentApproval.decision.is_(None)
+            ).order_by(AgentApproval.id)
+        )).scalars().all()
+    return [r for r in rows]
+
+
+# ── §11-2：同一 Run 连续两个 Interrupt，第二次只恢复第二批动作 ─────────────
+
+@pytest.mark.asyncio
+async def test_t03b_second_interrupt_batch_isolated(monkeypatch):
+    """P1-03 A：两个连续 Interrupt，第二次恢复只带第二批决策（不把历史批次带入）。
+
+    老实现按 Run 全部已决策审批构造 graph_decisions，会在第二次恢复时把第一批
+    决策一并塞入 Command(resume)，与第二批 action_requests 数量/位置不齐而失败。
+    """
+    calls = []
+    _setup_hitl_script(monkeypatch, calls, [
+        _tool_turn("tc-h1"),          # 批次 1：单动作
+        _tool_turn("tc-h2"),          # 批次 2：单动作（第一批执行后再触发）
+        AIMessage(content="全部完成"),
+    ])
+
+    svc = _make_service(worker_id="w-b6-1")
+    run_id, events = await _run_to_waiting_approval(svc)
+    assert events[-1]["status"] == STATUS_WAITING_APPROVAL
+
+    batch1 = await _pending_action_ids(run_id)
+    assert len(batch1) == 1, f"批次 1 应为单动作: {batch1}"
+    # 第一次恢复：批准批次 1 → 执行后触发批次 2 中断
+    events = await _consume(svc.resume_run(
+        run_id, [{"type": "approve", "message": "ok", "action_id": batch1[0]}], 1,
+    ))
+    assert events[-1]["type"] == "done" and events[-1]["status"] == STATUS_WAITING_APPROVAL, \
+        f"第一次恢复后应再次进入待审批（第二批）: {events[-3:]}"
+
+    batch2 = await _pending_action_ids(run_id)
+    assert len(batch2) == 1 and batch2[0] != batch1[0], f"批次 2 应为新的单动作: {batch2}"
+    # 第二次恢复：仅批准批次 2。若把批次 1 决策也带入会数量/位置不齐而失败。
+    events = await _consume(svc.resume_run(
+        run_id, [{"type": "approve", "message": "ok", "action_id": batch2[0]}], 1,
+    ))
+    assert events[-1]["type"] == "done" and events[-1]["status"] == STATUS_COMPLETED, \
+        f"第二次恢复应完成（决策仅对齐第二批）: {events[-3:]}"
+    assert len(calls) == 2, f"两个批次各执行一次工具: {calls}"
+    assert [c["args"]["message"] for c in calls] == ["tc-h1", "tc-h2"]
+
+
+# ── §11-4：多个 action_id 的审批结果严格对应（按位置对齐） ─────────────────
+
+@pytest.mark.asyncio
+async def test_t03c_multi_action_batch_strict_mapping(monkeypatch):
+    """P1-03 B：一个 Interrupt 批次含多个动作时，决策按 action_id 精确对应。"""
+    calls = []
+    _setup_hitl_script(monkeypatch, calls, [
+        # 同一轮发出两个 webhook_notify → 一个批次两个动作
+        AIMessage(content="", tool_calls=[
+            {"name": "webhook_notify", "args": {"webhook_url": "u", "message": "A"}, "id": "tc-A"},
+            {"name": "webhook_notify", "args": {"webhook_url": "u", "message": "B"}, "id": "tc-B"},
+        ]),
+        AIMessage(content="完成"),
+    ])
+
+    svc = _make_service(worker_id="w-b6-4")
+    run_id, events = await _run_to_waiting_approval(svc)
+
+    batch = await _pending_action_ids(run_id)
+    assert len(batch) == 2, f"一个批次应含两个动作: {batch}"
+    # 严格对应：登记顺序=动作顺序（[A, B]）。A 拒绝、B 批准（按 action_id 对齐）。
+    events = await _consume(svc.resume_run(
+        run_id, [
+            {"type": "reject", "message": "A 不批", "action_id": batch[0]},
+            {"type": "approve", "message": "B 放行", "action_id": batch[1]},
+        ], 1,
+    ))
+    assert events[-1]["type"] == "done", f"多动作批次应能恢复: {events[-3:]}"
+    # 严格对应：仅 B（批准）执行副作用，A（拒绝）不得执行
+    assert [c["args"]["message"] for c in calls] == ["B"], f"仅批准的动作执行: {calls}"
+
+
+@pytest.mark.asyncio
+async def test_t03d_unknown_action_id_rejected():
+    """P1-03 B：action_id 必须精确匹配，未知动作显式拒绝（不得按下标猜测）。"""
+    svc = _make_service(worker_id="w-b6-b")
+    async with AsyncSessionLocal() as s:
+        run, _ = await _create_run(RunRepository(s))
+        s.add(AgentApproval(
+            run_id=run.id, tool_name="webhook_notify",
+            action_id="tc-known", args_hash="h", tool_call_id="tc-known",
+            decision_status="pending",
+        ))
+        await s.commit()
+        run_id = run.id
+    with pytest.raises(ApprovalInvalid):
+        await svc._check_decisions(run_id, [{"type": "approve", "action_id": "no-such"}])
+
+
+# ── §11-3：重复一致决策幂等 / 冲突决策显式拒绝 / 写入 CAS ───────────────────
+
+@pytest.mark.asyncio
+async def test_t03e_idempotent_and_conflict_and_cas():
+    """P1-03 C：重复一致决策幂等；冲突决策 409；并发 CAS 只有一个成功。"""
+    svc = _make_service(worker_id="w-b6-c")
+    async with AsyncSessionLocal() as s:
+        run, _ = await _create_run(RunRepository(s))
+        s.add(AgentApproval(
+            run_id=run.id, tool_name="webhook_notify",
+            action_id="tc-c", args_hash="h", tool_call_id="tc-c",
+            decision_status="pending",
+        ))
+        await s.commit()
+        run_id = run.id
+
+    dec = [{"type": "approve", "message": "ok", "action_id": "tc-c"}]
+    # 幂等：重复一致决策不报错、不重复写
+    assert await svc._check_decisions(run_id, dec) in ("ok", "idempotent")
+    await svc._record_approval_decision(run_id, dec, 1)
+    assert await svc._check_decisions(run_id, dec) == "idempotent"
+
+    # 冲突：改判显式拒绝
+    with pytest.raises(ApprovalConflict):
+        await svc._check_decisions(run_id, [{"type": "reject", "action_id": "tc-c"}])
+
+    # CAS：并发两个不同决策写入同一动作，最多一个成功
+    import asyncio as _aio
+    results = await _aio.gather(
+        svc._record_approval_decision(run_id, [{"type": "approve", "action_id": "tc-x"}], 1),
+        svc._record_approval_decision(run_id, [{"type": "reject", "action_id": "tc-x"}], 2),
+        return_exceptions=True,
+    )
+    conflicts = sum(1 for r in results if isinstance(r, (ApprovalConflict, ApprovalInvalid)))
+    assert conflicts >= 1, f"CAS 并发必须有显式冲突/拒绝: {results}"
+
+
+# ── §11-6：Checkpoint 丢失不得自动重新推理 ─────────────────────────────────
+
+@pytest.mark.asyncio
+async def test_t03f_reconcile_lost_checkpoint_no_auto_reinfer():
+    """P1-03 D：Checkpoint 丢失时 confirmed_not_executed 不得自动重新推理。"""
+    async with AsyncSessionLocal() as s:
+        run, _ = await _create_run(RunRepository(s))
+        s.add(AgentToolExecution(
+            run_id=run.id, tool_call_id="tc-r", tool_name="webhook_notify",
+            idempotency_key="idem-r", args_hash="h", status=TOOL_EXEC_NEEDS_RECONCILIATION,
+        ))
+        await s.commit()
+        run_id = run.id
+
+    svc = _make_service(worker_id="w-b6-d")
+    res = await svc.reconcile_run(
+        run_id, tool_call_id="tc-r", disposition="confirmed_not_executed",
+        external_operation_id=None, note="未执行", reconciled_by=1,
+    )
+    # 从不驱动图执行；Checkpoint 缺失时不得自动恢复/重新推理
+    assert res["matched"] is True
+    assert res["status"] == "prepared"
+    assert res["auto_recovery_allowed"] is False, \
+        "Checkpoint 丢失时不得自动重新推理（应要求人工重启或新 Run）"
+
+
+# ── §12-1：API 恒读 DB（Registry 不作状态真相源） ───────────────────────────
+
+@pytest.mark.asyncio
+async def test_t12a_get_run_reads_db_not_stale_registry():
+    """P1-04：Worker 崩溃后 Registry 可能残留陈旧状态，get_run 必须恒读 DB。"""
+    from sqlalchemy import update as _update
+    svc = _make_service(worker_id="w-b6-e")
+    async with AsyncSessionLocal() as s:
+        run, _ = await _create_run(RunRepository(s))
+        await s.execute(_update(AgentRun).where(AgentRun.id == run.id).values(status=STATUS_COMPLETED))
+        await s.commit()
+        run_id, uid = run.id, run.user_id
+
+    # 人为放入陈旧 Registry 句柄（status 与 DB 不一致）
+    RunRegistry.instance().attach(
+        run_id=run_id, agent_id=1, session_id=None, user_id=uid,
+        thread_id="stale", status=STATUS_RUNNING,
+    )
+    got = await svc.get_run(run_id, uid)
+    assert got["status"] == STATUS_COMPLETED, \
+        f"get_run 必须返回 DB 真相（completed），而非 Registry 陈旧 running: {got}"
+    RunRegistry.instance()._runs.pop(run_id, None)
+
+
+# ── §12-4：pending Run 取消与 Worker Claim 互斥 ────────────────────────────
+
+@pytest.mark.asyncio
+async def test_t12d_cancel_pending_excludes_claim():
+    """P1-04：pending Run 取消后不得被 Worker 领取（取消与 Claim 互斥）。"""
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)                 # 默认 pending
+        await s.commit()
+        run_id = run.id
+
+        ok = await repo.cancel_without_lease(run_id)     # 取消 pending
+        await s.commit()
+        assert ok is True
+
+        row = await repo.claim(run_id, "w-x", 30)        # 取消后再领取必须失败
+        await s.commit()
+        assert row is None, "已取消的 pending Run 不得被 Claim"
+
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run2, _ = await _create_run(repo)                # 默认 pending
+        await s.commit()
+        row = await repo.claim(run2.id, "w-y", 30)       # 先领取
+        await s.commit()
+        assert row is not None
+        # 已领取（running）后 cancel_without_lease 必须失败（互斥）
+        assert await repo.cancel_without_lease(run2.id) is False
+
+
+# ── §11-6：needs_reconciliation 三处置生效 + 审计留痕 ─────────────────────
+
+@pytest.mark.asyncio
+async def test_t03g_reconcile_three_dispositions_and_audit():
+    """P1-03 D：正式核对接口三处置（解决/终止/保持阻断）+ 审计（人/时/外部 operation ID）。"""
+    svc = _make_service(worker_id="w-b6-f")
+    async with AsyncSessionLocal() as s:
+        run, _ = await _create_run(RunRepository(s))
+        for cid in ("tc-ok", "tc-no", "tc-un"):
+            s.add(AgentToolExecution(
+                run_id=run.id, tool_call_id=cid, tool_name="webhook_notify",
+                idempotency_key=f"idem-{cid}", args_hash="h",
+                status=TOOL_EXEC_NEEDS_RECONCILIATION,
+            ))
+        await s.commit()
+        run_id = run.id
+
+    # confirmed_succeeded -> succeeded（补录外部 operation ID）
+    r1 = await svc.reconcile_run(
+        run_id, tool_call_id="tc-ok", disposition="confirmed_succeeded",
+        external_operation_id="OP-123", note="下游已成功", reconciled_by=7,
+    )
+    assert r1["matched"] is True and r1["status"] == TOOL_EXEC_SUCCEEDED
+
+    # confirmed_not_executed -> prepared（允许安全恢复/重试）
+    r2 = await svc.reconcile_run(
+        run_id, tool_call_id="tc-no", disposition="confirmed_not_executed",
+        external_operation_id=None, note="未执行", reconciled_by=7,
+    )
+    assert r2["matched"] is True and r2["status"] == TOOL_EXEC_PREPARED
+
+    # unresolved -> 保持 needs_reconciliation（阻断，仅留痕）
+    r3 = await svc.reconcile_run(
+        run_id, tool_call_id="tc-un", disposition="unresolved",
+        external_operation_id=None, note="仍无法确认", reconciled_by=7,
+    )
+    assert r3["matched"] is True and r3["status"] == TOOL_EXEC_NEEDS_RECONCILIATION
+
+    from sqlalchemy import select as _sel
+    async with AsyncSessionLocal() as s:
+        rows = {r.tool_call_id: r for r in (await s.execute(
+            _sel(AgentToolExecution).where(AgentToolExecution.run_id == run_id)
+        )).scalars().all()}
+    ok = rows["tc-ok"]
+    assert ok.status == TOOL_EXEC_SUCCEEDED and ok.external_operation_id == "OP-123"
+    assert ok.reconcile_decision == "confirmed_succeeded" and ok.reconciled_by == 7
+    assert ok.reconciled_at is not None, "审计须记录核对时间"
+    assert rows["tc-no"].status == TOOL_EXEC_PREPARED
+    assert rows["tc-no"].reconcile_decision == "confirmed_not_executed"
+    assert rows["tc-un"].status == TOOL_EXEC_NEEDS_RECONCILIATION
+    assert rows["tc-un"].reconcile_decision == "unresolved"
+
+
+# ── §12-1：Registry 终态释放 + 容量清理（不随 Run 数线性增长） ──────────────
+
+@pytest.mark.asyncio
+async def test_t12b_registry_capacity_and_release_bounded():
+    """P1-04 §12：终态 Run 释放 + 满员 _prune，Registry 规模有界。"""
+    reg = RunRegistry()          # 独立实例，隔离单例
+    reg._max_runs = 50           # 缩小上限便于验证容量清理
+
+    # 终态且 Task 完成 -> release 释放（不得滞留）
+    reg.attach(run_id="r-rel", agent_id=1, session_id=None, user_id=1,
+               thread_id="t", status=STATUS_COMPLETED)
+    reg.release("r-rel")
+    assert reg.get("r-rel") is None, "终态 Run 释放后不得滞留 Registry"
+
+    # 塞入大量终态句柄：attach 触发 _prune，规模必须有界（非线性增长）
+    for i in range(300):
+        reg.attach(run_id=f"r-{i}", agent_id=1, session_id=None, user_id=1,
+                   thread_id=f"t{i}", status=STATUS_COMPLETED)
+    assert len(reg._runs) <= reg._max_runs, \
+        f"Registry 规模必须有界（容量清理）: {len(reg._runs)}"
+    assert len(reg._runs) < 100, f"Registry 不得随 Run 数线性增长: {len(reg._runs)}"
+
+
+# ── §12-3：Worker A 的 Run 可被 Worker B（另一 API 实例）请求取消 ───────────
+
+@pytest.mark.asyncio
+async def test_t12c_cross_worker_cancel_requested_visible():
+    """P1-04 §12：取消意图写 DB（唯一真相源），跨 Worker 心跳轮询可见。"""
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)
+        lease_v = await repo.claim(run.id, "worker-A", 30)   # Worker A 持有执行权
+        await s.commit()
+        assert lease_v is not None
+        run_id, uid = run.id, run.user_id
+
+    # Worker B（另一 API 实例）：本地 Registry 无该 Run 句柄
+    svc_b = _make_service(worker_id="worker-B")
+    res = await svc_b.cancel_run(run_id, uid)
+    assert res["ok"] is True and res["status"] == "cancelling", \
+        f"跨 Worker 取消应写入取消意图并返回 cancelling: {res}"
+
+    # Worker A 侧心跳轮询读 DB 发现取消意图（is_cancel_requested / _cancel_requested）
+    async with AsyncSessionLocal() as s:
+        assert await RunRepository(s).is_cancel_requested(run_id) is True
+    assert await svc_b.worker._cancel_requested(run_id) is True
+
+
+# ── §12-5：取消在途外部工具不得伪造取消成功（正确记录 unknown） ─────────────
+
+@pytest.mark.asyncio
+async def test_t12e_cancel_inflight_external_tool_not_faked_success():
+    """P1-04 §12：在途外部工具被取消时不得伪造 succeeded，应记 unknown（禁止重复发起）。"""
+    run_id, lease_version = await _claimed_run(worker_id="w-b6-g")
+    lease = _lease_for(run_id, lease_version, "w-b6-g")
+    async with AsyncSessionLocal() as s:
+        repo = ToolExecutionRepository(s)
+        rec, _ = await repo.begin(
+            run_id=run_id, tool_call_id="tc-inflight", tool_name="webhook_notify",
+            args_hash="h", idempotency_key="idem-inflight", lease=lease,
+        )
+        assert await repo.mark_executing(rec.id, lease=lease) is True  # 在途（副作用已发起）
+        await s.commit()
+
+        # 取消请求：仅写意图，不得触碰工具账本伪造成功
+        await RunRepository(s).request_cancel(run_id, 1)
+        await s.commit()
+        row = await repo.get(run_id, "tc-inflight")
+        assert row.status == TOOL_EXEC_EXECUTING, \
+            f"取消不得伪造在途外部工具成功: {row.status}"
+        assert row.status != TOOL_EXEC_SUCCEEDED
+
+        # 在途外部工具被中断后正确记录 unknown（结果未知，禁止重复发起）
+        assert await repo.mark_unknown(rec.id, error="取消中断，结果未知", lease=lease) is True
+        await s.commit()
+        row = await repo.get(run_id, "tc-inflight")
+        assert row.status == TOOL_EXEC_UNKNOWN
+        assert row.status != TOOL_EXEC_SUCCEEDED, "不得伪造取消成功"
 
 
 @pytest.mark.asyncio

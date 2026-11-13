@@ -14,6 +14,8 @@ import asyncio
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime
+
+from app.core.config import settings
 from typing import Any, Dict, List, Optional, Set
 
 from .events import EventBus
@@ -139,6 +141,8 @@ class RunRegistry:
         self._runs: Dict[str, RunHandle] = {}
         self._by_idem: Dict[str, str] = {}
         self._lock = asyncio.Lock()
+        # 容量上限（P1-04 §12）：满员时按终态/租约过期淘汰
+        self._max_runs = int(getattr(settings, "AGENT_MAX_RUNS", 1000))
 
     @classmethod
     def instance(cls) -> "RunRegistry":
@@ -196,6 +200,9 @@ class RunRegistry:
         existing = self._runs.get(run_id)
         if existing is not None:
             return existing
+        # 容量清理（P1-04 §12）：满员时按终态/租约过期淘汰旧句柄
+        if len(self._runs) >= self._max_runs:
+            self._prune()
         handle = RunHandle(
             run_id=run_id,
             agent_id=agent_id,
@@ -211,7 +218,28 @@ class RunRegistry:
         return handle
 
     def release(self, run_id: str) -> None:
-        """终态 run 移出活跃表（保留记录在 DB）。"""
+        """终态 run 移出活跃表（保留记录在 DB）。
+
+        P1-04 §12：Run 终态后释放 Registry 热数据；Registry 不作状态真相源
+        （状态真相恒在 DB）。
+        """
         run = self._runs.get(run_id)
-        if run and run.is_terminal and run.task is None or (run and run.is_terminal and run.task and run.task.done()):
+        if run and run.is_terminal and (run.task is None or run.task.done()):
             self._runs.pop(run_id, None)
+            if run.idempotency_key:
+                self._by_idem.pop(run.idempotency_key, None)
+
+    def _prune(self) -> None:
+        """容量清理（P1-04 §12）：按终态/租约过期淘汰旧句柄。"""
+        now = datetime.utcnow()
+        for rid in list(self._runs.keys()):
+            h = self._runs[rid]
+            expired = (
+                h.lease_expires_at is not None
+                and h.status == STATUS_RUNNING
+                and (now - (h.updated_at or h.created_at)).total_seconds() > 86400
+            )
+            if h.is_terminal or expired:
+                self._runs.pop(rid, None)
+                if h.idempotency_key:
+                    self._by_idem.pop(h.idempotency_key, None)

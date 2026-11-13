@@ -125,6 +125,12 @@ class AgentRun(Base):
     recovery_error = Column(Text, nullable=True)       # 恢复失败原因
     recovery_metadata = Column(JSON, nullable=True)    # 恢复决策元数据（P0-04 §6.3）
 
+    # 取消请求（P1-04 §12）：DB 是取消意图的唯一真相源。cancel_requested=CAS 写入；
+    # 在途外部工具不得伪造取消完成（取消为意图，实现尽力而为）。
+    cancel_requested = Column(Boolean, default=False, nullable=False)  # 是否请求取消
+    cancel_requested_at = Column(DateTime, nullable=True)              # 取消请求时间
+    cancel_requested_by = Column(Integer, ForeignKey("users.id"), nullable=True)  # 请求者
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     finished_at = Column(DateTime, nullable=True)
@@ -185,6 +191,12 @@ class AgentToolExecution(Base):
     external_operation_id = Column(String(128), nullable=True)  # 下游业务操作 ID
     worker_id = Column(String(128), nullable=True)
     lease_version = Column(Integer, default=0, nullable=False)
+
+    # 人工核对（P1-03 §11 D）：needs_reconciliation 之后由管理员核对处置的审计留痕
+    reconcile_decision = Column(String(32), nullable=True)   # confirmed_succeeded/confirmed_not_executed/unresolved
+    reconcile_note = Column(Text, nullable=True)             # 核对说明/证据
+    reconciled_by = Column(Integer, ForeignKey("users.id"), nullable=True)  # 核对人（管理员）
+    reconciled_at = Column(DateTime, nullable=True)          # 核对时间
 
     started_at = Column(DateTime, nullable=True)
     finished_at = Column(DateTime, nullable=True)

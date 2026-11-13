@@ -294,6 +294,57 @@ class ToolExecutionRepository:
             exec_id, TOOL_EXEC_NEEDS_RECONCILIATION, error=error, lease=lease
         )
 
+    async def reconcile(
+        self,
+        exec_id: int,
+        *,
+        disposition: str,
+        external_operation_id: Optional[str] = None,
+        note: Optional[str] = None,
+        reconciled_by: Optional[int] = None,
+    ) -> bool:
+        """人工核对专用迁移口（P1-03 §11 D）。
+
+        ``needs_reconciliation`` 在 ``_ALLOWED_TRANSITIONS`` 中是死终态（空集），
+        普通路径不可迁移；人工核对必须走此专用口做条件状态迁移
+        （``WHERE status='needs_reconciliation'``）。三处置：
+        - ``confirmed_succeeded``：外部副作用确认已发生 -> ``succeeded``
+          （记录 ``external_operation_id``，去重复用）；
+        - ``confirmed_not_executed``：确认未执行 -> ``prepared``（允许安全恢复/重试）；
+        - ``unresolved``：维持 ``needs_reconciliation``，仅留痕审计。
+
+        返回是否命中（仅从 needs_reconciliation 出发的条件更新成功）。调用方不得
+        在此触发任何重新推理。
+        """
+        if disposition not in (
+            "confirmed_succeeded", "confirmed_not_executed", "unresolved"
+        ):
+            raise ValueError(f"未知核对处置: {disposition}")
+        values: Dict[str, Any] = {
+            "reconcile_decision": disposition,
+            "reconcile_note": note,
+            "reconciled_by": reconciled_by,
+            "reconciled_at": datetime.utcnow(),
+            "updated_at": datetime.utcnow(),
+        }
+        if external_operation_id is not None:
+            values["external_operation_id"] = external_operation_id
+        if disposition == "confirmed_succeeded":
+            values["status"] = TOOL_EXEC_SUCCEEDED
+        elif disposition == "confirmed_not_executed":
+            values["status"] = TOOL_EXEC_PREPARED
+        # unresolved：不改 status，仅审计留痕
+        res = await self.session.execute(
+            update(AgentToolExecution)
+            .where(
+                AgentToolExecution.id == exec_id,
+                AgentToolExecution.status == TOOL_EXEC_NEEDS_RECONCILIATION,
+            )
+            .values(**values),
+            execution_options={"synchronize_session": False},
+        )
+        return res.rowcount == 1
+
     async def _finish(
         self,
         exec_id: int,
