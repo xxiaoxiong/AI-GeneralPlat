@@ -1,0 +1,125 @@
+name: CI
+
+# Phase 2.1 §17：最小可运行 CI 链路
+# - requirements.txt 锁定依赖（Python 3.11）
+# - 单个 pytest 进程运行 SQLite 全量（防 SQLite 测试库争抢）
+# - SQLite 迁移测试 test_alembic_migration_upgrade_downgrade 含在全量内
+# - MySQL 8 服务容器：真实迁移测试 + Repository/Durable 关键集
+# - PostgreSQL 服务容器：Checkpointer 测试 + 关键集
+# - 真实模型 E2E 与 Secret 配置分开（见 e2e.yml），未配置时明确 skipped
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  unit-sqlite:
+    name: 单元测试 + SQLite 迁移（单进程）
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: 安装锁定依赖
+        run: pip install -r backend/requirements.txt
+      - name: 全量测试（SQLite，单 pytest 进程）
+        working-directory: backend
+        env:
+          PYTHONPATH: "."
+          PYTHONIOENCODING: utf-8
+          SECRET_KEY: test-secret-key-for-ci
+        run: pytest tests -q --tb=short -p no:cacheprovider
+
+  migration-and-repo-mysql:
+    name: MySQL 8 迁移 + Repository/关键集
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      mysql:
+        image: mysql:8
+        env:
+          MYSQL_ROOT_PASSWORD: ci_root_pw
+          MYSQL_DATABASE: ai_plat_migration_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -pci_root_pw"
+          --health-interval=5s --health-timeout=3s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: 安装锁定依赖
+        run: pip install -r backend/requirements.txt
+      - name: MySQL 8 真实迁移测试（upgrade/downgrade + MySQL 专属索引校验）
+        working-directory: backend
+        env:
+          PYTHONPATH: "."
+          PYTHONIOENCODING: utf-8
+          SECRET_KEY: test-secret-key-for-ci
+          TEST_MYSQL_MIGRATE_SYNC_DSN: "mysql+pymysql://root:ci_root_pw@127.0.0.1:3306/ai_plat_migration_test"
+        run: pytest tests/test_migration_mysql.py -q --tb=short -p no:cacheprovider
+      - name: Repository / Durable 关键集（MySQL 业务库）
+        working-directory: backend
+        env:
+          PYTHONPATH: "."
+          PYTHONIOENCODING: utf-8
+          SECRET_KEY: test-secret-key-for-ci
+          DATABASE_URL: "mysql+aiomysql://root:ci_root_pw@127.0.0.1:3306/ai_plat_migration_test"
+          DATABASE_SYNC_URL: "mysql+pymysql://root:ci_root_pw@127.0.0.1:3306/ai_plat_migration_test"
+        run: >-
+          pytest tests -q --tb=short -p no:cacheprovider
+          -k "p15 or p16 or t01 or t03 or t09 or t12"
+
+  checkpointer-postgres:
+    name: PostgreSQL Checkpointer + 关键集
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: ai_cp
+          POSTGRES_PASSWORD: ci_pg_pw
+          POSTGRES_DB: agent_checkpoints
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U ai_cp -d agent_checkpoints"
+          --health-interval=5s --health-timeout=3s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: backend/requirements.txt
+      - name: 安装锁定依赖
+        run: pip install -r backend/requirements.txt
+      - name: PostgreSQL Checkpointer 测试
+        working-directory: backend
+        env:
+          PYTHONPATH: "."
+          PYTHONIOENCODING: utf-8
+          SECRET_KEY: test-secret-key-for-ci
+          TEST_CHECKPOINT_PG_DSN: "postgresql://ai_cp:ci_pg_pw@127.0.0.1:5432/agent_checkpoints"
+        run: pytest tests/test_checkpointer_persistence.py -q --tb=short -p no:cacheprovider
+      - name: Durable 关键集（PG 业务库）
+        working-directory: backend
+        env:
+          PYTHONPATH: "."
+          PYTHONIOENCODING: utf-8
+          SECRET_KEY: test-secret-key-for-ci
+          DATABASE_URL: "postgresql+psycopg://ai_cp:ci_pg_pw@127.0.0.1:5432/agent_checkpoints"
+          DATABASE_SYNC_URL: "postgresql+psycopg2://ai_cp:ci_pg_pw@127.0.0.1:5432/agent_checkpoints"
+        run: >-
+          pytest tests -q --tb=short -p no:cacheprovider
+          -k "p15 or p16 or t01 or t03 or t09 or t12"

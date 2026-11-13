@@ -404,26 +404,42 @@ class TestE2E:
         from langchain_core.tools import StructuredTool
         from app.services.agent_runtime.events import EventBus
         from app.services.agent_runtime.tools.adapter import ToolAdapterFactory
-
-        bus = EventBus()
-        factory = ToolAdapterFactory(await make_db_ctx(), ToolPolicy(allowed_tools={"broken_tool"}), bus)
-
-        def _broken(x: str) -> str:
-            raise ValueError("boom")
-
-        spec_tool = StructuredTool.from_function(
-            _broken, name="broken_tool", description="必失败工具", args_schema=build_args_model(
-                "broken_tool", {"parameters": {"x": {"type": "string", "description": ""}}, "required": ["x"]}
-            ),
-            coroutine=lambda **kw: factory._execute("broken_tool", kw),
+        from app.services.agent_runtime.tools.policy import (
+            ToolRisk,
+            ToolRiskProfile,
+            register_tool_risk,
+            unregister_tool_risk,
         )
 
-        model = FakeChatModel(script=[
-            _tool_call_turn("broken_tool", {"x": "1"}),
-            lambda **kw: AIMessage(content="工具失败了，无法继续。"),
-        ])
-        final_text, _ = await run_graph(model, [spec_tool], [HumanMessage(content="试一下")])
-        assert "失败" in final_text
+        # §15.2 A：自定义工具必须显式登记风险分类（未登记默认拒绝）；
+        # 登记为只读测试工具后，验证异常以错误文本回传模型的链路不变
+        register_tool_risk(ToolRiskProfile(
+            name="broken_tool", risk=ToolRisk.READ,
+            side_effect_class="read_only", requires_approval=False,
+            retry_policy="safe_retry",
+        ))
+        try:
+            bus = EventBus()
+            factory = ToolAdapterFactory(await make_db_ctx(), ToolPolicy(allowed_tools={"broken_tool"}), bus)
+
+            def _broken(x: str) -> str:
+                raise ValueError("boom")
+
+            spec_tool = StructuredTool.from_function(
+                _broken, name="broken_tool", description="必失败工具", args_schema=build_args_model(
+                    "broken_tool", {"parameters": {"x": {"type": "string", "description": ""}}, "required": ["x"]}
+                ),
+                coroutine=lambda **kw: factory._execute("broken_tool", kw),
+            )
+
+            model = FakeChatModel(script=[
+                _tool_call_turn("broken_tool", {"x": "1"}),
+                lambda **kw: AIMessage(content="工具失败了，无法继续。"),
+            ])
+            final_text, _ = await run_graph(model, [spec_tool], [HumanMessage(content="试一下")])
+            assert "失败" in final_text
+        finally:
+            unregister_tool_risk("broken_tool")
 
     @pytest.mark.asyncio
     async def test_hitl_interrupt_and_resume(self):

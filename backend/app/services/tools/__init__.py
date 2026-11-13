@@ -130,7 +130,8 @@ class ToolExecutor:
             url = url.replace(f"{{{k}}}", str(v))
         from app.core.config import settings as _settings
         async with httpx.AsyncClient(
-            timeout=15, verify=(_settings.AGENT_CA_BUNDLE or _settings.AGENT_TLS_VERIFY)
+            timeout=15, verify=(_settings.AGENT_CA_BUNDLE or _settings.AGENT_TLS_VERIFY),
+            proxy=(_settings.AGENT_EGRESS_PROXY or None),
         ) as client:
             resp = await client.get(url) if method == "GET" else await client.post(url, json=params)
         try:

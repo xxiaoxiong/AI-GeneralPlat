@@ -69,6 +69,7 @@ async def lifespan(app: FastAPI):
 
 async def _seed_initial_data():
     from sqlalchemy import select
+    from sqlalchemy.exc import IntegrityError
     from app.core.database import AsyncSessionLocal
     from app.core.security import get_password_hash
     from app.models.user import User, Role, Permission, UserRole, RolePermission
@@ -78,28 +79,35 @@ async def _seed_initial_data():
         if result.scalar_one_or_none():
             return
 
-        admin_role = Role(name="admin", display_name="管理员", is_system=True,
-                          description="系统管理员，拥有所有权限")
-        user_role = Role(name="user", display_name="普通用户", is_system=True,
-                         description="普通用户")
-        db.add_all([admin_role, user_role])
-        await db.flush()
+        # 多 Worker（uvicorn --workers N）并发启动会同时进入本函数：
+        # roles/users/app_templates 均有唯一约束，捕获冲突即视为其他进程已完成
+        # 播种（整段单事务提交，不存在半播种状态），回滚后正常启动
+        try:
+            admin_role = Role(name="admin", display_name="管理员", is_system=True,
+                              description="系统管理员，拥有所有权限")
+            user_role = Role(name="user", display_name="普通用户", is_system=True,
+                             description="普通用户")
+            db.add_all([admin_role, user_role])
+            await db.flush()
 
-        admin = User(
-            username=settings.ADMIN_USERNAME,
-            email=settings.ADMIN_EMAIL,
-            hashed_password=get_password_hash(settings.ADMIN_PASSWORD),
-            full_name="系统管理员",
-            is_active=True,
-            is_superuser=True,
-        )
-        db.add(admin)
-        await db.flush()
+            admin = User(
+                username=settings.ADMIN_USERNAME,
+                email=settings.ADMIN_EMAIL,
+                hashed_password=get_password_hash(settings.ADMIN_PASSWORD),
+                full_name="系统管理员",
+                is_active=True,
+                is_superuser=True,
+            )
+            db.add(admin)
+            await db.flush()
 
-        db.add(UserRole(user_id=admin.id, role_id=admin_role.id))
+            db.add(UserRole(user_id=admin.id, role_id=admin_role.id))
 
-        await _seed_app_templates(db)
-        await db.commit()
+            await _seed_app_templates(db)
+            await db.commit()
+        except IntegrityError:
+            await db.rollback()
+            logger.info("初始数据已由其他进程播种（唯一约束冲突），跳过")
 
 
 async def _seed_app_templates(db):

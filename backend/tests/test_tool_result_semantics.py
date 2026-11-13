@@ -458,6 +458,12 @@ async def test_smtp_does_not_block_event_loop(monkeypatch):
         def __init__(self, host, port, timeout=None):
             smtp_threads.append(threading.get_ident())
             time.sleep(0.25)  # 同步阻塞调用：若在事件循环线程会卡死 Heartbeat
+            # 模拟已建立的连接（对端为公网地址）：连接阶段对端 IP 校验依赖 sock
+            class _Sock:
+                @staticmethod
+                def getpeername():
+                    return ("8.8.8.8", 587)
+            self.sock = _Sock()
 
         def __enter__(self):
             return self

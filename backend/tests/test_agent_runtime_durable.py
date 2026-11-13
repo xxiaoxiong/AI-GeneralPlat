@@ -1640,9 +1640,10 @@ async def test_t03c_multi_action_batch_strict_mapping(monkeypatch):
     calls = []
     _setup_hitl_script(monkeypatch, calls, [
         # 同一轮发出两个 webhook_notify → 一个批次两个动作
+        # （webhook_url 必须通过 URL Policy 校验，使用合法夹具地址）
         AIMessage(content="", tool_calls=[
-            {"name": "webhook_notify", "args": {"webhook_url": "u", "message": "A"}, "id": "tc-A"},
-            {"name": "webhook_notify", "args": {"webhook_url": "u", "message": "B"}, "id": "tc-B"},
+            {"name": "webhook_notify", "args": {"webhook_url": "https://hooks.example.com/x", "message": "A"}, "id": "tc-A"},
+            {"name": "webhook_notify", "args": {"webhook_url": "https://hooks.example.com/x", "message": "B"}, "id": "tc-B"},
         ]),
         AIMessage(content="完成"),
     ])

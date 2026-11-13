@@ -13,3 +13,6 @@ os.environ.setdefault("DATABASE_SYNC_URL", f"sqlite:///{_TEST_DIR}/test.db")
 os.environ.setdefault("AGENT_CHECKPOINT_DSN", "memory")
 os.environ.setdefault("SECRET_KEY", "test-secret-key-for-pytest")
 os.environ.setdefault("AGENT_FILES_ROOT", os.path.join(_TEST_DIR, "agent_files"))
+# 测试夹具域 *.example.com 显式信任（服务级流程测试的假 Webhook/HTTP 目标，
+# 由 ToolPolicy.from_settings 读取）；安全基线测试直接构造 ToolPolicy，不受影响。
+os.environ.setdefault("AGENT_NETWORK_ALLOWLIST", "example.com")

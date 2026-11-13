@@ -46,7 +46,7 @@ async def execute_http_get(params: dict) -> ToolResult:
     timeout = int(params.get("timeout", 15))
     headers = params.get("headers", {}) or {}
     query_params = params.get("params", {}) or {}
-    async with httpx.AsyncClient(timeout=timeout, verify=(_settings.AGENT_CA_BUNDLE or _settings.AGENT_TLS_VERIFY)) as client:
+    async with httpx.AsyncClient(timeout=timeout, verify=(_settings.AGENT_CA_BUNDLE or _settings.AGENT_TLS_VERIFY), proxy=(_settings.AGENT_EGRESS_PROXY or None)) as client:
         resp = await client.get(url, headers=headers, params=query_params)
     try:
         body = json.dumps(resp.json(), ensure_ascii=False, indent=2)
@@ -66,7 +66,7 @@ async def execute_http_post(params: dict) -> ToolResult:
     timeout = int(params.get("timeout", 15))
     headers = params.get("headers", {}) or {}
     body = params.get("body", {}) or {}
-    async with httpx.AsyncClient(timeout=timeout, verify=(_settings.AGENT_CA_BUNDLE or _settings.AGENT_TLS_VERIFY)) as client:
+    async with httpx.AsyncClient(timeout=timeout, verify=(_settings.AGENT_CA_BUNDLE or _settings.AGENT_TLS_VERIFY), proxy=(_settings.AGENT_EGRESS_PROXY or None)) as client:
         resp = await client.post(url, json=body, headers=headers)
     try:
         resp_body = json.dumps(resp.json(), ensure_ascii=False, indent=2)

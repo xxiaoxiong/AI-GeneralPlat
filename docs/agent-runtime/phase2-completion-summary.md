@@ -2,7 +2,12 @@
 
 > 任务来源：`docs/AI-GeneralPlat_AgentRuntime_Phase2_DurableExecution_TaskBook.md`
 > 完成日期：2026-11-12
-> 最终验证：105 passed / 0 failed / 0 skipped（4 个测试文件，干净环境 10.29s）
+> 最终验证（Phase 2 时点）：105 passed / 0 failed / 0 skipped（4 个测试文件，干净环境 10.29s）
+>
+> **勘误（2026-11-13，Phase 2.1 加固后）**：Phase 2.1（Batch 1–8）已完成，迁移链延长至
+> `d7e8f9a0b1c2`，全量回归为 301 passed / 5 skipped，并已在真实 MySQL 8.0 / PostgreSQL 16
+> 实测（见 `phase2.1-test-report.md`）。本文中"迁移链 head"、"MySQL/PG 未实测"、测试计数、
+> 迁移清单等表述以本页各处勘误标注及 `phase2.1-change-log.md` / `phase2.1-test-report.md` 为准。
 
 ---
 
@@ -89,7 +94,7 @@
 
 ## 4. 数据库变更
 
-**迁移链**（独立新增，head = `f1a2b3c4d5e6`）：
+**迁移链**（独立新增，Phase 2 时点 head = `f1a2b3c4d5e6`；勘误：Phase 2.1 又延长 4 个迁移，现 head = `d7e8f9a0b1c2`）：
 
 ```
 9ce3d801b702 (initial)
@@ -97,7 +102,11 @@
   → a1b2c3d4e5f6  database_connections（改 batch 模式兼容 SQLite，语义不变）
   → b7c8d9e0f1a2  agent_runs / agent_approvals 基础表
   → d4e5f6a7b8c9  Phase 2 durable execution（主迁移）
-  → f1a2b3c4d5e6  agent_run_events + thread_id（head）
+  → f1a2b3c4d5e6  agent_run_events + thread_id（Phase 2 终点）
+  → e3f4a5b6c7d8  add_run_recovery_metadata（Phase 2.1）
+  → b5c6d7e8f9a0  add_session_concurrency_outbox（Phase 2.1）
+  → c6d7e8f9a0b1  add_reconcile_and_cancel（Phase 2.1）
+  → d7e8f9a0b1c2  add_run_budget（Phase 2.1，head）
 ```
 
 - 修改表：`agent_runs` +11 列、`agent_approvals` +6 列；
@@ -122,6 +131,10 @@ python -m pytest tests/test_agent_runtime.py tests/test_agent_runtime_persistenc
 
 → 105 passed, 0 failed, 0 skipped（2026-11-12）
 ```
+
+> 勘误（2026-11-13）：Phase 2.1 后全量回归为 **301 passed / 5 skipped / 0 failed**（16 个测试文件，
+> 含 SEC 安全基线 30 项；5 个 skip 为真实模型 E2E 无 Secret 3 项 + MySQL 迁移默认 DSN 2 项，
+> 明细与三库实测见 `phase2.1-test-report.md`）。
 
 | 测试文件 | 数量 | 覆盖 |
 |---|---|---|
@@ -156,8 +169,8 @@ F-01 创建崩溃、F-02 提交后崩溃、F-03 Claim 后崩溃、F-04 模型调
 
 ## 7. 已知限制与遗留风险
 
-1. **MySQL / PostgreSQL 未实测**（本地无实例）：迁移用 `batch_alter_table` 兼容设计，上线前必须在生产同版本库预演 upgrade/downgrade；
-2. **AsyncPostgresSaver / AsyncPostgresStore 路径未实测**（缺依赖/实例）；
+1. ~~**MySQL / PostgreSQL 未实测**~~ **勘误（2026-11-13）**：已在真实 MySQL 8.0.46 / PostgreSQL 16.15 实测（迁移往返 + 关键集，见 `phase2.1-test-report.md`）；上线前仍建议在生产同版本库预演 upgrade/downgrade；
+2. ~~**AsyncPostgresSaver / AsyncPostgresStore 路径未实测**~~ **勘误（2026-11-13）**：AsyncPostgresSaver 路径已在真实 PG 16 实测（含双进程共享与 kill 接管，CP-01/02/04）；AsyncPostgresStore（跨线程记忆）仍未实测；
 3. **不承诺"恰好一次"外部副作用**：`unknown` 状态依赖人工核对 SOP 最终一致；
 4. F-16 位级损坏、真实 NTP 漂移、长稳/负载测试未纳入本阶段；
 5. `tokens_generated` 无 usage 元数据时为流式计数兜底，可能与计费口径有偏差；
@@ -195,5 +208,5 @@ F-01 创建崩溃、F-02 提交后崩溃、F-03 Claim 后崩溃、F-04 模型调
 | 变更清单 | `docs/agent-runtime/phase2-change-log.md` |
 | 本总结报告 | `docs/agent-runtime/phase2-completion-summary.md` |
 | 代码 | `backend/app/models/agent.py`、`backend/app/services/agent_runtime/`（service/lifecycle/events/context/worker/repositories/tools）、`backend/app/api/v1/agents.py`、`backend/app/core/{config,database}.py`、`backend/app/main.py` |
-| 迁移 | `backend/alembic/versions/add_durable_execution.py`、`add_event_thread_id.py`、`e5f6a7b8c9d0_add_agent_base_tables.py` |
+| 迁移 | `backend/alembic/versions/add_durable_execution.py`、`add_event_thread_id.py`、`e5f6a7b8c9d0_add_agent_base_tables.py`（勘误：另有历史链 `add_database_connections.py`、`add_agent_runs.py` 及 Phase 2.1 新增 `add_run_recovery_metadata.py`、`add_session_concurrency_outbox.py`、`add_reconcile_and_cancel.py`、`add_run_budget.py`） |
 | 测试 | `backend/tests/test_agent_runtime_durable.py`（47 项）等 4 个文件共 105 项 |

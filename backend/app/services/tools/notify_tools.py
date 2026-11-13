@@ -11,12 +11,15 @@ P0-05（任务书 §7）改造：
 - 同步 smtplib 全流程放入 asyncio.to_thread，不阻塞事件循环 / Worker Heartbeat（§7.2 D）。
 """
 import asyncio
+import ipaddress
 import os
 import smtplib
 import socket
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from typing import Optional
+
+from app.core.config import settings
 
 from .result import ToolResult
 
@@ -40,6 +43,28 @@ _SMTP_UNCERTAIN_ERRORS = (
     ConnectionAbortedError,
     BrokenPipeError,
 )
+
+
+def _verify_smtp_peer(server: smtplib.SMTP, host: str) -> None:
+    """SMTP 连接阶段对端 IP 校验（§15.2 B：DNS Rebinding 防护的等价机制）。
+
+    执行前 URL Policy 只能看到解析前的主机名；连接建立后在 EHLO 之前校验
+    实际对端 IP，防止 DNS 解析后被重绑定到内网/回环/链路本地地址。
+    受 AGENT_NETWORK_ALLOWLIST 显式信任的主机跳过（与 URL Policy allowlist
+    语义一致：显式信任决策可含内网中继）。
+    """
+    allow = [x.strip() for x in (getattr(settings, "AGENT_NETWORK_ALLOWLIST", "") or "").split(",") if x.strip()]
+    if any(host == a or host.endswith("." + a) for a in allow):
+        return
+    try:
+        peer = server.sock.getpeername()[0]
+    except OSError as e:
+        raise ConnectionRefusedError(f"SMTP 连接对端无法确认，拒绝继续: {e}") from e
+    ip = ipaddress.ip_address(peer)
+    if ip.is_loopback or ip.is_link_local or ip.is_private or ip.is_reserved:
+        raise ConnectionRefusedError(
+            f"SMTP 对端 {peer} 为内网/回环/链路本地地址，已按 SSRF 策略拒绝（host={host}）"
+        )
 
 
 async def execute_send_email_tool(params: dict) -> ToolResult:
@@ -83,6 +108,8 @@ async def execute_send_email_tool(params: dict) -> ToolResult:
         # 同步 smtplib 全流程在受控线程池执行（§7.2 D）：
         # 不阻塞事件循环，Worker Heartbeat 得以继续；超时由 smtplib timeout 兜底。
         with smtplib.SMTP(smtp_host, smtp_port, timeout=15) as server:
+            # §15.2 B：连接建立后 EHLO 前校验对端 IP（DNS Rebinding 等价防护）
+            _verify_smtp_peer(server, smtp_host)
             server.ehlo()
             server.starttls()
             server.login(smtp_user, smtp_pass)
@@ -158,7 +185,10 @@ async def execute_webhook_notify(params: dict) -> ToolResult:
             payload["at_users"] = at_users
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        # AGENT_EGRESS_PROXY 非空时经受控 Egress Proxy 出口（§15.2 B）
+        async with httpx.AsyncClient(
+            timeout=10, proxy=(getattr(settings, "AGENT_EGRESS_PROXY", "") or None),
+        ) as client:
             response = await client.post(webhook_url, json=payload)
     except httpx.TimeoutException as e:
         return ToolResult.unknown(f"Webhook 发送结果未知（超时）: {e}")

@@ -103,6 +103,8 @@ class Settings(BaseSettings):
     AGENT_STORE_DSN: str = ""                   # 跨线程记忆 Store（空=不启用）
     AGENT_ENABLE_HITL: bool = True              # 人工审批（高危工具 interrupt_on）
     AGENT_SANDBOX_MODE: str = "restricted"      # restricted / disabled / external（disabled 时禁用高危执行工具）
+    AGENT_ALLOW_UNSAFE_PYTHON: bool = False     # 代码执行逃生开关（仅开发）：restricted 不是安全沙箱，生产强制禁用 python_exec/execute
+    AGENT_EGRESS_PROXY: str = ""                # 受控 Egress Proxy（HTTP 出口统一收口；DNS Rebinding 防护的等价机制）
     AGENT_ALLOW_NETWORK: bool = True            # 允许工具网络访问
     AGENT_TLS_VERIFY: bool = True               # TLS 证书校验（禁止生产关闭）
     AGENT_CA_BUNDLE: str = ""                   # 自定义 CA 证书路径（内网自签）

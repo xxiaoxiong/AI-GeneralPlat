@@ -57,6 +57,7 @@ from ..events import (
     TOOL_STARTED,
     EventBus,
     RuntimeEvent,
+    redact_secrets,
     redact_sensitive,
 )
 from ..lifecycle import RunExecutionLease
@@ -97,6 +98,18 @@ _TYPE_MAP: Dict[str, Type] = {
 _DEFINITIVE_ERRORS = (ToolPolicyError, TypeError, KeyError, ValueError, LookupError, ArithmeticError)
 
 _RESULT_PAYLOAD_LIMIT = 8000
+
+# SSRF 统一入口（§15.2 B）：工具名 -> 网络出口参数名。
+# 所有会触达外部网络的目标参数（HTTP url / Webhook url / SMTP host）
+# 必须经由 ToolPolicy.check_url 同一策略校验。
+_NET_TARGET_PARAMS: Dict[str, tuple] = {
+    "http_get": ("url",),
+    "http_post": ("url",),
+    "http_request": ("url",),
+    "fetch_webpage": ("url",),
+    "webhook_notify": ("webhook_url",),
+    "send_email_tool": ("smtp_host",),   # SMTP 目标按 URL 形式过同一策略
+}
 
 
 class ToolLedgerError(PersistenceError, GraphBubbleUp):
@@ -192,9 +205,20 @@ class ToolAdapterFactory:
         try:
             self.policy.check_tool_allowed(name)
             self.policy.check_exec_allowed(name)
-            if name in ("http_get", "http_post", "http_request", "fetch_webpage"):
-                url = args.get("url") or ""
-                self.policy.check_url(str(url))
+            # SSRF 统一入口（§15.2 B）：所有网络出口参数过同一 URL Policy
+            # （http/fetch 的 url、webhook 的 webhook_url、SMTP 的 smtp_host）
+            for pname in _NET_TARGET_PARAMS.get(name, ()):
+                raw = args.get(pname)
+                if not raw:
+                    continue
+                if pname == "smtp_host":
+                    # SMTP 目标转 URL 形式走同一策略（allowlist / 内网拦截）
+                    host = str(raw).strip()
+                    port = args.get("smtp_port")
+                    target = f"http://{host}:{port}" if port else f"http://{host}"
+                else:
+                    target = str(raw)
+                self.policy.check_url(target)
             if name in ("write_file", "edit_file", "read_file", "delete_file"):
                 self.policy.check_path(str(args.get("path") or args.get("file_path") or ""))
             if name == "db_query" and args.get("sql"):
@@ -298,7 +322,8 @@ class ToolAdapterFactory:
 
             if tr.status == STATUS_SUCCEEDED:
                 # 远端/本地已确认成功：只有账本确认写入成功后才宣告成功（§5.2 D）
-                text = tr.text
+                # §15.2 E：工具输出统一脱敏后再入账本/事件/回传
+                text = redact_secrets(tr.text)
                 await self._ledger_mark(
                     rec.id,
                     "succeeded",
@@ -318,7 +343,8 @@ class ToolAdapterFactory:
 
             if tr.status == STATUS_FAILED:
                 # 业务错误不得伪装成功字符串（§7.2 C）：标记 failed 并回传失败文本
-                err_text = (tr.error or tr.text)[:_RESULT_PAYLOAD_LIMIT]
+                # §15.2 E：错误信息统一脱敏后再入账本/事件/日志
+                err_text = redact_secrets(tr.error or tr.text)[:_RESULT_PAYLOAD_LIMIT]
                 await self._ledger_mark(rec.id, "failed", error=err_text)
                 await self.bus.publish(RuntimeEvent(
                     type=TOOL_FAILED,
@@ -332,7 +358,7 @@ class ToolAdapterFactory:
                 return tr.text
 
             # STATUS_UNKNOWN：无法确认外部操作是否已生效（§7.2 A）
-            err_text = (tr.error or tr.text)[:_RESULT_PAYLOAD_LIMIT]
+            err_text = redact_secrets(tr.error or tr.text)[:_RESULT_PAYLOAD_LIMIT]
             await self._ledger_mark(rec.id, "unknown", error=err_text)
             await self.bus.publish(RuntimeEvent(
                 type=TOOL_FAILED,
@@ -358,16 +384,18 @@ class ToolAdapterFactory:
             status = (
                 "failed" if is_definitive or tool_outcome_class(name) == CLASS_READ_ONLY else "unknown"
             )
+            # §15.2 E：异常文本统一脱敏后再入账本/事件/日志
+            err_text = redact_secrets(str(e))[:_RESULT_PAYLOAD_LIMIT]
             # 账本写入失败时 ToolLedgerError 会向上冒泡，不会走到 return
-            await self._ledger_mark(rec.id, status, error=str(e))
+            await self._ledger_mark(rec.id, status, error=err_text)
             await self.bus.publish(RuntimeEvent(
                 type=TOOL_FAILED,
                 run_id=self.ctx.run_id,
-                data={"tool": name, "error": str(e)[:500]},
+                data={"tool": name, "error": err_text[:500]},
             ))
             telemetry.record_tool(
                 self.ctx.to_log_fields(), tool=name, status=status,
-                duration_ms=float(duration_ms), error=str(e)[:500],
+                duration_ms=float(duration_ms), error=err_text[:500],
             )
             return f"工具执行错误: {e}"
 

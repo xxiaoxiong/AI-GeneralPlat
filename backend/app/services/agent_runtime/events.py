@@ -89,25 +89,68 @@ class RuntimeEvent:
         }
 
 
-def redact_sensitive(value: Any, max_len: int = 400) -> Any:
-    """对外事件脱敏：截断长参数并遮蔽疑似密钥字段。"""
-    sensitive_keys = {
-        "api_key", "apikey", "authorization", "token", "secret",
-        "password", "access_key", "private_key", "cookie",
-    }
+# ── 脱敏（§15.2 E：错误信息 / 工具输出 / 审批记录 / Ledger 统一脱敏）────────
+# 识别规则：
+# 1) 敏感 key 关键词匹配（password/pass/secret/token/api_key/authorization/
+#    cookie/credential 等，词边界防 bypass/passenger 误伤）；
+# 2) URL 内 user:pass@ 凭据与 token/secret/key/signature 等查询参数打码；
+# 3) 自由文本中 Authorization/Bearer/API-Key 凭据值打码。
+import re as _re
+
+_SENSITIVE_KEY_RE = _re.compile(
+    r"(password|passwd|pwd|secret|token|api[_-]?key|apikey|authorization|cookie"
+    r"|credential|access[_-]?key|private[_-]?key|smtp[_-]?pass"
+    r"|(^|[^a-z0-9])pass([^a-z0-9]|$))",
+    _re.IGNORECASE,
+)
+_URL_USERINFO_RE = _re.compile(r"(://[^/\s:@]+:)([^@/\s]+)(@)")
+_URL_SECRET_PARAM_RE = _re.compile(
+    r"([?&][^=\s&]*?(?:token|secret|signature|password|passwd|credential"
+    r"|apikey|api_key|access_key|private_key|auth)[^=\s&]*=)([^&\s]*)",
+    _re.IGNORECASE,
+)
+_TEXT_AUTH_RE = _re.compile(
+    r"((?:authorization|api[-_]?key)\s*[:=]\s*)(?:bearer\s+)?(\S+)", _re.IGNORECASE
+)
+_TEXT_BEARER_RE = _re.compile(r"(\bbearer\s+)(\S+)", _re.IGNORECASE)
+
+
+def _mask_text(text: str) -> str:
+    """自由文本打码：URL 凭据 / 查询参数 token / Bearer 值（不截断）。"""
+    text = _URL_USERINFO_RE.sub(r"\1***\3", text)
+    text = _URL_SECRET_PARAM_RE.sub(r"\1***", text)
+    text = _TEXT_AUTH_RE.sub(r"\1***", text)
+    text = _TEXT_BEARER_RE.sub(r"\1***", text)
+    return text
+
+
+def _redact(value: Any, max_len: Optional[int]) -> Any:
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            if k.lower() in sensitive_keys:
+            if isinstance(k, str) and _SENSITIVE_KEY_RE.search(k):
                 out[k] = "***"
             else:
-                out[k] = redact_sensitive(v, max_len)
+                out[k] = _redact(v, max_len)
         return out
     if isinstance(value, list):
-        return [redact_sensitive(v, max_len) for v in value[:20]]
-    if isinstance(value, str) and len(value) > max_len:
-        return value[:max_len] + f"...[truncated {len(value) - max_len} chars]"
+        return [_redact(v, max_len) for v in value[:20]]
+    if isinstance(value, str):
+        text = _mask_text(value)
+        if max_len is not None and len(text) > max_len:
+            return text[:max_len] + f"...[truncated {len(text) - max_len} chars]"
+        return text
     return value
+
+
+def redact_secrets(value: Any) -> Any:
+    """统一脱敏（仅打码、不截断）：工具输出 / 错误信息 / Ledger 写入使用。"""
+    return _redact(value, max_len=None)
+
+
+def redact_sensitive(value: Any, max_len: int = 400) -> Any:
+    """对外事件脱敏：截断长参数并遮蔽疑似密钥字段。"""
+    return _redact(value, max_len=max_len)
 
 
 # ── 旧 SSE 契约适配 ──────────────────────────────────────────────────────────

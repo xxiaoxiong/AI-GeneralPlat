@@ -14,6 +14,8 @@ import json
 import re
 from typing import Dict, Any, List
 
+from app.core.config import settings
+
 from .result import ToolResult
 
 import httpx
@@ -228,7 +230,7 @@ async def execute_web_search(params: dict) -> str:
     found_results = None
     found_engine = ""
 
-    async with httpx.AsyncClient(timeout=timeout, verify=(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY), follow_redirects=True) as client:
+    async with httpx.AsyncClient(timeout=timeout, verify=(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY), proxy=(settings.AGENT_EGRESS_PROXY or None), follow_redirects=True) as client:
         # 引擎 0：SearXNG（内网搜索引擎，优先级最高）
         searxng_url = settings.SEARXNG_URL
         if not found_results and searxng_url and engine in ("auto", "searxng"):
@@ -362,7 +364,7 @@ async def execute_fetch_webpage(params: dict) -> str:
     if not url.startswith("http"):
         return ToolResult.failed("错误：URL 必须以 http:// 或 https:// 开头")
     try:
-        async with httpx.AsyncClient(timeout=20, verify=(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY), follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=20, verify=(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY), proxy=(settings.AGENT_EGRESS_PROXY or None), follow_redirects=True) as client:
             resp = await client.get(url, headers=_HEADERS)
         html = resp.text
         # 去除 script/style/head
@@ -386,7 +388,7 @@ async def execute_weather(params: dict) -> str:
     if not city:
         return ToolResult.failed("错误：请提供城市名称")
     try:
-        async with httpx.AsyncClient(timeout=15, verify=(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY)) as client:
+        async with httpx.AsyncClient(timeout=15, verify=(settings.AGENT_CA_BUNDLE or settings.AGENT_TLS_VERIFY), proxy=(settings.AGENT_EGRESS_PROXY or None)) as client:
             resp = await client.get(
                 f"https://wttr.in/{city}",
                 params={"format": "j1", "lang": "zh"},

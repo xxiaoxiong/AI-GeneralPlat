@@ -1,10 +1,22 @@
-"""🐍 代码执行工具：python_exec（受限沙箱执行 Python 代码）"""
+"""🐍 代码执行工具：python_exec（受限沙箱执行 Python 代码）
+
+能力边界声明（§15.2 F）：restricted（AST 检查 + 内置白名单 + 线程超时）
+**不是安全沙箱**，无法防御同进程资源滥用或复杂逃逸；真正的隔离必须接入
+外部 Sandbox（ToolPolicy.sandbox_mode == "external"）。没有外部 Sandbox 时，
+生产模式由 ToolPolicy 默认禁用 python_exec，仅开发环境可显式
+AGENT_ALLOW_UNSAFE_PYTHON 开关放行。
+
+超时语义诚实性（§15.2 F）：线程 join 超时**不能假装终止**——超时线程以
+daemon 方式继续存活，工具如实报告"线程仍在运行、可能继续占用 CPU/内存"，
+并在残留线程存活期间拒绝再次执行（防止无限堆积占用进程资源）。
+"""
 import sys
 import io
 import ast
 import math
 import json
 import re
+import threading
 import traceback
 from typing import Dict, List
 
@@ -71,6 +83,20 @@ def _check_ast_safety(code: str) -> str | None:
     return None
 
 
+# 残留超时线程登记（§15.2 F）：join 超时的执行线程无法强制终止（daemon 存活），
+# 存活期间拒绝再次执行 python_exec，防止无限堆积占用进程资源。
+_RUNAWAY_LOCK = threading.Lock()
+_RUNAWAY_THREADS: List[threading.Thread] = []
+
+
+def _prune_runaway_threads() -> List[threading.Thread]:
+    """清理已结束的残留线程，返回仍存活的超时线程列表。"""
+    with _RUNAWAY_LOCK:
+        alive = [t for t in _RUNAWAY_THREADS if t.is_alive()]
+        _RUNAWAY_THREADS[:] = alive
+        return list(alive)
+
+
 def execute_python_exec(params: dict) -> ToolResult:
     """受限 Python 执行（P0-05 §7.2 C：错误/超时必须返回明确失败结果）。
 
@@ -82,6 +108,15 @@ def execute_python_exec(params: dict) -> ToolResult:
 
     if not code:
         return ToolResult.failed("错误：代码为空")
+
+    # 残留超时线程仍在运行：拒绝再次执行（§15.2 F，防止资源无限占用）
+    alive_runaways = _prune_runaway_threads()
+    if alive_runaways:
+        return ToolResult.failed(
+            f"拒绝执行：上一次 python_exec 超时的线程仍在后台运行"
+            f"（{len(alive_runaways)} 个，daemon 线程无法强制终止），"
+            "可能继续占用 CPU/内存资源；请等待其结束或接入外部 Sandbox（AGENT_SANDBOX_MODE=external）"
+        )
 
     # AST 安全检查
     err = _check_ast_safety(code)
@@ -135,8 +170,16 @@ def execute_python_exec(params: dict) -> ToolResult:
     t.join(timeout=timeout_sec)
 
     if t.is_alive():
-        # 超时必须返回明确失败结果（§7.2 C）
-        return ToolResult.failed(f"执行超时（>{timeout_sec}s），请检查是否有死循环")
+        # 超时必须返回明确失败结果（§7.2 C）。
+        # §15.2 F 诚实语义：线程未被终止、以 daemon 方式继续存活，
+        # 如实报告"仍在运行/可能占用资源"，登记残留线程并阻止再次执行。
+        with _RUNAWAY_LOCK:
+            _RUNAWAY_THREADS.append(t)
+        return ToolResult.failed(
+            f"执行超时（>{timeout_sec}s）：线程未被强制终止，仍在后台运行（daemon），"
+            "可能继续占用 CPU/内存资源；已阻止后续 python_exec 执行直到该线程结束。"
+            "请检查是否有死循环；如需可靠终止请接入外部 Sandbox（AGENT_SANDBOX_MODE=external）"
+        )
 
     if result_container["error"]:
         return ToolResult.failed(f"执行错误:\n{result_container['error']}")
