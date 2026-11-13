@@ -21,8 +21,13 @@ pytestmark = pytest.mark.skipif(
     reason="未配置 AGENT_E2E_BASE_URL/AGENT_E2E_API_KEY/AGENT_E2E_MODEL，跳过真实模型 E2E",
 )
 
+# 注意：本文件所有用例必须使用 loop_scope="session"——langchain_openai 的
+# AsyncOpenAI/httpx 客户端带 @lru_cache 全局缓存，连接池绑定创建时的事件循环；
+# 若按 pytest 默认每用例独立 loop，跨用例复用旧连接会在关闭时报
+# "RuntimeError: Event loop is closed"（生产环境每 Worker 单 loop，无此问题）。
 
-@pytest.mark.asyncio
+
+@pytest.mark.asyncio(loop_scope="session")
 async def test_real_model_tool_calling_e2e():
     from langchain_core.tools import tool
 
@@ -96,7 +101,7 @@ def _e2e_provider():
     }
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="session")
 async def test_real_model_hitl_interrupt_resume_e2e():
     """真实模型 + HITL：高危工具中断 → 批准 → 精确恢复执行（§8 真实模型场景 2）"""
     from langchain.agents import create_agent
@@ -144,7 +149,7 @@ async def test_real_model_hitl_interrupt_resume_e2e():
     print("REAL MODEL HITL E2E PASS:", final)
 
 
-@pytest.mark.asyncio
+@pytest.mark.asyncio(loop_scope="session")
 async def test_real_model_large_context_unload_e2e():
     """真实模型 + 大上下文卸载：2MB 工具输出由 FilesystemMiddleware 落盘（§8 真实模型场景 3）"""
     from langchain.agents import create_agent

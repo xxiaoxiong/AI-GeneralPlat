@@ -52,8 +52,16 @@
 | 3 | MySQL 业务库集成 | ✅ 25 + 2 passed | 关键集 + 真实迁移实测（MySQL 8.0.46） |
 | 4 | PostgreSQL Checkpointer 集成 | ✅ 25 passed | 关键集含 CP-01/02/04（AsyncPostgresSaver，PG 16.15） |
 | 5 | 多进程故障恢复 | ✅ 通过 | CP-01 两进程共享 Checkpointer；CP-02 **真实 kill** 进程 A 后进程 B 接管恢复；worker crash/重启恢复用例（t 系列） |
-| 6 | 真实模型 E2E | ⚠️ skipped | 无模型 Secret；3 项显式 skip，不计基础通过数（§17 要求） |
+| 6 | 真实模型 E2E | ✅ **3/3 通过（2026-11-13 补测）** | 用 OpenAI 兼容真实模型（agnes-2.5-flash）跑通 §8 三场景：多步工具调用、HITL 中断恢复、大上下文卸载（`log/e2e-t2-realmodel.txt`）。修复：测试用例改 `loop_scope="session"`（langchain_openai 客户端 @lru_cache 连接池跨 pytest 独立 loop 报 "Event loop is closed"，断言未动） |
 | 7 | 长稳 / 性能 | ❌ 未做 | 见 §5 未验证场景（P2 门禁项） |
+
+### 2.4 Docker 运行环境主流程 E2E（2026-11-13 补测）
+
+对 Docker 实际运行栈（nginx:80 + backend:8000 + MySQL + PG Checkpointer）+ 真实模型执行主流程：
+
+- **API 主流程 16/16 通过**（`log/e2e-t3-docker-api.txt`）：登录 → 模型供应商配置 + 连通性测试 → 模型配置 → 直连对话 → 建 Agent（calculator 工具）→ 工具链路对话（17×23=391 经真实模型+真实工具）→ Run 状态/事件回放 → 会话消息（user/assistant 写回）→ 幂等复用/409 冲突 → SSE 流式（done+final）→ **取消（中途 cancel → 终态 `cancelled`）** → invoke；
+- **前端前门（nginx）全链路 6/6 通过**（`log/e2e-t4-frontdoor.txt`）：SPA 首页/资产 → 经 80 端口登录 → 数据接口 → 非流式与 SSE 对话；
+- **UI 点击级验证未执行**：本机浏览器 guest 环境不可用（多次尝试 "Browser guest is not ready"），如实标注为未验证项。
 
 ## 3. Mock 与真实服务边界
 
@@ -80,13 +88,14 @@
 
 ## 5. 尚未验证的场景（如实标注）
 
-1. **真实模型 E2E**（3 项 skip）：需 `AGENT_E2E_*` Secret，走 `e2e.yml` 独立通道。
+1. ~~**真实模型 E2E**（3 项 skip）~~ **已补测（2026-11-13）**：3/3 通过（§2.3-6）；CI 中仍以 `e2e.yml` 独立 Secret 通道运行，未配置 Secret 时 skip 不计基础通过数。
 2. **长稳 / 性能基准 / 长时间多 Run 并发**（P2 门禁）：未纳入本轮。
-3. **MySQL Checkpointer**：不存在该形态——业务库 MySQL + Checkpointer PostgreSQL 是既定架构（`persistence.py` 支持 memory/sqlite/postgresql 三种 DSN），MySQL 仅业务库实测。
-4. **F-16 Checkpoint 位级损坏**：仅覆盖账本兜底路径，位级损坏注入未测。
-5. **真实 NTP 漂移 / 跨时钟漂移**：未测。
-6. **DNS Rebinding 完整攻防**：应用层等价防护已测（SEC-01/02/07）；网络层 Egress Proxy 部署形态需环境侧验证。
-7. **生产规模事件保留 / Ledger 归档策略执行**：策略代码已具备，长周期运行未验证。
+3. **UI 点击级浏览器验证**：浏览器 guest 环境不可用，前端仅验证到"前门全链路"层级（§2.4）。
+4. **MySQL Checkpointer**：不存在该形态——业务库 MySQL + Checkpointer PostgreSQL 是既定架构（`persistence.py` 支持 memory/sqlite/postgresql 三种 DSN），MySQL 仅业务库实测。
+5. **F-16 Checkpoint 位级损坏**：仅覆盖账本兜底路径，位级损坏注入未测。
+6. **真实 NTP 漂移 / 跨时钟漂移**：未测。
+7. **DNS Rebinding 完整攻防**：应用层等价防护已测（SEC-01/02/07）；网络层 Egress Proxy 部署形态需环境侧验证。
+8. **生产规模事件保留 / Ledger 归档策略执行**：策略代码已具备，长周期运行未验证。
 
 ## 6. 测试适配披露（断言零改动）
 
@@ -113,4 +122,4 @@ python -m pytest tests/test_migration_mysql.py -q
 
 - P0/P1 门禁相关测试在 **SQLite 全量 + MySQL 8 + PostgreSQL 16 三库**真实执行通过；
 - 5 个 skip 全部为"真实模型 Secret 未配置 + 默认 DSN 端口不一致"，均已如实标注且后者已实测补过；
-- 真实模型 E2E 与长稳/性能为**未完成项**（P2 与生产前置），不以任何方式宣称已验证。
+- 真实模型 E2E 已于 2026-11-13 补测通过（§2.3-6/§2.4）；长稳/性能与 UI 点击级验证为**未完成项**，不以任何方式宣称已验证。
