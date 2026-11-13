@@ -86,6 +86,18 @@ class RuntimeContext:
     tokens_generated: int = 0
     steps: int = 0
 
+    # ── Run 级预算（P1-05 §13）：跨崩溃/HITL 恢复不重置 ─────────────────
+    # 上述计数在恢复时由 DB 累计值种子（不从零开始）；budget_* 为持久化镜像。
+    # budget_version：CAS 版本；budget_deadline_at：绝对截止（不随重启重置）。
+    budget_version: int = 0
+    budget_deadline_at: Optional[Any] = None        # datetime，绝对截止
+    budget_first_started_at: Optional[Any] = None   # datetime，Run 起点
+    # 上次 flush 到 DB 的计数快照（用于算增量、CAS 累计）
+    _flushed_model_calls: int = 0
+    _flushed_tool_calls: int = 0
+    _flushed_steps: int = 0
+    _flushed_tokens: int = 0
+
     # 安全策略开关
     enable_hitl: bool = True
     sandbox_mode: str = "restricted"      # restricted / disabled / external

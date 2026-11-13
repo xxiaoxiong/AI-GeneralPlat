@@ -1946,6 +1946,9 @@ async def test_event_overflow_keeps_persisted_and_redacts_payload():
             run_id=run_id,
             data={"text": f"t{i}", "api_key": "sk-secret", "index": i},
         ))
+    # P1-06 §14.5：MODEL_DELTA 走批量缓冲，收尾 flush 后才保证全部落库
+    # （与 _consume_stream 收尾行为一致；断言语义不变：溢出仅丢通知、DB 全量、入库脱敏）
+    await bus.flush_deltas()
     async with AsyncSessionLocal() as s:
         rows = await EventRepository(s).list_after(run_id, 0)
     assert [r.sequence for r in rows] == [1, 2, 3, 4, 5]  # 溢出仅丢通知，DB 全量
@@ -2254,3 +2257,397 @@ async def test_t11_model_call_counting_and_budget_limit(monkeypatch):
     row3 = await _wait_status(result3["run_id"], {STATUS_LIMIT_EXCEEDED})
     assert row3 is not None and row3.status == STATUS_LIMIT_EXCEEDED
     await svc3.worker.stop()
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Phase 2.1 §13 P1-05：Run 级执行预算持久化（跨崩溃 / HITL 恢复不重置）
+# ════════════════════════════════════════════════════════════════════════════
+
+
+async def _budget_seed(worker_id: str, **advance):
+    """创建 + claim 一个 Run，返回 (run_id, lease_version, ensure_budget 快照)。"""
+    async with AsyncSessionLocal() as s:
+        repo = RunRepository(s)
+        run, _ = await _create_run(repo)
+        version = await repo.claim(run.id, worker_id, 30)
+        state = await repo.ensure_budget(run.id, timeout_seconds=300.0)
+        if advance:
+            await repo.advance_budget(run.id, expected_version=state["version"], **advance)
+            state = await repo.ensure_budget(run.id, timeout_seconds=300.0)
+        await s.commit()
+    return run.id, version, state
+
+
+def _budget_ctx(run_id: str, **kw):
+    from app.services.agent_runtime.context import ExecutionBudget
+    return RuntimeContext(
+        scope=RunScope(user_id=1), run_id=run_id, thread_id=f"t-{run_id[:6]}",
+        agent_id=1, budget=ExecutionBudget(run_timeout_seconds=300.0, **kw),
+    )
+
+
+def _budget_handle(run_id: str):
+    return RunHandle(
+        run_id=run_id, agent_id=1, session_id=None, user_id=1,
+        thread_id=f"t-{run_id[:6]}",
+    )
+
+
+def _dt_eq(a, b, tol: float = 1.0) -> bool:
+    """跨库 datetime 秒级等值比较（P1-05 验收断言）。
+
+    MySQL 的 DATETIME(0) 列会把小数秒四舍五入到整秒，而 ensure_budget 返回的
+    是带微秒的 Python 计算值，二者直接 == 会因存储精度不同而假失败。这里以 1 秒
+    容差吸收 DB 存储精度差异；被测语义（deadline 未顺延/未重置，差异达 120s/300s）
+    仍被完整检出——任何真实重置/顺延都会远超容差。
+    """
+    return abs((a - b).total_seconds()) < tol
+
+
+@pytest.mark.asyncio
+async def test_p15_budget_continues_from_10_after_restart():
+    """§13 验收1：Run 执行 10 次模型调用后重启，恢复后预算从 10 继续（非从 0）。"""
+    run_id, _lease, state = await _budget_seed("w-p15-1", model_calls=10, steps=10, tokens=100)
+    assert state["model_calls"] == 10
+
+    # 模拟 Worker 重启：内存 ctx 全新构造（计数器归零），仅靠 DB 累计恢复
+    svc = _make_service(worker_id="w-p15-1b")
+    ctx = _budget_ctx(run_id)
+    assert ctx.model_calls == 0, "重启后新 ctx 内存计数器确实从零开始"
+    await svc._load_budget(ctx, _budget_handle(run_id))
+
+    # 恢复后预算从 10 继续，而非从 0
+    assert ctx.model_calls == 10, f"恢复后模型调用预算应从 10 继续，实得 {ctx.model_calls}"
+    assert ctx.steps == 10 and ctx.tokens_generated == 100
+    # 已刷快照 = 历史累计，本轮 flush 仅累计增量（不重复计数）
+    assert ctx._flushed_model_calls == 10 and ctx._flushed_tokens == 100
+
+
+@pytest.mark.asyncio
+async def test_p15_worker_restart_cannot_bypass_max_tool_calls():
+    """§13 验收2：Worker 多次重启不能绕过最大工具调用次数（累计不被重置）。"""
+    from app.core.config import settings as app_settings
+
+    run_id, _lease, _ = await _budget_seed("w-p15-2")
+    handle = _budget_handle(run_id)
+    max_tool = 4
+
+    # 多次"Worker 重启"：每次新 ctx、_load_budget 从 DB 累计续算，逐次逼近上限
+    for cycle in range(6):
+        svc = _make_service(worker_id=f"w-p15-2-{cycle}")
+        ctx = _budget_ctx(run_id, max_tool_calls=max_tool)
+        await svc._load_budget(ctx, handle)
+        # 模拟本轮又执行一次工具调用 -> ctx.tool_calls 递增 -> flush 累计
+        ctx.tool_calls += 1
+        await svc._flush_budget(ctx, handle)
+
+    async with AsyncSessionLocal() as s:
+        state = await RunRepository(s).ensure_budget(run_id, timeout_seconds=300.0)
+    # 6 次重启累计 6 次工具调用，没有一次被"从零开始"绕过
+    assert state["tool_calls"] == 6, f"跨重启工具调用须累计，实得 {state['tool_calls']}"
+    assert state["tool_calls"] > max_tool, "累计必须能超过单次预算上限（不被重置绕过）"
+
+    # 预算口径一致性：exhausted_reason 依据累计值判超限
+    from app.services.agent_runtime.context import ExecutionBudget
+    budget = ExecutionBudget(max_tool_calls=max_tool)
+    assert budget.exhausted_reason(0, state["tool_calls"], 0) is not None, \
+        "累计工具调用超限必须被识别（重启不得绕过上限）"
+
+
+@pytest.mark.asyncio
+async def test_p15_hitl_wait_timeout_is_explicitly_configurable(monkeypatch):
+    """§13 验收3：HITL 等待时间是否计入 Run Timeout 由配置显式决定。
+
+    - AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT=True：等待计入超时，deadline 不顺延；
+    - =False：等待不计入超时，恢复时按等待时长顺延 deadline。
+    """
+    from datetime import datetime, timedelta
+
+    from app.core.config import settings as app_settings
+
+    run_id, _lease, state = await _budget_seed("w-p15-3")
+    base_deadline = state["deadline_at"]
+    assert base_deadline is not None
+
+    svc = _make_service(worker_id="w-p15-3")
+    # 模拟已进入 waiting_approval 一段时长（等待起点设为过去）
+    async with AsyncSessionLocal() as s:
+        await RunRepository(s).clear_hitl_wait(run_id)  # 先清零
+        await s.execute(
+            update(AgentRun).where(AgentRun.id == run_id).values(
+                hitl_wait_started_at=datetime.utcnow() - timedelta(seconds=120)
+            )
+        )
+        await s.commit()
+
+    # (a) True：等待计入超时 -> deadline 不变
+    monkeypatch.setattr(app_settings, "AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT", True)
+    await svc._apply_hitl_wait_policy(run_id)
+    async with AsyncSessionLocal() as s:
+        after_true = (await RunRepository(s).get_run(run_id)).budget_deadline_at
+    assert _dt_eq(after_true, base_deadline), "等待计入超时时 deadline 不得顺延"
+
+    # 重新置等待起点
+    async with AsyncSessionLocal() as s:
+        await s.execute(
+            update(AgentRun).where(AgentRun.id == run_id).values(
+                hitl_wait_started_at=datetime.utcnow() - timedelta(seconds=120)
+            )
+        )
+        await s.commit()
+
+    # (b) False：等待不计入超时 -> deadline 按等待时长顺延（约 +120s）
+    monkeypatch.setattr(app_settings, "AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT", False)
+    await svc._apply_hitl_wait_policy(run_id)
+    async with AsyncSessionLocal() as s:
+        row = await RunRepository(s).get_run(run_id)
+    shifted = (row.budget_deadline_at - base_deadline).total_seconds()
+    assert 100 <= shifted <= 140, f"等待不计入超时时应顺延 deadline 约 120s，实得 {shifted}s"
+    assert row.hitl_wait_started_at is None, "顺延后应清除等待起点（避免重复顺延）"
+
+
+@pytest.mark.asyncio
+async def test_p15_deadline_absolute_not_reset_on_restart():
+    """§13 验收4：deadline 到期后即使重启也不能重新获得完整时间（绝对时间）。"""
+    from datetime import datetime, timedelta
+
+    run_id, _lease, state = await _budget_seed("w-p15-4")
+    d1 = state["deadline_at"]
+
+    # 模拟重启后再次 ensure_budget：deadline 保持原绝对值，不重设为 now+timeout
+    await asyncio.sleep(0.01)
+    async with AsyncSessionLocal() as s:
+        again = await RunRepository(s).ensure_budget(run_id, timeout_seconds=300.0)
+    assert _dt_eq(again["deadline_at"], d1), "重启后 deadline 须保持绝对值，不得重新获得完整超时"
+
+    # deadline 已过期后重启：不得重置为 now+timeout（仍指向过去）
+    past = datetime.utcnow() - timedelta(seconds=5)
+    async with AsyncSessionLocal() as s:
+        await s.execute(
+            update(AgentRun).where(AgentRun.id == run_id).values(budget_deadline_at=past)
+        )
+        await s.commit()
+    svc = _make_service(worker_id="w-p15-4b")
+    ctx = _budget_ctx(run_id)
+    await svc._load_budget(ctx, _budget_handle(run_id))
+    assert _dt_eq(ctx.budget_deadline_at, past), "过期 deadline 不得被重启刷新为完整超时"
+    # 剩余时间按绝对 deadline 计算（已过期 -> 0），不重新计满
+    remaining = (ctx.budget_deadline_at - datetime.utcnow()).total_seconds()
+    assert remaining <= 0, f"过期 deadline 恢复后不得重新获得完整时间，剩余 {remaining}s"
+
+
+@pytest.mark.asyncio
+async def test_p15_subagent_budget_shares_parent_ctx():
+    """§13 验收5：多 Agent 子任务预算口径一致（子 Agent 工具计入父 Run ctx 预算）。"""
+    from app.services.agent_runtime.factory import _subagent_tools
+    from app.services.agent_runtime.tools.policy import ToolPolicy
+
+    run_id, lease_version, _ = await _budget_seed("w-p15-5")
+
+    # 父运行 ctx（唯一预算池）：子 Agent 工具经同一 adapter 构建 -> 共享父 ctx
+    ctx = _budget_ctx(run_id)
+    ctx.worker_id = "w-p15-5"
+    ctx.lease_version = lease_version
+    bus = EventBus(persist=True)
+    bus.bind_run(thread_id=f"t-{run_id[:6]}", agent_id=1, trace_id=run_id)
+    adapter = ToolAdapterFactory(ctx, ToolPolicy.from_settings({"calculator"}, enable_hitl=False), bus)
+
+    # 子 Agent 工具集由父 adapter 构建（收窄交集），共享同一 ctx 预算池
+    sub_tools = _subagent_tools({"name": "data-analyst", "tools": ["calculator"]}, adapter)
+    assert sub_tools, "子 Agent 工具集非空"
+    assert all(t.name in ("calculator",) for t in sub_tools), "子 Agent 工具须按策略收窄"
+
+    # 执行体替身（真实账本 + 可注入行为）
+    calls = []
+
+    async def behavior(name, args):
+        calls.append(name)
+        return "3"
+
+    monkeypatch_executor = _fake_executor(behavior)
+    import app.services.agent_runtime.tools.adapter as adapter_mod
+    orig = adapter_mod.ToolExecutor
+    adapter_mod.ToolExecutor = monkeypatch_executor
+    try:
+        tool = next(t for t in sub_tools if t.name == "calculator")
+        # 含 InjectedToolCallId 的工具须以完整 ToolCall 形式调用
+        await tool.ainvoke({
+            "name": "calculator", "type": "tool_call", "id": "tc-sub1",
+            "args": {"expression": "1+2"},
+        })
+    finally:
+        adapter_mod.ToolExecutor = orig
+
+    # 子 Agent 工具调用计入父 ctx.tool_calls（同一预算池，口径一致）
+    assert ctx.tool_calls == 1, f"子 Agent 工具调用须计入父 Run 预算，实得 {ctx.tool_calls}"
+    assert calls == ["calculator"]
+    assert ctx.run_id == run_id, "预算归属父 Run（子任务不另开预算池）"
+
+    # flush 到 DB：累计进父 Run budget_tool_calls（口径一致、不重复计）
+    svc = _make_service(worker_id="w-p15-5b")
+    await svc._flush_budget(ctx, _budget_handle(run_id))
+    async with AsyncSessionLocal() as s:
+        state = await RunRepository(s).ensure_budget(run_id, timeout_seconds=300.0)
+    assert state["tool_calls"] == 1, f"子任务工具调用须累计进父 Run 预算，实得 {state['tool_calls']}"
+
+
+# ════════════════════════════════════════════════════════════════════════════
+# Phase 2.1 §14 P1-06：事件订阅、回放与性能（序号权威源 / Last-Event-ID / 批量）
+# ════════════════════════════════════════════════════════════════════════════
+
+
+async def _p16_seed_events(worker_id: str, deltas: int, *, batch_size: int = 32,
+                           terminal: bool = True):
+    """建 Run + 经真实 EventBus 持久化一组 MODEL_DELTA + 终态事件。"""
+    from app.services.agent_runtime.events import EventBus, RuntimeEvent, MODEL_DELTA, RUN_COMPLETED
+
+    run_id, _lease, _ = await _budget_seed(worker_id)
+    bus = EventBus(persist=True, delta_batch_size=batch_size)
+    bus.bind_run(thread_id=f"t-{run_id[:6]}", agent_id=1, trace_id=run_id)
+    parts = []
+    for i in range(deltas):
+        text = f"part{i} "
+        parts.append(text)
+        await bus.publish(RuntimeEvent(type=MODEL_DELTA, run_id=run_id, data={"text": text}))
+    if terminal:
+        await bus.publish(RuntimeEvent(
+            type=RUN_COMPLETED, run_id=run_id, data={"final_text": "".join(parts)}
+        ))
+    await bus.flush_deltas()
+    return run_id, "".join(parts)
+
+
+async def _p16_consume_all(svc, run_id):
+    """订阅者经 replay_events 从 DB 事实日志读取全部可见事件（到 done 为止）。"""
+    got = []
+    async for ev in svc.replay_events(run_id):
+        got.append(ev)
+        if ev.get("type") == "done":
+            break
+    return got
+
+
+@pytest.mark.asyncio
+async def test_p16_two_subscribers_both_get_complete_events():
+    """§14 验收1：同一 Run 两个 SSE 订阅者都能收到完整事件。"""
+    run_id, _ = await _p16_seed_events("w-p16-1", deltas=6)
+
+    svc_a = _make_service(worker_id="w-p16-1a")
+    svc_b = _make_service(worker_id="w-p16-1b")
+    sub_a, sub_b = await asyncio.gather(
+        _p16_consume_all(svc_a, run_id), _p16_consume_all(svc_b, run_id)
+    )
+    types_a = [e.get("type") for e in sub_a]
+    types_b = [e.get("type") for e in sub_b]
+    # 两个订阅者各自读到完整事件序列（不因竞争共享队列而缺漏）
+    # 注：MODEL_DELTA 在旧 SSE 契约里映射为 final_chunk（流式文本增量）
+    assert types_a == types_b, "两个订阅者应收到一致的完整事件序列"
+    assert types_a.count("final_chunk") == 6, f"应各收到 6 个增量，实得 {types_a.count('final_chunk')}"
+    assert types_a[-1] == "done" and "final" in types_a
+
+
+@pytest.mark.asyncio
+async def test_p16_queue_overflow_subscriber_catches_up_from_db():
+    """§14 验收2：事件队列溢出后订阅者能自动补齐（通知丢失，DB 事实日志完整）。"""
+    from app.services.agent_runtime.events import EventBus, RuntimeEvent, MODEL_DELTA, RUN_COMPLETED
+
+    run_id, _lease, _ = await _budget_seed("w-p16-2")
+    # 极小队列制造溢出：内存通知被丢弃，但持久化事件仍在 DB
+    bus = EventBus(persist=True, maxsize=2)
+    bus.bind_run(thread_id=f"t-{run_id[:6]}", agent_id=1, trace_id=run_id)
+    for i in range(10):
+        await bus.publish(RuntimeEvent(type=MODEL_DELTA, run_id=run_id, data={"text": f"t{i}"}))
+    await bus.publish(RuntimeEvent(type=RUN_COMPLETED, run_id=run_id, data={"final_text": "done"}))
+    await bus.flush_deltas()
+
+    # 订阅者不依赖内存队列，从 DB 事实日志自动补齐全部事件
+    svc = _make_service(worker_id="w-p16-2s")
+    got = await _p16_consume_all(svc, run_id)
+    deltas = [e.get("type") for e in got].count("final_chunk")
+    assert deltas == 10, f"队列溢出后应从 DB 补齐全部 10 个增量，实得 {deltas}"
+    assert got[-1].get("type") == "done"
+
+
+@pytest.mark.asyncio
+async def test_p16_last_event_id_resume_no_dup_no_gap():
+    """§14 验收3：Last-Event-ID 可精确续传，无重复、无漏事件。"""
+    run_id, _ = await _p16_seed_events("w-p16-3", deltas=8)
+
+    svc = _make_service(worker_id="w-p16-3")
+    # 第一次订阅：取前 3 个事件后断开
+    first = []
+    async for ev in svc.replay_events(run_id):
+        first.append(ev)
+        if len(first) >= 3:
+            break
+    last_seq = first[-1].get("seq")
+    assert last_seq is not None
+
+    # 从 Last-Event-ID（last_seq）之后精确续传
+    resumed = await _p16_consume_all(svc, run_id)  # 全量（含 first）
+    after = [e for e in resumed if e.get("seq") > last_seq]
+    # 无重复：续传事件序号均 > last_seq
+    assert all(e.get("seq") > last_seq for e in after), "续传不得重复已收事件"
+    # 无漏 + 无重复：first ∪ after = 全部事件，序号严格连续递增
+    merged = sorted(first + after, key=lambda e: e.get("seq"))
+    all_seqs = [e.get("seq") for e in merged]
+    assert all_seqs == sorted(set(all_seqs)), "事件序号不得重复"
+    # 严格连续（无缺口）：相邻序号差 1
+    for a, b in zip(all_seqs, all_seqs[1:]):
+        assert b - a == 1, f"事件序号须连续无缺口：{all_seqs}"
+
+
+@pytest.mark.asyncio
+async def test_p16_cross_process_subscription_reads_db_not_queue():
+    """§14 验收4：跨进程订阅依赖数据库事实日志，不依赖进程内 Queue。"""
+    run_id, _ = await _p16_seed_events("w-p16-4", deltas=5)
+
+    # 进程 B：全新服务实例、全新 adapter、不接触进程 A 的 EventBus 队列
+    svc_b = _make_service(worker_id="w-p16-4-cross")
+    got = await _p16_consume_all(svc_b, run_id)
+    # 完全从 DB 事实日志读到全部事件（零依赖进程内内存队列）
+    assert [e.get("type") for e in got].count("final_chunk") == 5
+    assert got[-1].get("type") == "done"
+
+
+@pytest.mark.asyncio
+async def test_p16_model_delta_batching_reduces_db_transactions(monkeypatch):
+    """§14 验收5：100 Token/s 的 MODEL_DELTA 不产生 100 次/s 独立数据库事务。"""
+    import app.core.database as db_mod
+    from app.services.agent_runtime.events import EventBus, RuntimeEvent, MODEL_DELTA, RUN_COMPLETED
+
+    run_id, _lease, _ = await _budget_seed("w-p16-5")  # 建 run（不计入事务计数）
+
+    bus = EventBus(persist=True, delta_batch_size=32)
+    bus.bind_run(thread_id=f"t-{run_id[:6]}", agent_id=1, trace_id=run_id)
+
+    # 计数真实数据库事务：每次 AsyncSessionLocal() 开启 = 一个独立事务
+    txn = {"n": 0}
+    orig = db_mod.AsyncSessionLocal
+
+    def counting():
+        txn["n"] += 1
+        return orig()
+
+    monkeypatch.setattr(db_mod, "AsyncSessionLocal", counting)
+
+    # 100 个 MODEL_DELTA（模拟 100 Token/s）+ 1 个终态
+    for i in range(100):
+        await bus.publish(RuntimeEvent(type=MODEL_DELTA, run_id=run_id, data={"text": f"t{i}"}))
+    await bus.publish(RuntimeEvent(type=RUN_COMPLETED, run_id=run_id, data={"final_text": "done"}))
+    await bus.flush_deltas()
+
+    # 批量持久化：100 个增量绝不产生 100 个事务
+    assert txn["n"] < 20, f"100 Token 增量产生 {txn['n']} 个独立数据库事务，应远小于 100（批量持久化）"
+
+
+@pytest.mark.asyncio
+async def test_p16_final_text_complete_after_batching():
+    """§14 验收6：事件批量化后最终文本恢复仍然完整。"""
+    run_id, full_text = await _p16_seed_events("w-p16-6", deltas=10, batch_size=4)
+
+    # 多批批量持久化后，从 DB 重建最终文本完整无缺
+    svc = _make_service(worker_id="w-p16-6")
+    rebuilt = await svc._load_prior_final_text(run_id)
+    assert "".join(rebuilt) == full_text, "批量持久化后最终文本重建须完整（不丢 Token）"
+    assert len(rebuilt) == 10, f"每 Token 仍是一条独立事件（不合并行），实得 {len(rebuilt)}"

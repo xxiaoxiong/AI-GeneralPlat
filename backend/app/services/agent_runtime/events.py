@@ -268,9 +268,17 @@ class EventBus:
     成功后才通过内存队列唤醒本地 SSE 消费者 —— 内存队列只是通知优化，
     溢出时仅丢通知、绝不丢持久化事件；事件写入失败显式抛出
     PersistenceError，不得静默当作成功。
+
+    Phase 2.1 §14.5（P1-06）：MODEL_DELTA 批量持久化 —— 高频 Token 增量
+    不得每条一个数据库事务。增量先入内存缓冲并**立即通知**本地消费者
+    （live SSE 仍逐 Token），达到 ``delta_batch_size`` 或遇到非增量事件边界
+    时**一次事务**批量写入 DB（DB 仍是事实来源，序号在写入时分配）。批量
+    持久化不合并事件行（每 Token 仍是一条 agent_run_events），因此事件条数、
+    回放顺序与最终文本重建（_load_prior_final_text）保持完整一致。
     """
 
-    def __init__(self, maxsize: int = 1000, *, persist: bool = False):
+    def __init__(self, maxsize: int = 1000, *, persist: bool = False,
+                 delta_batch_size: int = 32):
         import asyncio
 
         self._queue: "asyncio.Queue[RuntimeEvent]" = asyncio.Queue(maxsize=maxsize)
@@ -281,6 +289,9 @@ class EventBus:
         self.agent_id: Optional[int] = None
         self.status = ""
         self.trace_id = ""
+        # MODEL_DELTA 批量缓冲（P1-06 §14.5）：攒够 delta_batch_size 或事件边界一次事务写入
+        self._delta_buffer: List[RuntimeEvent] = []
+        self.delta_batch_size = max(1, int(delta_batch_size))
 
     def bind_run(self, *, thread_id: str, agent_id: Optional[int], trace_id: str = "") -> None:
         """绑定 run 级上下文（由 RunHandle 构造时调用）。"""
@@ -319,11 +330,25 @@ class EventBus:
         ev.status = ev.status or self.status
         ev.trace_id = ev.trace_id or self.trace_id
         if self.persist and ev.run_id:
-            # FR-07：先持久化（可靠序号），再通知本地消费者
+            if ev.type == MODEL_DELTA:
+                # P1-06 §14.5：MODEL_DELTA 批量持久化（不每 Token 一个事务）。
+                # 先入缓冲并立即通知本地消费者（live SSE 逐 Token），攒够批量或
+                # 遇到非增量事件边界时一次事务写入 DB（序号写入时分配）。
+                self._delta_buffer.append(ev)
+                if len(self._delta_buffer) >= self.delta_batch_size:
+                    await self.flush_deltas()
+                self._notify(ev)
+                return
+            # 非增量事件：先刷缓冲的 MODEL_DELTA（保持持久化顺序），再写本事件
+            await self.flush_deltas()
             ev.sequence = await self._persist(ev)
         else:
             self._seq += 1
             ev.sequence = self._seq
+        self._notify(ev)
+
+    def _notify(self, ev: RuntimeEvent) -> None:
+        """通知本地 SSE 消费者（内存队列仅是通知优化，溢出只丢通知不丢持久化事件）。"""
         try:
             self._queue.put_nowait(ev)
         except Exception:
@@ -333,6 +358,48 @@ class EventBus:
                 self._queue.put_nowait(ev)
             except Exception:
                 pass
+
+    async def flush_deltas(self) -> None:
+        """把缓冲的 MODEL_DELTA 一次事务持久化（P1-06 §14.5：单 commit = 单事务）。
+
+        批量写入不合并事件行——每条 MODEL_DELTA 仍是一条 agent_run_events，
+        仅事务数按批聚合，从而高频 Token 输出不再产生每 Token 一个事务。
+        """
+        if not self._delta_buffer:
+            return
+        buf = self._delta_buffer
+        self._delta_buffer = []
+        seqs = await self._persist_many(buf)
+        for ev, seq in zip(buf, seqs):
+            ev.sequence = seq
+
+    @staticmethod
+    async def _persist_many(events: List[RuntimeEvent]) -> List[int]:
+        """一次事务批量持久化多条事件，返回各自分配的 sequence。
+
+        与单条 ``_persist`` 语义一致：失败向上抛出 PersistenceError，不静默成功。
+        """
+        from app.core.database import AsyncSessionLocal
+        from .repositories import EventRepository, PersistenceError
+
+        try:
+            async with AsyncSessionLocal() as db:
+                repo = EventRepository(db)
+                seqs: List[int] = []
+                for ev in events:
+                    # 与 _persist 相同的脱敏规则：文本型事件不截断，保证最终文本重建完整
+                    max_len = 100_000 if ev.type in (MODEL_DELTA, RUN_COMPLETED) else 400
+                    payload = redact_sensitive(ev.data or {}, max_len=max_len)
+                    seq = await repo.append(
+                        ev.run_id, ev.type, payload, thread_id=ev.thread_id or "",
+                    )
+                    seqs.append(seq)
+                await db.commit()
+            return seqs
+        except PersistenceError:
+            raise
+        except Exception as e:
+            raise PersistenceError(f"MODEL_DELTA 批量事件持久化失败: {e}") from e
 
     async def events(self) -> AsyncGenerator[RuntimeEvent, None]:
         while True:

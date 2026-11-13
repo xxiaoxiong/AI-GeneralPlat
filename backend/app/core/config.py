@@ -96,6 +96,9 @@ class Settings(BaseSettings):
     AGENT_MAX_TOOL_CALLS: int = 30              # 工具调用总次数预算
     AGENT_MAX_MODEL_CALLS: int = 30             # 模型调用次数预算
     AGENT_RUN_TIMEOUT: float = 300.0            # 单次运行墙钟超时（秒）
+    # P1-05 §13：HITL 等待时间是否计入 Run Timeout。True=计入（deadline 绝对、含等待）；
+    # False=不计入（HITL 恢复时按等待时长顺延 deadline，只耗执行时间不耗人工等待）。
+    AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT: bool = True
     AGENT_CHECKPOINT_DSN: str = "memory"        # memory | sqlite:///./data/agent_checkpoints.db | postgresql+asyncpg://...
     AGENT_STORE_DSN: str = ""                   # 跨线程记忆 Store（空=不启用）
     AGENT_ENABLE_HITL: bool = True              # 人工审批（高危工具 interrupt_on）

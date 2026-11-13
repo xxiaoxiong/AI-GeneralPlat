@@ -30,6 +30,7 @@ from ..lifecycle import (
     STATUS_CANCELLED,
     STATUS_PENDING,
     STATUS_RUNNING,
+    STATUS_WAITING_APPROVAL,
     TERMINAL_STATUSES,
     RunExecutionLease,
 )
@@ -213,6 +214,9 @@ class RunRepository:
             values["recovery_error"] = recovery_error
         if finished:
             values["finished_at"] = datetime.utcnow()
+        if status == STATUS_WAITING_APPROVAL:
+            # P1-05 §13.3：记录 HITL 等待起点，恢复时按配置决定是否顺延 deadline
+            values["hitl_wait_started_at"] = datetime.utcnow()
 
         conditions = [
             AgentRun.id == run_id,
@@ -587,7 +591,109 @@ class RunRepository:
         )
         return row.scalar_one()
 
-    # ── 过期/恢复扫描（FR-03） ─────────────────────────────────────────
+    # ── Run 级执行预算（P1-05 §13）：跨恢复持久化 + CAS 并发一致性 ────────
+
+    async def ensure_budget(self, run_id: str, *, timeout_seconds: float) -> dict:
+        """读取 Run 预算累计值；新 Run 初始化（first_started_at/deadline_at 仅首次设置）。
+
+        deadline_at 为绝对时间：重启不重新获得完整超时时间。
+        返回 {model_calls, tool_calls, steps, tokens, first_started_at, deadline_at, version}。
+        """
+        row = await self.session.execute(
+            select(
+                AgentRun.budget_model_calls, AgentRun.budget_tool_calls,
+                AgentRun.budget_steps, AgentRun.budget_tokens,
+                AgentRun.budget_first_started_at, AgentRun.budget_deadline_at,
+                AgentRun.budget_version,
+            ).where(AgentRun.id == run_id)
+        )
+        rec = row.one_or_none()
+        if rec is None:
+            raise LookupError(f"run {run_id} 不存在，无法读取预算")
+        (mc, tc, st, tk, first_at, deadline_at, ver) = rec
+        now = datetime.utcnow()
+        if first_at is None or deadline_at is None:
+            # 首次初始化预算：绝对截止 = now + timeout，仅首次写入
+            first_at = first_at or now
+            deadline_at = deadline_at or (now + timedelta(seconds=timeout_seconds))
+            await self.session.execute(
+                update(AgentRun).where(
+                    AgentRun.id == run_id,
+                    AgentRun.budget_first_started_at.is_(None),
+                ).values(
+                    budget_first_started_at=first_at,
+                    budget_deadline_at=deadline_at,
+                    updated_at=now,
+                ),
+                execution_options={"synchronize_session": False},
+            )
+        return {
+            "model_calls": mc or 0, "tool_calls": tc or 0,
+            "steps": st or 0, "tokens": tk or 0,
+            "first_started_at": first_at, "deadline_at": deadline_at,
+            "version": ver or 0,
+        }
+
+    async def advance_budget(
+        self,
+        run_id: str,
+        *,
+        expected_version: int,
+        model_calls: int = 0,
+        tool_calls: int = 0,
+        steps: int = 0,
+        tokens: int = 0,
+    ) -> int:
+        """按增量累计预算并 CAS 递增 budget_version（并发一致性）。
+
+        WHERE budget_version=expected_version 不匹配（并发写）则返回 -1，调用方重试。
+        """
+        res = await self.session.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id, AgentRun.budget_version == expected_version)
+            .values(
+                budget_model_calls=AgentRun.budget_model_calls + model_calls,
+                budget_tool_calls=AgentRun.budget_tool_calls + tool_calls,
+                budget_steps=AgentRun.budget_steps + steps,
+                budget_tokens=AgentRun.budget_tokens + tokens,
+                budget_version=AgentRun.budget_version + 1,
+                updated_at=datetime.utcnow(),
+            ),
+            execution_options={"synchronize_session": False},
+        )
+        if res.rowcount != 1:
+            return -1
+        return expected_version + 1
+
+    async def shift_deadline(self, run_id: str, *, extra_seconds: float) -> None:
+        """在既有绝对截止上顺延（P1-05 §13.3：HITL 等待不计入 Run Timeout 时按等待时长顺延）。"""
+        if extra_seconds <= 0:
+            return
+        row = await self.session.execute(
+            select(AgentRun.budget_deadline_at).where(AgentRun.id == run_id)
+        )
+        cur = row.scalar_one_or_none()
+        if cur is None:
+            return
+        from datetime import timedelta
+        await self.session.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id)
+            .values(
+                budget_deadline_at=cur + timedelta(seconds=extra_seconds),
+                updated_at=datetime.utcnow(),
+            ),
+            execution_options={"synchronize_session": False},
+        )
+
+    async def clear_hitl_wait(self, run_id: str) -> None:
+        """清除 HITL 等待起点（顺延后避免重复顺延）。"""
+        await self.session.execute(
+            update(AgentRun)
+            .where(AgentRun.id == run_id)
+            .values(hitl_wait_started_at=None, updated_at=datetime.utcnow()),
+            execution_options={"synchronize_session": False},
+        )
 
     async def list_stale_running(self, now: Optional[datetime] = None) -> List[AgentRun]:
         """Lease 已过期的 running Run（进入恢复检查）。"""

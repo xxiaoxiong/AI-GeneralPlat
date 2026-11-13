@@ -444,6 +444,9 @@ class AgentRuntimeService:
         run.attempt = row.attempt or run.attempt
         run.transition(STATUS_RUNNING)
 
+        # P1-05 §13.3：HITL 等待是否计入超时由配置决定（不计入则顺延 deadline）
+        await self._apply_hitl_wait_policy(run_id)
+
         run.bus = EventBus(persist=True)
         run.bus.bind_run(thread_id=run.thread_id, agent_id=run.agent_id, trace_id=run.run_id)
         self.worker.supervise(
@@ -995,6 +998,9 @@ class AgentRuntimeService:
                 lease_version=run.lease_version or 0,
             )
 
+            # P1-05 §13：加载 Run 级预算历史累计（跨恢复不重置），取绝对 deadline
+            await self._load_budget(ctx, run)
+
             tool_specs = self._resolve_tool_specs(agent_config)
             policy = ToolPolicy.from_settings({s["name"] for s in tool_specs}, enable_hitl=ctx.enable_hitl)
 
@@ -1041,7 +1047,13 @@ class AgentRuntimeService:
                     run.final_text_parts = await self._load_prior_final_text(run.run_id)
 
                 try:
-                    async with asyncio.timeout(ctx.budget.run_timeout_seconds):
+                    # P1-05 §13：按绝对 deadline 计算剩余超时（重启不重新获得完整时间）
+                    _deadline = ctx.budget_deadline_at
+                    if _deadline is not None:
+                        _remaining = max(0.0, (_deadline - datetime.utcnow()).total_seconds())
+                    else:
+                        _remaining = ctx.budget.run_timeout_seconds
+                    async with asyncio.timeout(_remaining):
                         await self._consume_stream(agent, payload, run_config, ctx, run, bus)
                 except asyncio.TimeoutError:
                     raise _RunLimitExceeded(f"运行超时（>{ctx.budget.run_timeout_seconds}s）")
@@ -1163,6 +1175,79 @@ class AgentRuntimeService:
                 attributes=run.summary or {},
             )
 
+    # ── Run 级执行预算（P1-05 §13）：跨崩溃/HITL 恢复不重置 ─────────────
+
+    async def _load_budget(self, ctx: RuntimeContext, run: RunHandle) -> None:
+        """加载 Run 预算历史累计并种子 ctx：恢复后计数继续，不从零开始。
+
+        deadline_at 为绝对时间：重启不重新获得完整超时。子 Agent 共享父 Run
+        ctx/预算（口径一致，见 P1-05 §13.5）。
+        """
+        timeout = float(ctx.budget.run_timeout_seconds)
+        async with AsyncSessionLocal() as session:
+            state = await RunRepository(session).ensure_budget(
+                run.run_id, timeout_seconds=timeout
+            )
+            await session.commit()
+        # 种子计数（跨恢复累计）
+        ctx.model_calls = state["model_calls"]
+        ctx.tool_calls = state["tool_calls"]
+        ctx.steps = state["steps"]
+        ctx.model_node_runs = state["steps"]
+        ctx.tokens_generated = state["tokens"]
+        # 已刷快照 = 当前累计（本轮 flush 仅累计增量）
+        ctx._flushed_model_calls = state["model_calls"]
+        ctx._flushed_tool_calls = state["tool_calls"]
+        ctx._flushed_steps = state["steps"]
+        ctx._flushed_tokens = state["tokens"]
+        ctx.budget_version = state["version"]
+        ctx.budget_deadline_at = state["deadline_at"]
+        ctx.budget_first_started_at = state["first_started_at"]
+
+    async def _apply_hitl_wait_policy(self, run_id: str) -> None:
+        """HITL 等待是否计入 Run Timeout（P1-05 §13.3）：由配置显式决定。
+
+        - ``AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT=True``（默认）：等待计入超时，
+          deadline 为绝对时间、含等待，不顺延；
+        - ``=False``：等待不计入超时，恢复时按等待时长顺延 deadline（只耗
+          执行时间，不耗人工等待）。
+        顺延后清除等待起点，避免重复顺延。
+        """
+        if getattr(settings, "AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT", True):
+            return
+        async with AsyncSessionLocal() as session:
+            repo = RunRepository(session)
+            row = await repo.get_run(run_id)
+            wait_since = getattr(row, "hitl_wait_started_at", None) if row else None
+            if wait_since is not None:
+                waited = (datetime.utcnow() - wait_since).total_seconds()
+                await repo.shift_deadline(run_id, extra_seconds=waited)
+                await repo.clear_hitl_wait(run_id)
+            await session.commit()
+
+    async def _flush_budget(self, ctx: RuntimeContext, run: RunHandle) -> None:
+        """把 ctx 计数增量 CAS 累计到 DB（budget_version 乐观锁），更新已刷快照。"""
+        d_mc = ctx.model_calls - ctx._flushed_model_calls
+        d_tc = ctx.tool_calls - ctx._flushed_tool_calls
+        d_st = ctx.steps - ctx._flushed_steps
+        d_tk = ctx.tokens_generated - ctx._flushed_tokens
+        if d_mc == 0 and d_tc == 0 and d_st == 0 and d_tk == 0:
+            return
+        async with AsyncSessionLocal() as session:
+            new_ver = await RunRepository(session).advance_budget(
+                run.run_id,
+                expected_version=ctx.budget_version,
+                model_calls=d_mc, tool_calls=d_tc, steps=d_st, tokens=d_tk,
+            )
+            await session.commit()
+        if new_ver >= 0:
+            ctx._flushed_model_calls = ctx.model_calls
+            ctx._flushed_tool_calls = ctx.tool_calls
+            ctx._flushed_steps = ctx.steps
+            ctx._flushed_tokens = ctx.tokens_generated
+            ctx.budget_version = new_ver
+        # CAS 失败（并发写）不致命：下次 flush 以新版本重试累计（Run 单飞，罕见）
+
     async def _consume_stream(self, agent, payload, run_config, ctx, run, bus) -> None:
         """消费 astream：模型增量 / 计划 / 中断 -> 事件总线。
 
@@ -1206,14 +1291,21 @@ class AgentRuntimeService:
                             type=PLAN_UPDATED, run_id=run.run_id,
                             data={"todos": [dict(t) if not isinstance(t, dict) else t for t in todos]},
                         ))
+                # P1-05 §13：每个图步/工具边界 CAS 累计预算（崩溃恢复不丢累计）
+                await self._flush_budget(ctx, run)
         if interrupted:
             run.transition(STATUS_WAITING_APPROVAL)
+            await self._flush_budget(ctx, run)
             # 暂停态必须先持久化成功，再对外宣告（失败向上抛出）
             await self._commit(run, status=STATUS_WAITING_APPROVAL)
             await bus.publish(RuntimeEvent(
                 type=RUN_WAITING_APPROVAL, run_id=run.run_id,
                 data={"actions": redact_sensitive(run.pending_actions)},
             ))
+        # P1-05 §13：收尾再刷一次预算（抓取尾部增量，正常完成/中断均覆盖）
+        await self._flush_budget(ctx, run)
+        # P1-06 §14.5：收尾刷一次 MODEL_DELTA 缓冲（确保尾部增量落库，最终文本重建完整）
+        await bus.flush_deltas()
 
     async def _handle_interrupt(self, interrupts, run, bus) -> None:
         actions: List[Dict[str, Any]] = []

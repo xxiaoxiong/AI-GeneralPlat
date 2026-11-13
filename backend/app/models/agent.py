@@ -125,6 +125,19 @@ class AgentRun(Base):
     recovery_error = Column(Text, nullable=True)       # 恢复失败原因
     recovery_metadata = Column(JSON, nullable=True)    # 恢复决策元数据（P0-04 §6.3）
 
+    # ── Run 级执行预算（P1-05 §13）：跨崩溃/HITL 恢复不重置 ──────────────
+    # 累计值 + 绝对 deadline + CAS 版本；恢复时读取历史累计，不从零开始。
+    budget_model_calls = Column(Integer, default=0, nullable=False)  # 累计模型调用
+    budget_tool_calls = Column(Integer, default=0, nullable=False)   # 累计工具调用
+    budget_steps = Column(Integer, default=0, nullable=False)        # 累计图步数
+    budget_tokens = Column(Integer, default=0, nullable=False)       # 累计生成 Token
+    budget_first_started_at = Column(DateTime, nullable=True)        # 首次启动（Run 起点）
+    budget_deadline_at = Column(DateTime, nullable=True)             # 绝对截止（不随重启重置）
+    budget_version = Column(Integer, default=0, nullable=False)      # CAS 版本（并发一致性）
+    # HITL 等待起点（P1-05 §13.3）：进入 waiting_approval 时写入；恢复时按
+    # AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT 决定是否按等待时长顺延 deadline。
+    hitl_wait_started_at = Column(DateTime, nullable=True)
+
     # 取消请求（P1-04 §12）：DB 是取消意图的唯一真相源。cancel_requested=CAS 写入；
     # 在途外部工具不得伪造取消完成（取消为意图，实现尽力而为）。
     cancel_requested = Column(Boolean, default=False, nullable=False)  # 是否请求取消
