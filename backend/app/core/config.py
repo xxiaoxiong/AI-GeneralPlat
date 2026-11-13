@@ -92,10 +92,10 @@ class Settings(BaseSettings):
 
     # ── DeepAgents Runtime（阶段一新内核）────────────────────────────────────
     AGENT_RUNTIME_ENABLED: bool = True          # 回滚开关：False 时走旧引擎路径
-    AGENT_MAX_STEPS: int = 20                   # 图执行最大步数
-    AGENT_MAX_TOOL_CALLS: int = 30              # 工具调用总次数预算
-    AGENT_MAX_MODEL_CALLS: int = 30             # 模型调用次数预算
-    AGENT_RUN_TIMEOUT: float = 300.0            # 单次运行墙钟超时（秒）
+    AGENT_MAX_STEPS: int = 100                  # 图执行最大步数（0=不限制）
+    AGENT_MAX_TOOL_CALLS: int = 200             # 工具调用总次数预算（0=不限制）
+    AGENT_MAX_MODEL_CALLS: int = 100            # 模型调用次数预算（0=不限制）
+    AGENT_RUN_TIMEOUT: float = 600.0            # 单次运行墙钟超时（秒）
     # P1-05 §13：HITL 等待时间是否计入 Run Timeout。True=计入（deadline 绝对、含等待）；
     # False=不计入（HITL 恢复时按等待时长顺延 deadline，只耗执行时间不耗人工等待）。
     AGENT_HITL_WAIT_COUNTS_TO_TIMEOUT: bool = True

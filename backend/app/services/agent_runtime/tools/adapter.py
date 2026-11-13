@@ -40,6 +40,7 @@ from langchain_core.tools import InjectedToolCallId, StructuredTool
 from langgraph.errors import GraphBubbleUp
 from pydantic import BaseModel, Field, create_model
 
+from app.core.config import settings
 from app.core.database import AsyncSessionLocal
 from app.services.tools import BUILTIN_TOOLS, get_tool_by_name
 from app.services.tools import ToolExecutor
@@ -163,6 +164,8 @@ class ToolAdapterFactory:
         self.ctx = ctx
         self.policy = policy
         self.bus = bus
+        # 同工具同参调用计数（重复防护，key = 工具名 + 参数指纹）
+        self._same_call_counts: Dict[str, int] = {}
 
     def build(self, tool_specs: List[Dict[str, Any]]) -> List[StructuredTool]:
         tools: List[StructuredTool] = []
@@ -201,6 +204,23 @@ class ToolAdapterFactory:
         tool_call_id = args.pop("tool_call_id", None) or uuid.uuid4().hex
         idempotency_key = _idempotency_key(self.ctx.run_id, tool_call_id)
 
+        # 同工具同参重复防护（对齐旧引擎 AGENT_MAX_SAME_TOOL_CALLS）：完全相同的
+        # (工具, 参数指纹) 超过阈值视为疑似执行死循环，返回明确错误终止该调用，
+        # 避免模型复读同一调用直到烧完预算；阈值 <=0 不防护
+        max_same = int(getattr(settings, "AGENT_MAX_SAME_TOOL_CALLS", 3))
+        if max_same > 0:
+            fp = hashlib.sha256(
+                json.dumps(args, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+            ).hexdigest()[:16]
+            count_key = f"{name}:{fp}"
+            self._same_call_counts[count_key] = self._same_call_counts.get(count_key, 0) + 1
+            if self._same_call_counts[count_key] > max_same:
+                return (
+                    f"错误：工具 '{name}' 以完全相同参数已连续调用 "
+                    f"{self._same_call_counts[count_key]} 次（上限 {max_same}），"
+                    "疑似执行循环，已拒绝本次调用。请改变参数或直接给出最终回答。"
+                )
+
         # 1) 授权 + 策略检查
         try:
             self.policy.check_tool_allowed(name)
@@ -219,7 +239,7 @@ class ToolAdapterFactory:
                 else:
                     target = str(raw)
                 self.policy.check_url(target)
-            if name in ("write_file", "edit_file", "read_file", "delete_file"):
+            if name in ("write_file", "edit_file", "read_file", "delete_file", "delete"):
                 self.policy.check_path(str(args.get("path") or args.get("file_path") or ""))
             if name == "db_query" and args.get("sql"):
                 self.policy.check_sql_readonly(str(args["sql"]))

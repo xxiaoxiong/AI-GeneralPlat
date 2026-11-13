@@ -85,11 +85,16 @@ def build_agent(
 
     # exit_behavior="error"：超限抛出明确异常，由 service 映射为
     # limit_exceeded 状态（任务书 P0-A：超限返回明确 failed/limit_exceeded）
-    middleware = [
-        TodoListMiddleware(),
-        ToolCallLimitMiddleware(run_limit=ctx.budget.max_tool_calls, exit_behavior="error"),
-        ModelCallLimitMiddleware(run_limit=ctx.budget.max_model_calls, exit_behavior="error"),
-    ]
+    # 预算 <=0 = 不限制：不挂对应 Limit 中间件（防真死循环仍由重复调用防护兜底）
+    middleware = [TodoListMiddleware()]
+    if ctx.budget.max_tool_calls > 0:
+        middleware.append(
+            ToolCallLimitMiddleware(run_limit=ctx.budget.max_tool_calls, exit_behavior="error")
+        )
+    if ctx.budget.max_model_calls > 0:
+        middleware.append(
+            ModelCallLimitMiddleware(run_limit=ctx.budget.max_model_calls, exit_behavior="error")
+        )
 
     system_prompt = _compose_system_prompt(ctx)
 

@@ -729,3 +729,28 @@ class TestBudget:
                 {"messages": [HumanMessage(content="go")]},
                 config={"configurable": {"thread_id": "budget-3"}, "recursion_limit": 6},
             )
+
+    def test_budget_zero_means_unlimited(self):
+        """0 = 不限制：exhausted_reason 不触发（真死循环由重复防护/超时兜底）"""
+        b = ExecutionBudget(max_steps=0, max_tool_calls=0, max_model_calls=0)
+        assert b.exhausted_reason(9999, 9999, 9999) is None
+
+    @pytest.mark.asyncio
+    async def test_same_tool_same_args_repeat_guard(self, monkeypatch):
+        """同工具同参重复调用超阈值 -> 拒绝并报疑似循环（对齐旧引擎重复防护）"""
+        import app.core.config as config_mod
+        from app.services.agent_runtime.events import EventBus
+        from app.services.agent_runtime.tools.adapter import ToolAdapterFactory
+
+        monkeypatch.setattr(config_mod.settings, "AGENT_MAX_SAME_TOOL_CALLS", 2, raising=False)
+        factory = ToolAdapterFactory(
+            await make_db_ctx(), ToolPolicy(allowed_tools={"calculator"}), EventBus()
+        )
+        out1 = await factory._execute("calculator", {"expression": "1+1"})
+        out2 = await factory._execute("calculator", {"expression": "1+1"})
+        assert "疑似执行循环" not in out1 and "疑似执行循环" not in out2
+        out3 = await factory._execute("calculator", {"expression": "1+1"})
+        assert "疑似执行循环" in out3
+        # 参数不同的调用不受影响
+        out4 = await factory._execute("calculator", {"expression": "2+2"})
+        assert "疑似执行循环" not in out4

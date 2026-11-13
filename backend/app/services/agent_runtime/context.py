@@ -34,19 +34,20 @@ class RunScope:
 class ExecutionBudget:
     """执行预算：次数 / 时长限制（token 预算留接口，暂按次数/时长执行）"""
 
-    max_steps: int = 20                    # 图执行最大步数（模型调用轮数）
-    max_tool_calls: int = 30               # 工具调用总次数
-    max_model_calls: int = 30              # 模型调用次数
-    run_timeout_seconds: float = 300.0     # 单次运行墙钟超时
+    max_steps: int = 100                   # 图执行最大步数（模型调用轮数），0=不限制
+    max_tool_calls: int = 200              # 工具调用总次数，0=不限制
+    max_model_calls: int = 100             # 模型调用次数，0=不限制
+    run_timeout_seconds: float = 600.0     # 单次运行墙钟超时
     max_subagent_depth: int = 2            # 子代理派生深度上限
     max_tokens_budget: Optional[int] = None  # 预留：token 预算
 
     def exhausted_reason(self, steps: int, tool_calls: int, model_calls: int) -> Optional[str]:
-        if model_calls > self.max_model_calls:
+        # 0 / 负数 = 不限制（任务书可配置预算；默认预算仅为防真死循环兜底）
+        if self.max_model_calls > 0 and model_calls > self.max_model_calls:
             return f"模型调用次数超过预算({self.max_model_calls})"
-        if steps > self.max_steps:
+        if self.max_steps > 0 and steps > self.max_steps:
             return f"执行步数超过预算({self.max_steps})"
-        if tool_calls > self.max_tool_calls:
+        if self.max_tool_calls > 0 and tool_calls > self.max_tool_calls:
             return f"工具调用次数超过预算({self.max_tool_calls})"
         return None
 

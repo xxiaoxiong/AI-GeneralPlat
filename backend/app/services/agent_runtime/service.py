@@ -19,7 +19,7 @@ import uuid
 from datetime import datetime
 from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
 
-from langchain_core.messages import AIMessage, AIMessageChunk
+from langchain_core.messages import AIMessage, AIMessageChunk, ToolMessage
 from langchain.agents.middleware.model_call_limit import ModelCallLimitExceededError
 from langchain.agents.middleware.tool_call_limit import ToolCallLimitExceededError
 from langgraph.errors import GraphRecursionError
@@ -49,6 +49,8 @@ from .events import (
     SUBAGENT_COMPLETED,
     SUBAGENT_STARTED,
     TOOL_COMPLETED,
+    TOOL_FAILED,
+    TOOL_STARTED,
     TERMINAL_EVENTS,
     EventBus,
     LegacyEventAdapter,
@@ -986,10 +988,10 @@ class AgentRuntimeService:
                 agent_config=agent_config,
                 memory_context=mem_ctx,
                 budget=ExecutionBudget(
-                    max_steps=getattr(settings, "AGENT_MAX_STEPS", 20),
-                    max_tool_calls=getattr(settings, "AGENT_MAX_TOOL_CALLS", 30),
-                    max_model_calls=getattr(settings, "AGENT_MAX_MODEL_CALLS", 30),
-                    run_timeout_seconds=getattr(settings, "AGENT_RUN_TIMEOUT", 300.0),
+                    max_steps=getattr(settings, "AGENT_MAX_STEPS", 100),
+                    max_tool_calls=getattr(settings, "AGENT_MAX_TOOL_CALLS", 200),
+                    max_model_calls=getattr(settings, "AGENT_MAX_MODEL_CALLS", 100),
+                    run_timeout_seconds=getattr(settings, "AGENT_RUN_TIMEOUT", 600.0),
                 ),
                 enable_hitl=getattr(settings, "AGENT_ENABLE_HITL", True),
                 sandbox_mode=getattr(settings, "AGENT_SANDBOX_MODE", "restricted"),
@@ -1259,6 +1261,13 @@ class AgentRuntimeService:
         完成（一次 = 一个 agent 轮次）。
         """
         interrupted = False
+        # 内部工具事件桥：DeepAgents 注入的工具（文件/规划/子代理等）不经
+        # ToolAdapterFactory，从更新流补发 TOOL 事件并计入预算（平台工具由
+        # adapter 发事件，这里按名称跳过避免重复）
+        platform_names = {s["name"] for s in self._resolve_tool_specs(ctx.agent_config)}
+        platform_names |= {
+            t.get("name") for t in (ctx.agent_config.get("custom_tools") or []) if isinstance(t, dict)
+        }
         async for mode, chunk in agent.astream(
             payload, config=run_config, stream_mode=["updates", "messages"]
         ):
@@ -1285,12 +1294,52 @@ class AgentRuntimeService:
                     await self._handle_interrupt(chunk["__interrupt__"], run, bus)
                     continue
                 for node_update in chunk.values():
-                    if isinstance(node_update, dict) and "todos" in node_update:
+                    if not isinstance(node_update, dict):
+                        continue
+                    if "todos" in node_update:
                         todos = node_update.get("todos") or []
                         await bus.publish(RuntimeEvent(
                             type=PLAN_UPDATED, run_id=run.run_id,
                             data={"todos": [dict(t) if not isinstance(t, dict) else t for t in todos]},
                         ))
+                    for m in (node_update.get("messages") or []):
+                        if isinstance(m, ToolMessage):
+                            mname = getattr(m, "name", "") or ""
+                            if mname in platform_names:
+                                continue  # 平台工具已由 adapter 发事件
+                            is_err = getattr(m, "status", None) == "error"
+                            await bus.publish(RuntimeEvent(
+                                type=TOOL_FAILED if is_err else TOOL_COMPLETED,
+                                run_id=run.run_id,
+                                data={
+                                    "tool": mname,
+                                    "tool_call_id": getattr(m, "tool_call_id", "") or "",
+                                    "internal": True,
+                                    **(
+                                        {"error": str(m.content)[:500]}
+                                        if is_err
+                                        else {"output": _extract_text(m.content)}
+                                    ),
+                                },
+                            ))
+                            # 内部工具调用计入执行预算/遥测（与 ToolCallLimit 口径对齐）
+                            ctx.tool_calls += 1
+                        elif isinstance(m, AIMessage):
+                            for tc in (getattr(m, "tool_calls", None) or []):
+                                tc_name = (tc.get("name") or "") if isinstance(tc, dict) else ""
+                                if tc_name and tc_name not in platform_names:
+                                    await bus.publish(RuntimeEvent(
+                                        type=TOOL_STARTED,
+                                        run_id=run.run_id,
+                                        data={
+                                            "tool": tc_name,
+                                            "tool_call_id": (tc.get("id") or "") if isinstance(tc, dict) else "",
+                                            "internal": True,
+                                            "input": redact_sensitive(
+                                                (tc.get("args") or {}) if isinstance(tc, dict) else {}
+                                            ),
+                                        },
+                                    ))
                 # P1-05 §13：每个图步/工具边界 CAS 累计预算（崩溃恢复不丢累计）
                 await self._flush_budget(ctx, run)
         if interrupted:

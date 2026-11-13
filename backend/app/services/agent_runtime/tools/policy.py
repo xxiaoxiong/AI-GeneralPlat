@@ -113,7 +113,10 @@ def _bootstrap_builtin_profiles() -> None:
         ToolRiskProfile("grep", ToolRisk.READ, file_access=True, **read_only),
         ToolRiskProfile("write_file", ToolRisk.WRITE, file_access=True, **non_idem),
         ToolRiskProfile("edit_file", ToolRisk.WRITE, file_access=True, **non_idem),
+        # delete_file 为历史登记名；deepagents 内部工具真名为 "delete"，双名并存
         ToolRiskProfile("delete_file", ToolRisk.DANGEROUS, requires_approval=True,
+                        file_access=True, **non_idem),
+        ToolRiskProfile("delete", ToolRisk.DANGEROUS, requires_approval=True,
                         file_access=True, **non_idem),
     ]
     for p in entries:
@@ -129,10 +132,11 @@ DEFAULT_HITL_TOOLS: Set[str] = {
     "webhook_notify",
     "send_email_tool",
     "delete_file",
+    "delete",
 }
 
 # 高危工具：内网/生产默认禁用
-DANGEROUS_TOOLS: Set[str] = {"python_exec", "execute", "delete_file"}
+DANGEROUS_TOOLS: Set[str] = {"python_exec", "execute", "delete_file", "delete"}
 
 # 代码执行类工具（exec_access）：restricted 进程内限制 ≠ 安全沙箱
 EXEC_ACCESS_TOOLS: Set[str] = {"python_exec", "execute"}
